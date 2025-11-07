@@ -208,56 +208,8 @@ def segment_sentences(text: str) -> List[str]:
 
 
 
-def tokenize_words_ud_style(text: str) -> List[str]:
-    """
-    Tokenize text into words using UD-style tokenization rules.
-    
-    UD tokenization principles:
-    - Split on whitespace
-    - Separate punctuation from words (except for apostrophes in contractions)
-    - Keep contractions together (e.g., "d'", "l'", "n'")
-    
-    Args:
-        text: Sentence string
-        
-    Returns:
-        List of token strings
-    """
-    if not text:
-        return []
-    
-    # UD-style tokenization regex
-    # Matches:
-    # - Contractions with apostrophes (d', l', n', etc.)
-    # - Words with hyphens (compound words)
-    # - Regular words (Unicode-aware)
-    # - Punctuation (separated)
-    
-    # Use Unicode word characters (\w includes Unicode letters, but we need to be explicit for some cases)
-    # Pattern for contractions: letter(s) + apostrophe + letter(s)
-    # Use \p{L} for Unicode letters (requires regex with UNICODE flag) or use \w which is Unicode-aware in Python
-    contraction_pattern = r"[\w]+'[\w]+"
-    
-    # Pattern for hyphenated compounds
-    compound_pattern = r"[\w]+(?:-[\w]+)+"
-    
-    # Pattern for regular words (including numbers and mixed alphanumeric, Unicode-aware)
-    # \w matches Unicode word characters (letters, digits, underscore)
-    word_pattern = r"[\w]+"
-    
-    # Pattern for punctuation (everything that's not whitespace, word chars, hyphen, or apostrophe)
-    punct_pattern = r"[^\s\w\-']+"
-    
-    # Combined pattern (order matters: contractions first, then compounds, then words, then punctuation)
-    token_pattern = f"({contraction_pattern}|{compound_pattern}|{word_pattern}|{punct_pattern})"
-    
-    # Use UNICODE flag to ensure proper Unicode handling
-    tokens = re.findall(token_pattern, text, re.UNICODE)
-    
-    # Filter out empty tokens
-    tokens = [t for t in tokens if t.strip()]
-    
-    return tokens
+# Import tokenization from tokenizer module
+from flexipipe.tokenizer import tokenize_words_ud_style
 
 
 

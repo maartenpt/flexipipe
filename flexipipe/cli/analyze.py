@@ -8,8 +8,10 @@ import argparse
 import json
 from pathlib import Path
 
+from flexipipe.config import FlexiPipeConfig
+from flexipipe.tagger import FlexiPipeTagger
 from flexipipe.core import (
-    FlexiPipeConfig, FlexiPipeTagger, set_conllu_expansion_key,
+    set_conllu_expansion_key,
     load_teitok_xml
 )
 

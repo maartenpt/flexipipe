@@ -8,9 +8,11 @@ import argparse
 import json
 from pathlib import Path
 
-# Import from core module (temporary - will be refactored to use modular imports)
+# Import from appropriate modules
+from flexipipe.config import FlexiPipeConfig
+from flexipipe.tagger import FlexiPipeTagger
 from flexipipe.core import (
-    FlexiPipeConfig, FlexiPipeTagger, set_conllu_expansion_key,
+    set_conllu_expansion_key,
     load_teitok_xml, build_vocabulary
 )
 
@@ -31,6 +33,8 @@ def main():
                        help='Segment raw text into sentences')
     parser.add_argument('--tokenize', action='store_true',
                        help='Tokenize sentences into words')
+    parser.add_argument('--tokenization-method', choices=['ud', 'bert', 'auto'], default='auto',
+                       help='Tokenization method: "ud" (rule-based), "bert" (BERT-based, for Chinese/Japanese/etc.), or "auto" (default: auto - uses BERT if available, otherwise UD)')
     parser.add_argument('--model', type=Path, help='Path to trained model')
     parser.add_argument('--bert-model', default='bert-base-multilingual-cased',
                        help='BERT base model if no trained model')
@@ -65,10 +69,16 @@ def main():
                        help='TEITOK attribute name(s) for XPOS')
     parser.add_argument('--debug', action='store_true',
                        help='Enable debug output')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Enable verbose output (shows pipeline steps and timing)')
     parser.add_argument('--lemma-anchor', choices=['reg', 'form', 'both'], default='both',
                        help='Anchor for learning inflection suffixes')
     parser.add_argument('--use-xpos-for-tagging', action='store_true',
                        help='Use XPOS for tagging/lemmatization instead of UPOS+FEATS (default: use UPOS+FEATS)')
+    parser.add_argument('--tagset', type=Path,
+                       help='Path to TEITOK tagset XML file (for XPOS to UPOS/FEATS mapping and agreement checking)')
+    parser.add_argument('--guess-ud', action='store_true',
+                       help='Output guessed UPOS and FEATS derived from XPOS using tagset definition')
     
     args = parser.parse_args()
     
@@ -77,6 +87,7 @@ def main():
     output_path = None
     use_stdin = (args.input == '-' or args.input is None or not args.input)
     use_stdout = (args.output == '-' or args.output is None or not args.output)
+    is_stdin = False  # Track if we're reading from stdin for verbose output
     
     # Check if input is from terminal or pipe
     if use_stdin:
@@ -84,6 +95,7 @@ def main():
             print("Error: No input provided and stdin is a terminal", file=sys.stderr)
             parser.print_help()
             sys.exit(1)
+        is_stdin = True
         # Create temporary file from stdin
         import tempfile
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as tmp:
@@ -138,9 +150,23 @@ def main():
         expansion_attr=args.expan,
         xpos_attr=args.xpos_attr,
         debug=args.debug,
+        verbose=args.verbose,
         lemma_anchor=args.lemma_anchor,
         use_xpos_for_tagging=args.use_xpos_for_tagging,
+        tokenization_method=args.tokenization_method,
+        guess_ud=args.guess_ud,
     )
+    
+    # Load tagset if provided
+    tagset_def = None
+    if args.tagset:
+        try:
+            from flexipipe.tagset import parse_teitok_tagset
+            tagset_def = parse_teitok_tagset(args.tagset)
+            if args.debug:
+                print(f"[DEBUG] Loaded tagset from {args.tagset}", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: Could not load tagset from {args.tagset}: {e}", file=sys.stderr)
     
     # Load vocabulary (support multiple files - later files override earlier ones)
     vocab = {}
@@ -176,7 +202,9 @@ def main():
             lexicon_file_paths.append(lexicon_file_path)
         
         if lexicons:
-            print(f"Loaded {len(lexicons)} lexicon entries from {len(lexicon_file_paths)} file(s) (OOV fallback only)", file=sys.stderr)
+            if args.debug:
+                print(f"Loaded {len(lexicons)} lexicon entries from {len(lexicon_file_paths)} file(s) (OOV fallback only)", file=sys.stderr)
+            # Will be reported in verbose mode by tagger
     
     if args.vocab:
         # Process vocab files in order - later files override earlier ones
@@ -288,6 +316,47 @@ def main():
                     if trans_type not in transition_probs:
                         transition_probs[trans_type] = {}
                     
+                    # Special handling for deprel transitions: they're stored as {'upos': {...}, 'xpos': {...}}
+                    # or as a flat dict (old format) with string keys like "head_pos|dep_pos|deprel"
+                    if trans_type == 'deprel':
+                        # Check if new format (nested dict with 'upos' and 'xpos' keys)
+                        if isinstance(trans_dict, dict) and 'upos' in trans_dict or 'xpos' in trans_dict:
+                            # New format: {'upos': {...}, 'xpos': {...}}
+                            if trans_type not in transition_probs:
+                                transition_probs[trans_type] = {}
+                            for tag_format in ['upos', 'xpos']:
+                                if tag_format in trans_dict:
+                                    if tag_format not in transition_probs[trans_type]:
+                                        transition_probs[trans_type][tag_format] = {}
+                                    format_dict = trans_dict[tag_format]
+                                    for key, prob in format_dict.items():
+                                        if isinstance(prob, (int, float)):
+                                            if key in transition_probs[trans_type][tag_format]:
+                                                # Weighted average: combine probabilities
+                                                old_prob = transition_probs[trans_type][tag_format][key]
+                                                if total_sentences > 0:
+                                                    new_prob = (old_prob * total_sentences + prob * file_sentences) / (total_sentences + file_sentences)
+                                                else:
+                                                    new_prob = prob
+                                                transition_probs[trans_type][tag_format][key] = new_prob
+                                            else:
+                                                transition_probs[trans_type][tag_format][key] = prob
+                        else:
+                            # Old format: flat dict with string keys (backward compatibility)
+                            for key, prob in trans_dict.items():
+                                if isinstance(prob, (int, float)):
+                                    if key in transition_probs[trans_type]:
+                                        # Weighted average: combine probabilities
+                                        old_prob = transition_probs[trans_type][key]
+                                        if total_sentences > 0:
+                                            new_prob = (old_prob * total_sentences + prob * file_sentences) / (total_sentences + file_sentences)
+                                        else:
+                                            new_prob = prob
+                                        transition_probs[trans_type][key] = new_prob
+                                    else:
+                                        transition_probs[trans_type][key] = prob
+                        continue
+                    
                     # Check if this is a nested structure (upos/xpos) or flat structure (start)
                     # Nested: {prev_tag: {next_tag: prob}}
                     # Flat: {tag: prob}
@@ -360,10 +429,16 @@ def main():
                                 else:
                                     vocab_metadata['capitalizable_tags'][tag_type][tag] = stats.copy()
                 
-                # Other metadata: later files override
-                for key, value in metadata_from_file.items():
-                    if key != 'capitalizable_tags':
-                        vocab_metadata[key] = value
+            # Other metadata: later files override
+            for key, value in metadata_from_file.items():
+                if key != 'capitalizable_tags':
+                    vocab_metadata[key] = value
+            
+            # Check if tagset is in metadata
+            if metadata_from_file and 'tagset' in metadata_from_file:
+                tagset_def = metadata_from_file['tagset']
+                if args.debug:
+                    print(f"[DEBUG] Loaded tagset from vocabulary metadata", file=sys.stderr)
             
             # If language is in metadata but not in config, use it
             if metadata_from_file and metadata_from_file.get('language') and not config.language:
@@ -373,6 +448,17 @@ def main():
     
     # Create tagger
     tagger = FlexiPipeTagger(config, vocab, model_path=args.model if args.model else None, transition_probs=transition_probs, vocab_metadata=vocab_metadata, lexicon=lexicons if lexicons else None)
+    # Store stdin flag for verbose output
+    tagger._is_stdin = is_stdin
+    # Store tagset for parser and UD guessing
+    if tagset_def:
+        tagger.tagset_def = tagset_def
+        if args.tagset:
+            tagger._tagset_file = str(args.tagset)
+        if args.debug:
+            print(f"[DEBUG] Stored tagset in tagger (tagset_def is not None: {tagset_def is not None})", file=sys.stderr)
+    elif args.debug:
+        print(f"[DEBUG] No tagset to store (tagset_def is None)", file=sys.stderr)
     # Store vocabulary file path(s) for revision statement
     if vocab_file_paths:
         # Store as comma-separated list or just the most specific (last) one

@@ -3,7 +3,7 @@ Models module for FlexiPipe.
 """
 import torch
 from torch import nn
-from transformers import Trainer, TrainingArguments
+from transformers import AutoModel, Trainer, TrainingArguments
 
 class BiaffineAttention(nn.Module):
     """Biaffine attention for dependency head prediction."""
@@ -103,7 +103,8 @@ class MultiTaskFlexiPipeTagger(nn.Module):
     
     def __init__(self, base_model_name: str, num_upos: int, num_xpos: int, num_feats: int, 
                  num_lemmas: int = 0, num_deprels: int = 0, num_norms: int = 0,
-                 train_parser: bool = False, train_lemmatizer: bool = False, train_normalizer: bool = False):
+                 train_parser: bool = False, train_lemmatizer: bool = False, train_normalizer: bool = False,
+                 num_orig_forms: int = 0, use_orig_form_for_parser: bool = False):
         super().__init__()
         self.base_model = AutoModel.from_pretrained(base_model_name)
         hidden_size = self.base_model.config.hidden_size
@@ -170,11 +171,23 @@ class MultiTaskFlexiPipeTagger(nn.Module):
             self.lemma_xpos_embed = None
             self.lemma_feats_embed = None
         
+        # Original form embedding for transpositional parsing (if enabled)
+        self.use_orig_form_for_parser = use_orig_form_for_parser
+        self.orig_form_embed = None
+        orig_form_embed_dim = 64  # Embedding dimension for original forms
+        if use_orig_form_for_parser and num_orig_forms > 0:
+            self.orig_form_embed = nn.Embedding(num_orig_forms, orig_form_embed_dim)
+            # Adjust hidden size for parser to account for orig_form embeddings
+            parser_hidden_size = hidden_size + orig_form_embed_dim
+        else:
+            parser_hidden_size = hidden_size
+        
         # Parsing heads (only if training parser)
         if train_parser and num_deprels > 0:
-            self.biaffine = BiaffineAttention(hidden_size, arc_dim=500)
+            # Use adjusted hidden size that includes orig_form embeddings if enabled
+            self.biaffine = BiaffineAttention(parser_hidden_size, arc_dim=500)
             self.deprel_head = nn.Sequential(
-                nn.Linear(hidden_size, mlp_hidden),
+                nn.Linear(parser_hidden_size, mlp_hidden),
                 nn.GELU(),
                 nn.Dropout(0.1),
                 nn.Linear(mlp_hidden, num_deprels)
@@ -197,7 +210,8 @@ class MultiTaskFlexiPipeTagger(nn.Module):
         self.dropout = nn.Dropout(0.1)
     
     def forward(self, input_ids, attention_mask=None, labels_upos=None, labels_xpos=None, 
-                labels_feats=None, labels_lemma=None, labels_norm=None, labels_head=None, labels_deprel=None):
+                labels_feats=None, labels_lemma=None, labels_norm=None, labels_head=None, labels_deprel=None,
+                orig_form_ids=None):
         outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
         sequence_output = outputs.last_hidden_state
         sequence_output = self.dropout(sequence_output)
@@ -248,10 +262,18 @@ class MultiTaskFlexiPipeTagger(nn.Module):
         arc_scores = None
         logits_deprel = None
         if self.train_parser and self.biaffine is not None:
-            arc_scores = self.biaffine(sequence_output)  # [batch, seq, seq]
+            # For transpositional parsing: concatenate original form embeddings with BERT embeddings
+            parser_input = sequence_output
+            if self.use_orig_form_for_parser and self.orig_form_embed is not None and orig_form_ids is not None:
+                # Embed original forms: [batch, seq] -> [batch, seq, orig_form_embed_dim]
+                orig_form_embeds = self.orig_form_embed(orig_form_ids)
+                # Concatenate: [batch, seq, hidden_size] + [batch, seq, orig_form_embed_dim]
+                parser_input = torch.cat([sequence_output, orig_form_embeds], dim=-1)
+            
+            arc_scores = self.biaffine(parser_input)  # [batch, seq, seq]
             # Deprel scores: for each possible head-child pair
             # We'll use a simpler approach: predict deprel for each token given its predicted head
-            logits_deprel = self.deprel_head(sequence_output)  # [batch, seq, num_deprels]
+            logits_deprel = self.deprel_head(parser_input)  # [batch, seq, num_deprels]
         
         loss = None
         if labels_upos is not None:
@@ -298,16 +320,27 @@ class MultiTaskFlexiPipeTagger(nn.Module):
                     deprel_loss = nn.CrossEntropyLoss(ignore_index=-100)
                     loss += deprel_loss(logits_deprel.view(-1, logits_deprel.size(-1)), labels_deprel.view(-1))
         
-                return {
-                    'loss': loss,
-                    'logits_upos': logits_upos,
-                    'logits_xpos': logits_xpos,
-                    'logits_feats': logits_feats,
-                    'logits_lemma': logits_lemma,
-                    'logits_norm': logits_norm,
-                    'arc_scores': arc_scores,
-                    'logits_deprel': logits_deprel,
-                }
+            return {
+                'loss': loss,
+                'logits_upos': logits_upos,
+                'logits_xpos': logits_xpos,
+                'logits_feats': logits_feats,
+                'logits_lemma': logits_lemma,
+                'logits_norm': logits_norm,
+                'arc_scores': arc_scores,
+                'logits_deprel': logits_deprel,
+            }
+        
+        # Inference mode (no labels): return logits without loss
+        return {
+            'logits_upos': logits_upos,
+            'logits_xpos': logits_xpos,
+            'logits_feats': logits_feats,
+            'logits_lemma': logits_lemma,
+            'logits_norm': logits_norm,
+            'arc_scores': arc_scores,
+            'logits_deprel': logits_deprel,
+        }
 
 
 

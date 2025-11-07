@@ -47,4 +47,7 @@ class FlexiPipeConfig:
     tag_only: bool = False  # Only tag (UPOS/XPOS/FEATS), skip parsing
     parse_only: bool = False  # Only parse (assumes tags already exist), skip tagging
     debug: bool = False  # Enable debug output
+    verbose: bool = False  # Enable verbose output (shows pipeline steps and timing)
+    tokenization_method: str = 'auto'  # Tokenization method: 'ud' (rule-based), 'bert' (BERT-based), or 'auto' (default: auto - uses BERT if available, otherwise UD)
+    guess_ud: bool = False  # If True, output guessed UPOS and FEATS derived from XPOS using tagset definition
 

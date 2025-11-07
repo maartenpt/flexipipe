@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
+from typing import List, Dict
 import xml.etree.ElementTree as ET
 
 
@@ -24,6 +25,65 @@ def extract_form_from_tok(tok):
     return form
 
 
+def _extract_dependency_transitions_from_conllu(sentences: List[List[Dict]], deprel_transitions: Dict, use_xpos: bool = False):
+    """
+    Extract dependency transition probabilities from CoNLL-U sentences.
+    
+    Stores transitions in both UPOS and XPOS formats.
+    
+    Args:
+        sentences: List of sentences, each a list of token dictionaries
+        deprel_transitions: Dictionary to store transitions: {'upos': {...}, 'xpos': {...}}
+        use_xpos: Not used anymore - we always extract both formats
+    """
+    if 'upos' not in deprel_transitions:
+        deprel_transitions['upos'] = defaultdict(int)
+    if 'xpos' not in deprel_transitions:
+        deprel_transitions['xpos'] = defaultdict(int)
+    
+    for sentence in sentences:
+        for token in sentence:
+            head = token.get('head', '_')
+            deprel = token.get('deprel', '_')
+            
+            # Skip if no dependency information
+            if head == '_' or head == 0 or deprel == '_':
+                continue
+            
+            try:
+                head_idx = int(head) - 1  # Convert to 0-indexed
+                if head_idx < 0 or head_idx >= len(sentence):
+                    continue
+                
+                head_token = sentence[head_idx]
+                
+                # Extract both UPOS and XPOS
+                dep_upos = token.get('upos', '_')
+                if dep_upos == '_':
+                    dep_upos = token.get('xpos', '_')  # Fallback
+                dep_xpos = token.get('xpos', '_')
+                if dep_xpos == '_':
+                    dep_xpos = token.get('upos', '_')  # Fallback
+                
+                head_upos = head_token.get('upos', '_')
+                if head_upos == '_':
+                    head_upos = head_token.get('xpos', '_')  # Fallback
+                head_xpos = head_token.get('xpos', '_')
+                if head_xpos == '_':
+                    head_xpos = head_token.get('upos', '_')  # Fallback
+                
+                # Store transitions in both formats
+                if dep_upos != '_' and head_upos != '_':
+                    key_upos = f"{head_upos}|{dep_upos}|{deprel}"
+                    deprel_transitions['upos'][key_upos] += 1
+                
+                if dep_xpos != '_' and head_xpos != '_':
+                    key_xpos = f"{head_xpos}|{dep_xpos}|{deprel}"
+                    deprel_transitions['xpos'][key_xpos] += 1
+            except (ValueError, TypeError, IndexError, KeyError):
+                continue
+
+
 def get_attribute_with_fallback(elem, attr_names: str) -> str:
     """
     Get attribute value with fallback to multiple attributes (TEITOK inheritance).
@@ -31,6 +91,7 @@ def get_attribute_with_fallback(elem, attr_names: str) -> str:
     Args:
         elem: XML element (<tok> or <dtok>)
         attr_names: Comma-separated attribute names (e.g., 'nform,fform' or 'xpos')
+                    For XPOS, if 'xpos' is specified and not found, automatically tries 'pos' as fallback
     
     Returns:
         First non-empty attribute value found, or empty string if none found
@@ -40,10 +101,17 @@ def get_attribute_with_fallback(elem, attr_names: str) -> str:
         value = elem.get(attr_name, '').strip()
         if value:
             return value
+        # Special case: if looking for 'xpos' and not found, try 'pos' as common alternative
+        if attr_name == 'xpos' and not value:
+            pos_value = elem.get('pos', '').strip()
+            if pos_value:
+                return pos_value
     return ''
 
 
-def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_attr: str = 'reg', expan_attr: str = 'expan', track_transitions: bool = False):
+def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_attr: str = 'reg', expan_attr: str = 'expan', 
+                                  track_transitions: bool = False, track_capitalization: bool = False, 
+                                  track_dependency_transitions: bool = False, use_xpos: bool = False):
     """
     Extract vocabulary entries from a TEITOK XML file.
     
@@ -51,19 +119,31 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
         file_path: Path to TEITOK XML file
         xpos_attr: Attribute name(s) for XPOS (default: 'xpos', can be 'pos' or 'msd', or comma-separated like 'pos,msd')
         reg_attr: Attribute name(s) for normalization/regularization (default: 'reg', can be 'nform' or 'nform,fform' for inheritance)
+        expan_attr: Attribute name(s) for expansion (default: 'expan')
         track_transitions: If True, also track tag transition probabilities for Viterbi
+        track_capitalization: If True, track capitalization statistics
+        track_dependency_transitions: If True, track dependency transition probabilities
+        use_xpos: If True, use XPOS for dependency transitions; if False, use UPOS
     
     Returns:
-        If track_transitions=False: Dictionary mapping (form, form_lower, annotation_key) -> count
-        If track_transitions=True: Tuple of (word_annotations, transitions) where:
+        Tuple of (word_annotations, transitions, capitalization_info, deprel_transitions) where:
             - word_annotations: Dictionary mapping (form, form_lower, annotation_key) -> count
-            - transitions: Dictionary with 'upos', 'xpos', 'start', 'sentences' keys
+            - transitions: Dictionary with 'upos', 'xpos', 'start', 'sentences' keys (or None)
+            - capitalization_info: Dictionary with capitalization stats (or empty dict)
+            - deprel_transitions: Dictionary {(head_pos, dep_pos, deprel): count} (or None)
     """
     word_annotations = defaultdict(int)  # (form, form_lower, upos, xpos, feats, lemma, norm_form, expan_form) -> count
     
     # Track transitions if requested
     transitions = None
     capitalization_info = None
+    deprel_transitions = None
+    
+    # Initialize dependency transitions tracking
+    if track_dependency_transitions:
+        deprel_transitions_upos = defaultdict(int)  # {(head_pos, dep_pos, deprel): count} for UPOS
+        deprel_transitions_xpos = defaultdict(int)  # {(head_pos, dep_pos, deprel): count} for XPOS
+    
     if track_transitions:
         transitions = {
             'upos': defaultdict(int),  # (prev_upos, curr_upos) -> count
@@ -71,12 +151,15 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
             'start': defaultdict(int),  # upos -> count (sentence-start)
             'sentences': 0
         }
-        # Track capitalization statistics: for each tag, count capitalized vs lowercase in non-initial positions
-        # Structure: {tag: {'capitalized': count, 'lowercase': count}}
+    
+    # Track capitalization statistics if requested (separate from transitions)
+    if track_capitalization:
         capitalization_info = {
             'upos': defaultdict(lambda: {'capitalized': 0, 'lowercase': 0}),
             'xpos': defaultdict(lambda: {'capitalized': 0, 'lowercase': 0})
         }
+    else:
+        capitalization_info = {'upos': {}, 'xpos': {}}
     
     try:
         tree = ET.parse(file_path)
@@ -105,6 +188,8 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
             is_first_token = True
             prev_form = None  # Track previous token form for punctuation-based sentence detection
             
+            # Collect all tokens in sentence for dependency tracking
+            sentence_tokens = []  # List of (element, upos, xpos, form) tuples
             token_idx = 0
             for tok in s.findall('.//tok'):
                 # Check if this tok has dtok children (contraction)
@@ -134,6 +219,17 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
                         if (not xpos or xpos == '_') and (not norm_form or norm_form == '_'):
                             continue
                         
+                        # Store token info for dependency tracking (after XPOS/norm check)
+                        # We include all tokens that made it past the XPOS/norm check for dependency extraction
+                        if track_dependency_transitions:
+                            sentence_tokens.append({
+                                'element': dt,
+                                'upos': upos,
+                                'xpos': xpos,
+                                'form': form,
+                                'idx': token_idx
+                            })
+                        
                         feats = dt.get('feats', '_')
                         lemma = dt.get('lemma', '_').lower() if dt.get('lemma', '_') != '_' else '_'
                         
@@ -146,7 +242,7 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
                         is_sentence_initial = (token_idx == 0) or (prev_form and is_sentence_final_punct(prev_form))
                         
                         # Only track capitalization if not all-caps and not sentence-initial
-                        if capitalization_info and not is_sentence_initial and not is_all_caps_word:
+                        if track_capitalization and capitalization_info and not is_sentence_initial and not is_all_caps_word:
                             # Track statistics for this tag in non-initial position
                             if upos and upos != '_':
                                 if is_capitalized:
@@ -202,6 +298,17 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
                     if (not xpos or xpos == '_') and (not norm_form or norm_form == '_'):
                         continue
                     
+                    # Store token info for dependency tracking (after XPOS/norm check)
+                    # We include all tokens that made it past the XPOS/norm check for dependency extraction
+                    if track_dependency_transitions:
+                        sentence_tokens.append({
+                            'element': tok,
+                            'upos': upos,
+                            'xpos': xpos,
+                            'form': form,
+                            'idx': token_idx
+                        })
+                    
                     feats = tok.get('feats', '_')
                     lemma = tok.get('lemma', '_').lower() if tok.get('lemma', '_') != '_' else '_'
                     
@@ -214,8 +321,9 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
                     is_sentence_initial = (token_idx == 0) or (prev_form and is_sentence_final_punct(prev_form))
                     
                     # Only track capitalization if not all-caps and not sentence-initial
-                    if capitalization_info and not is_sentence_initial and not is_all_caps_word:
+                    if track_capitalization and capitalization_info and not is_sentence_initial and not is_all_caps_word:
                         # Track statistics for this tag in non-initial position
+                        # capitalization_info is a defaultdict when track_capitalization is True
                         if upos and upos != '_':
                             if is_capitalized:
                                 capitalization_info['upos'][upos]['capitalized'] += 1
@@ -249,21 +357,103 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
                             prev_upos = upos
                             prev_xpos = xpos
             
+            # Extract dependency transitions from sentence tokens (in both UPOS and XPOS formats)
+            if track_dependency_transitions and deprel_transitions_upos is not None and sentence_tokens:
+                # Build a mapping from tokid to token_info index for ID-based head lookup
+                tokid_to_idx = {}
+                for idx, token_info in enumerate(sentence_tokens):
+                    elem = token_info['element']
+                    tokid = elem.get('id', '') or elem.get('{http://www.w3.org/XML/1998/namespace}id', '')
+                    if tokid:
+                        tokid_to_idx[tokid] = idx
+                
+                for token_info in sentence_tokens:
+                    elem = token_info['element']
+                    head = elem.get('head', '_')
+                    deprel = elem.get('deprel', '_')
+                    
+                    # Skip if no dependency information
+                    if head == '_' or head == '0' or deprel == '_':
+                        continue
+                    
+                    head_token = None
+                    try:
+                        # Head can be an index (1-based) or an ID reference (tokid)
+                        # Try parsing as integer first (1-based index)
+                        head_idx = int(head) - 1  # Convert to 0-indexed
+                        if 0 <= head_idx < len(sentence_tokens):
+                            head_token = sentence_tokens[head_idx]
+                        else:
+                            # Not a valid index, try as ID reference
+                            if head in tokid_to_idx:
+                                head_token = sentence_tokens[tokid_to_idx[head]]
+                    except (ValueError, TypeError):
+                        # Not a number, try as ID reference
+                        if head in tokid_to_idx:
+                            head_token = sentence_tokens[tokid_to_idx[head]]
+                    
+                    if head_token is None:
+                        # Could not resolve head - skip this token
+                        continue
+                    
+                    try:
+                        # Get POS from token_info dictionary (which has 'upos' and 'xpos' keys)
+                        # Extract both UPOS and XPOS for dual storage
+                        dep_upos = token_info.get('upos', '_')
+                        if dep_upos == '_':
+                            dep_upos = token_info.get('xpos', '_')  # Fallback
+                        dep_xpos = token_info.get('xpos', '_')
+                        if dep_xpos == '_':
+                            dep_xpos = token_info.get('upos', '_')  # Fallback
+                        
+                        head_upos = head_token.get('upos', '_')
+                        if head_upos == '_':
+                            head_upos = head_token.get('xpos', '_')  # Fallback
+                        head_xpos = head_token.get('xpos', '_')
+                        if head_xpos == '_':
+                            head_xpos = head_token.get('upos', '_')  # Fallback
+                        
+                        # Store transitions in both UPOS and XPOS formats
+                        if dep_upos != '_' and head_upos != '_':
+                            key_upos = f"{head_upos}|{dep_upos}|{deprel}"
+                            deprel_transitions_upos[key_upos] += 1
+                        
+                        if dep_xpos != '_' and head_xpos != '_':
+                            key_xpos = f"{head_xpos}|{dep_xpos}|{deprel}"
+                            deprel_transitions_xpos[key_xpos] += 1
+                    except (KeyError, IndexError):
+                        # Missing POS information - skip
+                        continue
+            
             # Count sentence
             if track_transitions and transitions and not is_first_token:
                 transitions['sentences'] += 1
     
     except Exception as e:
         print(f"Error processing {file_path}: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+    
+    # Combine UPOS and XPOS dependency transitions into a single dict
+    deprel_transitions = {}
+    if track_dependency_transitions:
+        if deprel_transitions_upos:
+            deprel_transitions['upos'] = dict(deprel_transitions_upos)
+        if deprel_transitions_xpos:
+            deprel_transitions['xpos'] = dict(deprel_transitions_xpos)
     
     if track_transitions:
-        return word_annotations, transitions, capitalization_info
+        return word_annotations, transitions, capitalization_info, deprel_transitions
     else:
-        # Return empty capitalization_info when not tracking transitions
-        return word_annotations, None, {'upos': {}, 'xpos': {}}
+        # Return empty capitalization_info when not tracking
+        if not track_capitalization:
+            capitalization_info = {'upos': {}, 'xpos': {}}
+        return word_annotations, transitions, capitalization_info, deprel_transitions
 
 
-def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg_attr: str = 'reg', expan_attr: str = 'expan', debug: bool = False):
+def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg_attr: str = 'reg', expan_attr: str = 'expan', 
+                                 debug: bool = False, track_transitions: bool = True, track_capitalization: bool = True,
+                                 track_dependency_transitions: bool = False):
     """
     Build vocabulary from all TEITOK XML files in a folder (recursively).
     
@@ -282,8 +472,7 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
     all_annotations_case = defaultdict(lambda: defaultdict(int))  # form (original case) -> (upos, xpos, feats, lemma, norm_form, expan_form) -> count
     all_annotations_lower = defaultdict(lambda: defaultdict(int))  # form_lower -> (upos, xpos, feats, lemma, norm_form, expan_form) -> count
     
-    # Track transition probabilities for Viterbi tagging
-    # Track tag sequences within sentences
+    # Track transition probabilities for Viterbi tagging (if requested)
     upos_transitions = defaultdict(int)  # (prev_upos, curr_upos) -> count
     xpos_transitions = defaultdict(int)  # (prev_xpos, curr_xpos) -> count
     upos_start_counts = defaultdict(int)  # upos -> count (for sentence-start probabilities)
@@ -293,7 +482,10 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
     capitalizable_tags = {
         'upos': defaultdict(lambda: {'capitalized': 0, 'lowercase': 0}),
         'xpos': defaultdict(lambda: {'capitalized': 0, 'lowercase': 0})
-    }
+    } if track_capitalization else {'upos': {}, 'xpos': {}}
+    
+    # Track dependency transitions for this folder (both UPOS and XPOS formats)
+    folder_deprel_transitions = {'upos': defaultdict(int), 'xpos': defaultdict(int)} if track_dependency_transitions else None
     
     # Find all XML files recursively
     xml_files = list(folder_path.rglob('*.xml'))
@@ -316,7 +508,13 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
             percent = (file_idx * 100) // total_files if total_files > 0 else 0
             print(f"Processing: {file_idx}/{total_files} files ({percent}%)...", file=sys.stderr, end='\r')
         
-        word_annotations, transitions, capitalization_info = extract_vocab_from_teitok_xml(xml_file, xpos_attr, reg_attr, expan_attr, track_transitions=True)
+        word_annotations, transitions, capitalization_info, file_deprel_transitions = extract_vocab_from_teitok_xml(
+            xml_file, xpos_attr, reg_attr, expan_attr, 
+            track_transitions=track_transitions, 
+            track_capitalization=track_capitalization,
+            track_dependency_transitions=track_dependency_transitions,
+            use_xpos=False  # Could be made configurable
+        )
         
         # Merge into main annotations dictionary
         # Track both case-sensitive and lowercase separately
@@ -331,8 +529,8 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
             if form != form_lower:
                 all_annotations_case[form][annotation_key] += count
         
-        # Merge transition probabilities
-        if transitions:
+        # Merge transition probabilities (if tracking)
+        if track_transitions and transitions:
             for (prev_upos, curr_upos), count in transitions.get('upos', {}).items():
                 upos_transitions[(prev_upos, curr_upos)] += count
             for (prev_xpos, curr_xpos), count in transitions.get('xpos', {}).items():
@@ -349,6 +547,16 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
             for tag, stats in capitalization_info['xpos'].items():
                 capitalizable_tags['xpos'][tag]['capitalized'] += stats['capitalized']
                 capitalizable_tags['xpos'][tag]['lowercase'] += stats['lowercase']
+        
+        # Merge dependency transitions (if tracking) - handle both UPOS and XPOS formats
+        if track_dependency_transitions and file_deprel_transitions and folder_deprel_transitions is not None:
+            # file_deprel_transitions is now {'upos': {...}, 'xpos': {...}}
+            if isinstance(file_deprel_transitions, dict):
+                for tag_format in ['upos', 'xpos']:
+                    if tag_format in file_deprel_transitions:
+                        for key, count in file_deprel_transitions[tag_format].items():
+                            if isinstance(count, (int, float)):
+                                folder_deprel_transitions[tag_format][key] += count
     
     # Print newline at the end to clear the progress line (if progress was shown)
     if not debug and total_files > 0:
@@ -359,7 +567,7 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
     
     # Convert transition counts to probabilities (with smoothing)
     transition_probs = {}
-    if total_sentences > 0:
+    if track_transitions and total_sentences > 0:
         # UPOS transition probabilities
         upos_trans_probs = {}
         # Count total transitions from each state
@@ -419,6 +627,8 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
             'start': start_probs,
             'sentences': total_sentences
         }
+    else:
+        transition_probs = {}
     
     # Convert annotation dictionaries to sentence format for shared vocabulary builder
     # This ensures consistency between create-vocab and training vocab building
@@ -472,7 +682,7 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
     vocab = build_vocab_from_sentences(fake_sentences)
     
     # Return both vocabulary and transition probabilities
-    return vocab, transition_probs, capitalizable_tags
+    return vocab, transition_probs, capitalizable_tags, folder_deprel_transitions
 
 
 def main():
@@ -533,7 +743,25 @@ Examples:
     parser.add_argument('--debug', action='store_true',
                        help='Enable debug output (prints each filename being processed)')
     
+    # Data inclusion flags (all enabled by default)
+    data_group = parser.add_argument_group('data selection', 
+                                          'Control which data types are included in the vocabulary file')
+    data_group.add_argument('--no-transitions', action='store_true',
+                           help='Exclude POS tag transition probabilities (UPOS/XPOS transitions)')
+    data_group.add_argument('--no-capitalization', action='store_true',
+                           help='Exclude capitalization statistics')
+    data_group.add_argument('--no-dependency-transitions', action='store_true',
+                           help='Exclude dependency transition probabilities (from CoNLL-U or TEITOK XML files with head/deprel)')
+    data_group.add_argument('--vocab-only', action='store_true',
+                           help='Only include vocabulary entries (exclude all transitions, capitalization, etc.)')
+    
     args = parser.parse_args()
+    
+    # If --vocab-only is set, disable everything else
+    if args.vocab_only:
+        args.no_transitions = True
+        args.no_capitalization = True
+        args.no_dependency_transitions = True
     
     # Import CoNLL-U loading function
     from flexipipe.data_loading import load_conllu_file
@@ -571,16 +799,26 @@ Examples:
     # Process each source and merge vocabularies
     merged_vocab = {}
     # Store transitions in nested format: {prev: {curr: prob}} for upos/xpos, {tag: prob} for start
-    merged_transitions = {
-        'upos': defaultdict(lambda: defaultdict(float)),  # {prev: {curr: prob}}
-        'xpos': defaultdict(lambda: defaultdict(float)),  # {prev: {curr: prob}}
-        'start': defaultdict(float),  # {tag: prob}
-        'sentences': 0
-    }
+    # Only initialize if tracking transitions
+    merged_transitions = None
+    if not args.no_transitions:
+        merged_transitions = {
+            'upos': defaultdict(lambda: defaultdict(float)),  # {prev: {curr: prob}}
+            'xpos': defaultdict(lambda: defaultdict(float)),  # {prev: {curr: prob}}
+            'start': defaultdict(float),  # {tag: prob}
+            'sentences': 0
+        }
+    
+    # Store capitalization statistics (if tracking)
     merged_capitalizable_tags = {
         'upos': defaultdict(lambda: {'capitalized': 0, 'lowercase': 0}),
         'xpos': defaultdict(lambda: {'capitalized': 0, 'lowercase': 0})
-    }
+    } if not args.no_capitalization else {'upos': {}, 'xpos': {}}
+    
+    # Store dependency transitions (if tracking) - both UPOS and XPOS formats
+    merged_deprel_transitions = None
+    if not args.no_dependency_transitions:
+        merged_deprel_transitions = {'upos': defaultdict(int), 'xpos': defaultdict(int)}
     
     source_idx = 0
     
@@ -588,10 +826,17 @@ Examples:
     for folder in xml_folders:
         source_idx += 1
         print(f"\n[{source_idx}/{total_sources}] Processing XML folder: {folder}", file=sys.stderr)
-        vocab, transition_probs, capitalizable_tags = build_vocabulary_from_folder(folder, args.xpos_attr, args.reg, args.expan, debug=args.debug)
+        vocab, transition_probs, capitalizable_tags, folder_deprel_transitions = build_vocabulary_from_folder(
+            folder, args.xpos_attr, args.reg, args.expan, 
+            debug=args.debug,
+            track_transitions=not args.no_transitions,
+            track_capitalization=not args.no_capitalization,
+            track_dependency_transitions=not args.no_dependency_transitions
+        )
         
         if not vocab:
             print(f"Warning: No vocabulary entries found in {folder}. Skipping.", file=sys.stderr)
+            print(f"  Hint: If your XML uses 'pos' instead of 'xpos', try --xpos-attr pos", file=sys.stderr)
             continue
         
         # Merge vocabularies: combine entries and accumulate counts
@@ -634,10 +879,10 @@ Examples:
                 # New entry: add it directly
                 merged_vocab[form] = entry
         
-        # Merge transition probabilities
+        # Merge transition probabilities (if tracking)
         # Note: transition_probs has structure: {'upos': {prev: {curr: prob}}, 'xpos': {prev: {curr: prob}}, 'start': {tag: prob}, 'sentences': N}
         # We merge by averaging probabilities (weighted by sentence count if available)
-        if transition_probs:
+        if not args.no_transitions and transition_probs and merged_transitions:
             folder_sentences = transition_probs.get('sentences', 1)
             total_sentences_before = merged_transitions['sentences']
             
@@ -678,13 +923,24 @@ Examples:
             
             merged_transitions['sentences'] += transition_probs.get('sentences', 0)
         
-        # Merge capitalization statistics
-        for tag, stats in capitalizable_tags['upos'].items():
-            merged_capitalizable_tags['upos'][tag]['capitalized'] += stats['capitalized']
-            merged_capitalizable_tags['upos'][tag]['lowercase'] += stats['lowercase']
-        for tag, stats in capitalizable_tags['xpos'].items():
-            merged_capitalizable_tags['xpos'][tag]['capitalized'] += stats['capitalized']
-            merged_capitalizable_tags['xpos'][tag]['lowercase'] += stats['lowercase']
+        # Merge capitalization statistics (if tracking)
+        if not args.no_capitalization:
+            for tag, stats in capitalizable_tags['upos'].items():
+                merged_capitalizable_tags['upos'][tag]['capitalized'] += stats['capitalized']
+                merged_capitalizable_tags['upos'][tag]['lowercase'] += stats['lowercase']
+            for tag, stats in capitalizable_tags['xpos'].items():
+                merged_capitalizable_tags['xpos'][tag]['capitalized'] += stats['capitalized']
+                merged_capitalizable_tags['xpos'][tag]['lowercase'] += stats['lowercase']
+        
+        # Merge dependency transitions from XML folder (if tracking) - handle both UPOS and XPOS formats
+        if not args.no_dependency_transitions and folder_deprel_transitions and merged_deprel_transitions is not None:
+            # folder_deprel_transitions is now {'upos': {...}, 'xpos': {...}}
+            if isinstance(folder_deprel_transitions, dict):
+                for tag_format in ['upos', 'xpos']:
+                    if tag_format in folder_deprel_transitions:
+                        for key, count in folder_deprel_transitions[tag_format].items():
+                            if isinstance(count, (int, float)):
+                                merged_deprel_transitions[tag_format][key] += count
     
     # Process CoNLL-U files
     from flexipipe.vocabulary import build_vocab_from_sentences
@@ -693,6 +949,10 @@ Examples:
         print(f"\n[{source_idx}/{total_sources}] Processing CoNLL-U file: {conllu_file}", file=sys.stderr)
         sentences = load_conllu_file(conllu_file)
         print(f"  Loaded {len(sentences)} sentences", file=sys.stderr)
+        
+        # Extract dependency transitions from CoNLL-U if available and requested
+        if not args.no_dependency_transitions and merged_deprel_transitions is not None:
+            _extract_dependency_transitions_from_conllu(sentences, merged_deprel_transitions, use_xpos=False)
         
         # Build vocabulary from sentences (no transition probabilities for CoNLL-U files)
         vocab = build_vocab_from_sentences(sentences)
@@ -731,18 +991,47 @@ Examples:
                 merged_vocab[form] = entry
     
     # Convert defaultdicts to regular dicts for JSON serialization
-    transition_probs_final = {
-        'upos': {prev: dict(curr_dict) for prev, curr_dict in merged_transitions['upos'].items()},
-        'xpos': {prev: dict(curr_dict) for prev, curr_dict in merged_transitions['xpos'].items()},
-        'start': dict(merged_transitions['start']),
-        'sentences': merged_transitions['sentences']
-    }
+    transition_probs_final = {}
+    if merged_transitions:
+        transition_probs_final = {
+            'upos': {prev: dict(curr_dict) for prev, curr_dict in merged_transitions['upos'].items()},
+            'xpos': {prev: dict(curr_dict) for prev, curr_dict in merged_transitions['xpos'].items()},
+            'start': dict(merged_transitions['start']),
+            'sentences': merged_transitions['sentences']
+        }
+    
+    # Add dependency transitions if available (even if regular transitions are disabled)
+    # merged_deprel_transitions is now {'upos': {...}, 'xpos': {...}}
+    if merged_deprel_transitions:
+        deprel_probs = {}
+        for tag_format in ['upos', 'xpos']:
+            if tag_format in merged_deprel_transitions:
+                format_transitions = merged_deprel_transitions[tag_format]
+                if format_transitions:
+                    # Convert counts to probabilities (simple normalization)
+                    deprel_counts = dict(format_transitions) if isinstance(format_transitions, dict) else {}
+                    total_deprel_count = sum(deprel_counts.values())
+                    if total_deprel_count > 0:
+                        format_probs = {}
+                        for key, count in deprel_counts.items():
+                            # Keys are already strings: "head_pos|dep_pos|deprel"
+                            if isinstance(key, tuple) and len(key) == 3:
+                                key_str = f"{key[0]}|{key[1]}|{key[2]}"
+                            else:
+                                key_str = str(key)
+                            format_probs[key_str] = count / total_deprel_count
+                        deprel_probs[tag_format] = format_probs
+        
+        if deprel_probs:
+            transition_probs_final['deprel'] = deprel_probs
     
     vocab = merged_vocab
-    transition_probs = transition_probs_final
+    # Only set transition_probs if it has content (either regular transitions or dependency transitions)
+    transition_probs = transition_probs_final if transition_probs_final else {}
     
     if not vocab:
         print("Warning: No vocabulary entries found. Check that XML files contain <tok> or <dtok> elements.", file=sys.stderr)
+        print("  Hint: If your XML uses 'pos' instead of 'xpos', try --xpos-attr pos", file=sys.stderr)
         sys.exit(1)
     
     # Calculate statistics
@@ -764,9 +1053,9 @@ Examples:
             total_analyses += 1
     
     # Transition statistics
-    upos_trans_count = sum(len(v) for v in transition_probs.get('upos', {}).values()) if transition_probs else 0
-    xpos_trans_count = sum(len(v) for v in transition_probs.get('xpos', {}).values()) if transition_probs else 0
-    start_count = len(transition_probs.get('start', {})) if transition_probs else 0
+    upos_trans_count = sum(len(v) for v in transition_probs.get('upos', {}).values()) if transition_probs and not args.no_transitions else 0
+    xpos_trans_count = sum(len(v) for v in transition_probs.get('xpos', {}).values()) if transition_probs and not args.no_transitions else 0
+    start_count = len(transition_probs.get('start', {})) if transition_probs and not args.no_transitions else 0
     
     # Determine corpus name
     # If explicit corpus name provided, use it
@@ -819,10 +1108,11 @@ Examples:
             'total_analyses': total_analyses
         },
         'transition_stats': {
-            'upos_transitions': upos_trans_count,
-            'xpos_transitions': xpos_trans_count,
-            'start_states': start_count,
-            'has_transitions': bool(transition_probs)
+            'upos_transitions': upos_trans_count if not args.no_transitions else 0,
+            'xpos_transitions': xpos_trans_count if not args.no_transitions else 0,
+            'start_states': start_count if not args.no_transitions else 0,
+            'has_transitions': bool(transition_probs_final) if not args.no_transitions else False,
+            'has_dependency_transitions': bool(merged_deprel_transitions) if not args.no_dependency_transitions else False
         },
         'source_stats': {
             'xml_files_processed': xml_file_count
@@ -855,6 +1145,9 @@ Examples:
         print(f"  UPOS transitions: {upos_trans_count}", file=sys.stderr)
         print(f"  XPOS transitions: {xpos_trans_count}", file=sys.stderr)
         print(f"  Start states: {start_count}", file=sys.stderr)
+        if 'deprel' in transition_probs:
+            deprel_count = len(transition_probs['deprel'])
+            print(f"  Dependency transitions: {deprel_count}", file=sys.stderr)
     
     print(f"\nSource Information:", file=sys.stderr)
     print(f"  Corpus: {corpus_name}", file=sys.stderr)
