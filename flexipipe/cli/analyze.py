@@ -20,6 +20,7 @@ def main():
     )
     parser.add_argument('--model', type=Path, help='Path to trained model')
     parser.add_argument('--vocab', type=Path, help='Vocabulary JSON to analyze')
+    parser.add_argument('--lexicon', type=Path, help='Lexicon file (UniMorph or JSON) to analyze')
     parser.add_argument('--normalization-suffixes', type=Path,
                        help='External suffix list (JSON)')
     parser.add_argument('--expan', default='expan',
@@ -53,26 +54,26 @@ def main():
     )
     
     # Load vocabulary
+    from flexipipe.vocabulary import load_vocabulary_file
+    
     vocab = {}
     if args.vocab:
-        with open(args.vocab, 'r', encoding='utf-8') as f:
-            vocab_data = json.load(f)
-        if isinstance(vocab_data, dict) and 'vocab' in vocab_data:
-            vocab = vocab_data.get('vocab', {})
-        else:
-            vocab = vocab_data
+        vocab, _, _ = load_vocabulary_file(args.vocab, default_count=1)
     elif args.model and Path(args.model).exists():
         model_vocab_file = Path(args.model) / 'model_vocab.json'
         if model_vocab_file.exists():
-            with open(model_vocab_file, 'r', encoding='utf-8') as f:
-                vocab_data = json.load(f)
-            if isinstance(vocab_data, dict) and 'vocab' in vocab_data:
-                vocab = vocab_data.get('vocab', {})
-            else:
-                vocab = vocab_data
+            vocab, _, _ = load_vocabulary_file(model_vocab_file, default_count=1)
+    
+    # Load lexicon if provided
+    lexicon = {}
+    if args.lexicon:
+        from flexipipe.vocabulary import load_vocabulary_file
+        lexicon, _, _ = load_vocabulary_file(args.lexicon, default_count=1)
+        if lexicon:
+            print(f"Loaded {len(lexicon)} lexicon entries (OOV fallback only)", file=sys.stderr)
     
     # Analyze
-    tagger = FlexiPipeTagger(config, vocab=vocab, model_path=args.model if args.model else None)
+    tagger = FlexiPipeTagger(config, vocab=vocab, model_path=args.model if args.model else None, lexicon=lexicon if lexicon else None)
     if not tagger.vocab:
         tagger.vocab = vocab
     tagger._build_normalization_inflection_suffixes()
@@ -118,6 +119,28 @@ def main():
                 vocab_analysis['form_xpos_lower'] = {key_lower: tagger.vocab[key_lower]}
         
         analysis['vocabulary'] = vocab_analysis
+        
+        # Lexicon lookup (if available)
+        lexicon_analysis = {}
+        if tagger.lexicon:
+            word_lower = word.lower()
+            # Check exact case
+            if word in tagger.lexicon:
+                entry = tagger.lexicon[word]
+                lexicon_analysis['exact_case'] = entry
+            # Check lowercase
+            if word_lower in tagger.lexicon:
+                entry = tagger.lexicon[word_lower]
+                lexicon_analysis['lowercase'] = entry
+            # Check form:xpos
+            if xpos:
+                key = f"{word}:{xpos}"
+                if key in tagger.lexicon:
+                    lexicon_analysis['form_xpos'] = {key: tagger.lexicon[key]}
+                key_lower = f"{word_lower}:{xpos}"
+                if key_lower in tagger.lexicon:
+                    lexicon_analysis['form_xpos_lower'] = {key_lower: tagger.lexicon[key_lower]}
+        analysis['lexicon'] = lexicon_analysis
         
         # Normalization analysis
         norm_analysis = {}

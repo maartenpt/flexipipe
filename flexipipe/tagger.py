@@ -2488,77 +2488,11 @@ class FlexiPipeTagger:
         return '_'
     
     def _apply_lemmatization_patterns(self, form: str, xpos: str) -> str:
-        """
-        Apply lemmatization patterns to OOV word (TreeTagger/Neotag style).
-        
-        Finds all matching patterns and applies the one with highest count of distinct lemma/form pairs.
-        When multiple patterns match the same suffix length, picks the one with most examples.
-        Example: 
-        - "estudiantes" with patterns (-es, ""), (-des, "d"), (-edes, "ed") -> "estudiante" (uses longest: -edes)
-        - For "palabrades" ending in -ades: if both (-ade, "") and (-ad, "") match, pick the one with highest count
-        
-        Args:
-            form: Word form to lemmatize
-            xpos: XPOS tag for pattern matching
-        
-        Returns:
-            Lemma or '_' if no pattern matches
-        """
-        if not self.lemmatization_patterns or xpos not in self.lemmatization_patterns:
+        """Wrapper around shared lemmatization pattern application."""
+        from flexipipe.lemmatizer import apply_lemmatization_patterns
+        if not self.lemmatization_patterns:
             return '_'
-        
-        form_lower = form.lower()
-        patterns = self.lemmatization_patterns[xpos]
-        
-        # Find all matching patterns (patterns where suffix_from matches the end of the form)
-        matching_patterns = []
-        
-        for pattern_tuple in patterns:
-            if len(pattern_tuple) == 4:
-                suffix_from, suffix_to, min_base, count = pattern_tuple
-            else:
-                # Backward compatibility: old format without count
-                suffix_from, suffix_to, min_base = pattern_tuple[:3]
-                count = 1  # Default count if not available
-            
-            # Check if form matches this pattern
-            if suffix_from:
-                # Include deletion patterns (empty suffix_to) if they have high enough count
-                # Deletion patterns like -es → '' are valid for cases like "mercedes" → "merced"
-                # But we need to be careful - only allow deletion if count is high enough (reliable)
-                if not suffix_to and suffix_from:
-                    # Empty suffix_to: deletion pattern (e.g., -es → '' for "mercedes" → "merced")
-                    # Only allow if count is high enough (at least 3) to be reliable
-                    if count < 3:
-                        # Skip unreliable deletion patterns
-                        continue
-                if form_lower.endswith(suffix_from):
-                    base = form_lower[:-len(suffix_from)]
-                    if len(base) >= min_base:
-                        lemma = base + suffix_to  # Will be just "base" if suffix_to is empty
-                        # Verify lemma is reasonable (not empty, not too short)
-                        if len(lemma) >= 2:
-                            # Store: (suffix_length, count, lemma)
-                            # "No change" patterns (suffix_from == suffix_to) are valid and important
-                            # Deletion patterns (suffix_to == '') are also valid if count is high
-                            matching_patterns.append((len(suffix_from), count, lemma))
-            elif suffix_to:
-                # Pattern: add suffix_to (less common, but possible)
-                if len(form_lower) >= min_base:
-                    lemma = form_lower + suffix_to
-                    if len(lemma) >= 2:
-                        matching_patterns.append((0, count, lemma))  # Suffix length 0 for add patterns
-        
-        if not matching_patterns:
-            return '_'
-        
-        # Resolve conflicts: if multiple patterns match, prefer:
-        # 1. Longest suffix (most specific match)
-        # 2. Highest count (most distinct lemma/form pairs) when suffix lengths are equal
-        matching_patterns.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        
-        # Return lemma from the best matching pattern
-        return matching_patterns[0][2]
+        return apply_lemmatization_patterns(form, xpos, self.lemmatization_patterns)
     
     def write_output(self, sentences: List[List[Dict]], output_file: Optional[Path], format: str = "conllu"):
         """Write tagged sentences to output file or stdout.

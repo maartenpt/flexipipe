@@ -420,57 +420,28 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
             'sentences': total_sentences
         }
     
-    # First, process case-sensitive forms (e.g., "Band", "Apple")
-    for form, annotations in all_annotations_case.items():
-        # Collect all annotation combinations (sorted by frequency, most frequent first)
-        annotation_list = sorted(annotations.items(), key=lambda x: x[1], reverse=True)
-        
-        # Build entries for each annotation combination
-        entries = []
-        seen_combinations = set()
-        
-        for (upos, xpos, feats, lemma, norm_form, expan_form), count in annotation_list:
-            combination_key = (upos, xpos, feats, lemma, norm_form, expan_form)
-            if combination_key in seen_combinations:
-                continue
-            seen_combinations.add(combination_key)
-            
-            # Build entry (only include non-"_" fields, except lemma which is always included)
-            entry = {}
-            if upos != '_':
-                entry['upos'] = upos
-            if xpos != '_':
-                entry['xpos'] = xpos
-            if feats != '_':
-                entry['feats'] = feats
-            entry['lemma'] = lemma
-            # Include normalization/expansion if present (for explicit mappings)
-            if norm_form and norm_form != '_':
-                entry['reg'] = norm_form
-            if expan_form and expan_form != '_':
-                entry['expan'] = expan_form
-            # Include count/frequency for this analysis (useful for disambiguation)
-            entry['count'] = count
-            
-            if entry:
-                entries.append(entry)
-        
-        # Store in vocabulary (case-sensitive entry)
-        if entries:
-            if len(entries) == 1:
-                vocab[form] = entries[0]
-            else:
-                vocab[form] = entries
+    # Convert annotation dictionaries to sentence format for shared vocabulary builder
+    # This ensures consistency between create-vocab and training vocab building
+    from flexipipe.vocabulary import build_vocab_from_sentences
     
-    # Then, process lowercase forms (for fallback when case-sensitive entry doesn't exist)
-    # Only add lowercase entries if they don't conflict with case-sensitive entries
-    # OR if they have different annotations (e.g., "Band" = NOUN, "band" = VERB)
+    # Build "fake" sentences from annotations (for shared function)
+    # Each token appears as many times as its count
+    fake_sentences = []
+    for form, annotations in all_annotations_case.items():
+        for (upos, xpos, feats, lemma, norm_form, expan_form), count in annotations.items():
+            for _ in range(count):
+                fake_sentences.append([{
+                    'form': form,
+                    'upos': upos,
+                    'xpos': xpos,
+                    'feats': feats,
+                    'lemma': lemma,
+                    'norm_form': norm_form,
+                    'expan': expan_form
+                }])
+    
     for form_lower, annotations in all_annotations_lower.items():
-        # Check if a case-sensitive form with different annotations already exists
-        # If same annotations, we don't need separate lowercase entry (case-sensitive handles it)
-        # If different annotations, we need both entries
-        
-        # Find case-sensitive forms that match this lowercase
+        # Only add if no case-sensitive form exists with same annotations
         case_sensitive_exists = False
         case_sensitive_annotations = set()
         for case_form in all_annotations_case.keys():
@@ -480,56 +451,25 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
                     case_sensitive_annotations.add(ann_key)
                 break
         
-        # If case-sensitive exists and has same annotations, skip lowercase (to avoid duplicates)
-        # But if annotations differ OR no case-sensitive exists, we need lowercase entry
         if case_sensitive_exists:
             lowercase_annotations = set(annotations.keys())
             if lowercase_annotations == case_sensitive_annotations:
-                # Same annotations: skip lowercase entry (case-sensitive will handle it)
-                continue
-            # Different annotations: keep both (case-sensitive already added above, lowercase needed for fallback)
+                continue  # Skip if same as case-sensitive
         
-        # Collect all annotation combinations (sorted by frequency, most frequent first)
-        annotation_list = sorted(annotations.items(), key=lambda x: x[1], reverse=True)
-        
-        # Build entries for each annotation combination
-        entries = []
-        seen_combinations = set()
-        
-        for (upos, xpos, feats, lemma, norm_form, expan_form), count in annotation_list:
-            combination_key = (upos, xpos, feats, lemma, norm_form, expan_form)
-            if combination_key in seen_combinations:
-                continue
-            seen_combinations.add(combination_key)
-            
-            # Build entry (only include non-"_" fields, except lemma which is always included)
-            entry = {}
-            if upos != '_':
-                entry['upos'] = upos
-            if xpos != '_':
-                entry['xpos'] = xpos
-            if feats != '_':
-                entry['feats'] = feats
-            entry['lemma'] = lemma
-            # Include normalization/expansion if present (for explicit mappings)
-            if norm_form and norm_form != '_':
-                entry['reg'] = norm_form
-            if expan_form and expan_form != '_':
-                entry['expan'] = expan_form
-            # Include count/frequency for this analysis (useful for disambiguation)
-            entry['count'] = count
-            
-            if entry:
-                entries.append(entry)
-        
-        # Store in vocabulary (only if not already present as case-sensitive with same annotations)
-        if entries and form_lower not in vocab:
-            # If only one analysis, store as single object (not array) for backward compatibility
-            # If multiple analyses, store as array
-            if len(entries) == 1:
-                vocab[form_lower] = entries[0]
-            else:
-                vocab[form_lower] = entries
+        for (upos, xpos, feats, lemma, norm_form, expan_form), count in annotations.items():
+            for _ in range(count):
+                fake_sentences.append([{
+                    'form': form_lower,
+                    'upos': upos,
+                    'xpos': xpos,
+                    'feats': feats,
+                    'lemma': lemma,
+                    'norm_form': norm_form,
+                    'expan': expan_form
+                }])
+    
+    # Use shared vocabulary building function
+    vocab = build_vocab_from_sentences(fake_sentences)
     
     # Return both vocabulary and transition probabilities
     return vocab, transition_probs, capitalizable_tags
@@ -538,27 +478,29 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
 def main():
     parser = argparse.ArgumentParser(
         prog='flexipipe create-vocab',
-        description='Extract vocabulary from TEITOK XML files for FlexiPipe',
+        description='Extract vocabulary from TEITOK XML files or CoNLL-U files for FlexiPipe',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Extract vocabulary with default attributes (xpos='xpos', reg='reg')
+  # Extract vocabulary from TEITOK XML folder with default attributes
   python -m flexipipe create-vocab /path/to/xml/folder --output custom_vocab.json
   
-  # Extract vocabulary from multiple folders (merged into one vocabulary)
-  python -m flexipipe create-vocab /path/to/corpus1 /path/to/corpus2 /path/to/corpus3 --output combined_vocab.json
+  # Extract vocabulary from CoNLL-U file(s)
+  python -m flexipipe create-vocab train.conllu dev.conllu --output model_vocab.json
   
-  # Extract vocabulary using 'pos' attribute instead of 'xpos'
+  # Extract vocabulary from multiple sources (folders and files)
+  python -m flexipipe create-vocab /path/to/xml/folder train.conllu --output combined_vocab.json
+  
+  # Extract vocabulary using 'pos' attribute instead of 'xpos' (XML only)
   python -m flexipipe create-vocab /path/to/xml/folder --output custom_vocab.json --xpos-attr pos
   
-  # Extract vocabulary using 'msd' attribute for XPOS
+  # Extract vocabulary using 'msd' attribute for XPOS (XML only)
   python -m flexipipe create-vocab /path/to/xml/folder --output custom_vocab.json --xpos-attr msd
   
-  # Extract vocabulary using 'nform' attribute for normalization instead of 'reg'
+  # Extract vocabulary using 'nform' attribute for normalization instead of 'reg' (XML only)
   python -m flexipipe create-vocab /path/to/xml/folder --output custom_vocab.json --reg nform
   
-  # Extract vocabulary with attribute inheritance (TEITOK style)
-  # Try @nform first, then @fform if @nform is not present; expansion from expan,fform
+  # Extract vocabulary with attribute inheritance (TEITOK style, XML only)
   python -m flexipipe create-vocab /path/to/xml/folder --output custom_vocab.json --xpos-attr pos,msd --reg nform,fform --expan expan,fform
   
   # Extract vocabulary with custom corpus name
@@ -567,8 +509,9 @@ Examples:
     )
     
     parser.add_argument('folders', type=Path, nargs='+',
-                       help='One or more root folders containing TEITOK XML files (will search recursively). '
-                            'Vocabularies from multiple folders will be merged together.')
+                       help='One or more root folders containing TEITOK XML files (will search recursively), '
+                            'or individual CoNLL-U files (.conllu). '
+                            'Vocabularies from multiple sources will be merged together.')
     parser.add_argument('--output', '-o', type=Path, default=Path('custom_vocab.json'),
                        help='Output vocabulary file (default: custom_vocab.json)')
     parser.add_argument('--xpos-attr', default='xpos',
@@ -592,25 +535,40 @@ Examples:
     
     args = parser.parse_args()
     
-    # Check if all folders exist and are directories
-    for folder in args.folders:
-        if not folder.exists():
-            print(f"Error: Folder does not exist: {folder}", file=sys.stderr)
+    # Import CoNLL-U loading function
+    from flexipipe.data_loading import load_conllu_file
+    
+    # Separate folders (for XML) and files (for CoNLL-U)
+    xml_folders = []
+    conllu_files = []
+    
+    for path in args.folders:
+        if not path.exists():
+            print(f"Error: Path does not exist: {path}", file=sys.stderr)
             sys.exit(1)
         
-        if not folder.is_dir():
-            print(f"Error: Not a directory: {folder}", file=sys.stderr)
+        if path.is_file() and path.suffix.lower() in ['.conllu', '.conll']:
+            conllu_files.append(path)
+        elif path.is_dir():
+            xml_folders.append(path)
+        else:
+            print(f"Error: {path} is neither a directory nor a CoNLL-U file (.conllu/.conll)", file=sys.stderr)
             sys.exit(1)
     
-    # Build vocabulary from all folders
-    print(f"Extracting vocabulary from {len(args.folders)} folder(s):", file=sys.stderr)
-    for folder in args.folders:
-        print(f"  - {folder}", file=sys.stderr)
-    print(f"Using XPOS attribute: {args.xpos_attr}", file=sys.stderr)
-    print(f"Using normalization attribute: {args.reg}", file=sys.stderr)
-    print(f"Using expansion attribute: {args.expan}", file=sys.stderr)
+    # Build vocabulary from all sources
+    total_sources = len(xml_folders) + len(conllu_files)
+    print(f"Extracting vocabulary from {total_sources} source(s):", file=sys.stderr)
+    for folder in xml_folders:
+        print(f"  - {folder} (XML folder)", file=sys.stderr)
+    for conllu_file in conllu_files:
+        print(f"  - {conllu_file} (CoNLL-U file)", file=sys.stderr)
     
-    # Process each folder and merge vocabularies
+    if xml_folders:
+        print(f"Using XPOS attribute: {args.xpos_attr}", file=sys.stderr)
+        print(f"Using normalization attribute: {args.reg}", file=sys.stderr)
+        print(f"Using expansion attribute: {args.expan}", file=sys.stderr)
+    
+    # Process each source and merge vocabularies
     merged_vocab = {}
     # Store transitions in nested format: {prev: {curr: prob}} for upos/xpos, {tag: prob} for start
     merged_transitions = {
@@ -624,8 +582,12 @@ Examples:
         'xpos': defaultdict(lambda: {'capitalized': 0, 'lowercase': 0})
     }
     
-    for folder_idx, folder in enumerate(args.folders, 1):
-        print(f"\n[{folder_idx}/{len(args.folders)}] Processing folder: {folder}", file=sys.stderr)
+    source_idx = 0
+    
+    # Process XML folders
+    for folder in xml_folders:
+        source_idx += 1
+        print(f"\n[{source_idx}/{total_sources}] Processing XML folder: {folder}", file=sys.stderr)
         vocab, transition_probs, capitalizable_tags = build_vocabulary_from_folder(folder, args.xpos_attr, args.reg, args.expan, debug=args.debug)
         
         if not vocab:
@@ -724,6 +686,50 @@ Examples:
             merged_capitalizable_tags['xpos'][tag]['capitalized'] += stats['capitalized']
             merged_capitalizable_tags['xpos'][tag]['lowercase'] += stats['lowercase']
     
+    # Process CoNLL-U files
+    from flexipipe.vocabulary import build_vocab_from_sentences
+    for conllu_file in conllu_files:
+        source_idx += 1
+        print(f"\n[{source_idx}/{total_sources}] Processing CoNLL-U file: {conllu_file}", file=sys.stderr)
+        sentences = load_conllu_file(conllu_file)
+        print(f"  Loaded {len(sentences)} sentences", file=sys.stderr)
+        
+        # Build vocabulary from sentences (no transition probabilities for CoNLL-U files)
+        vocab = build_vocab_from_sentences(sentences)
+        
+        if not vocab:
+            print(f"Warning: No vocabulary entries found in {conllu_file}. Skipping.", file=sys.stderr)
+            continue
+        
+        # Merge vocabularies (same logic as XML folders)
+        for form, entry in vocab.items():
+            if form in merged_vocab:
+                existing_entry = merged_vocab[form]
+                new_entry = entry
+                existing_list = existing_entry if isinstance(existing_entry, list) else [existing_entry]
+                new_list = new_entry if isinstance(new_entry, list) else [new_entry]
+                merged_analyses = {}
+                for analysis in existing_list + new_list:
+                    key = (
+                        analysis.get('upos', '_'),
+                        analysis.get('xpos', '_'),
+                        analysis.get('feats', '_'),
+                        analysis.get('lemma', '_'),
+                        analysis.get('reg', '_'),
+                        analysis.get('expan', '_')
+                    )
+                    if key in merged_analyses:
+                        merged_analyses[key]['count'] += analysis.get('count', 1)
+                    else:
+                        merged_analyses[key] = analysis.copy()
+                merged_list = list(merged_analyses.values())
+                if len(merged_list) == 1:
+                    merged_vocab[form] = merged_list[0]
+                else:
+                    merged_vocab[form] = merged_list
+            else:
+                merged_vocab[form] = entry
+    
     # Convert defaultdicts to regular dicts for JSON serialization
     transition_probs_final = {
         'upos': {prev: dict(curr_dict) for prev, curr_dict in merged_transitions['upos'].items()},
@@ -767,27 +773,27 @@ Examples:
     if args.corpus_name:
         corpus_name = args.corpus_name
     else:
-        # For multiple folders, use a combined name or first folder name
-        if len(args.folders) == 1:
-            folder = args.folders[0]
-            # Check if folder name is generic (like "xmlfiles", "xml", "data", etc.)
-            # If so, use parent folder name instead (which is typically the project/corpus name)
-            generic_folder_names = {'xmlfiles', 'xml', 'data', 'files', 'xml_data', 'xml_files', 'source', 'src'}
-            folder_name_lower = folder.name.lower()
-            
-            if folder_name_lower in generic_folder_names and folder.parent != folder:
-                # Use parent folder name (project/corpus name)
-                corpus_name = folder.parent.name
+        # For single source, use its name
+        if total_sources == 1:
+            source = xml_folders[0] if xml_folders else conllu_files[0]
+            if source.is_dir():
+                # Check if folder name is generic (like "xmlfiles", "xml", "data", etc.)
+                generic_folder_names = {'xmlfiles', 'xml', 'data', 'files', 'xml_data', 'xml_files', 'source', 'src'}
+                folder_name_lower = source.name.lower()
+                if folder_name_lower in generic_folder_names and source.parent != source:
+                    corpus_name = source.parent.name
+                else:
+                    corpus_name = source.name
             else:
-                # Use folder name itself
-                corpus_name = folder.name
+                # CoNLL-U file: use filename without extension
+                corpus_name = source.stem
         else:
-            # Multiple folders: use combined name
-            corpus_name = f"combined_{len(args.folders)}_corpora"
+            # Multiple sources: use combined name
+            corpus_name = f"combined_{total_sources}_sources"
     
     # Count XML files processed from all folders
     xml_file_count = 0
-    for folder in args.folders:
+    for folder in xml_folders:
         xml_files = list(folder.rglob('*.xml'))
         xml_file_count += len(xml_files)
     
@@ -795,7 +801,8 @@ Examples:
     metadata = {
         'corpus_name': corpus_name,
         'creation_date': datetime.now().isoformat(),
-        'source_folders': [str(f) for f in args.folders],
+        'source_folders': [str(f) for f in xml_folders],
+        'source_files': [str(f) for f in conllu_files],
         'xpos_attr': args.xpos_attr,
         'reg_attr': args.reg,
         'language': args.language if args.language else None,

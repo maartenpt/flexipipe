@@ -512,9 +512,14 @@ Built automatically during training, saved as `model_vocab.json`. Contains word-
 
 ### External Vocabulary
 
-JSON file for tuning to local corpus (extends/overrides model vocabulary). Can be created using `flexipipe_create_vocab.py`.
+FlexiPipe supports multiple vocabulary formats:
+
+1. **FlexiPipe JSON format** (recommended): JSON file for tuning to local corpus (extends/overrides model vocabulary). Can be created using `flexipipe create-vocab`.
+2. **UniMorph lexicon format**: Tab-separated format (`form\tlemma\tfeatures`) for morphological lexicons.
 
 ### Format Specification
+
+#### FlexiPipe JSON Format
 
 **Single Analysis (Unambiguous Word)**:
 ```json
@@ -537,10 +542,10 @@ JSON file for tuning to local corpus (extends/overrides model vocabulary). Can b
 
 **Note**: 
 - The `reg` field is optional and used for explicit normalization mappings (corresponds to `Reg=` in CoNLL-U and `@reg` in TEITOK). This is especially useful for historic documents where orthographic variants depend on transcription standards, region, period, and register. If `reg` is present, it takes priority over similarity-based normalization.
-- The `count` field indicates the frequency of this word with this specific analysis in the training corpus. This is useful for disambiguation when a word has multiple possible analyses (see below).
+- The `count` field is **optional**. If missing, a default count of 1 is used. Counts are useful for disambiguation when a word has multiple possible analyses (see below). Vocabularies without counts work perfectly fine for lemmatization and tagging.
 
 **Multiple Analyses (Ambiguous Word)**:
-For words with multiple possible analyses (different UPOS/XPOS/FEATS/LEMMA combinations), use an array. The `count` field helps determine the most likely analysis:
+For words with multiple possible analyses (different UPOS/XPOS/FEATS/LEMMA combinations), use an array. The `count` field (if present) helps determine the most likely analysis:
 ```json
 {
   "band": [
@@ -607,6 +612,58 @@ Case-sensitive forms are stored separately to handle language-specific distincti
   ]
 }
 ```
+
+#### UniMorph Lexicon Format
+
+FlexiPipe can load UniMorph lexicons directly. UniMorph format is tab-separated:
+
+```
+lemma	form	features
+```
+
+**Example**:
+```
+lächeln	lächelt	V;IND;SG;3;PRS
+gehen	geht	V;IND;SG;3;PRS
+Haus	Häuser	N;PL;NOM
+```
+
+**Format details**:
+- **lemma**: The lemma (dictionary form) - first column
+- **form**: The inflected word form - second column
+- **features**: UniMorph features (semicolon-separated, e.g., `V;IND;SG;3;PRS`) - third column
+
+**Note**: UniMorph format is `lemma\tform\tfeatures`, not `form\tlemma\tfeatures`. The lemma comes first.
+
+FlexiPipe automatically converts UniMorph features to UD FEATS format where possible:
+- UniMorph POS tags (e.g., `V`, `N`, `ADJ`) are mapped to UPOS
+- Common UniMorph features are converted to UD format:
+  - `PST` → `Tense=Past`, `PRS` → `Tense=Pres`, `FUT` → `Tense=Fut`
+  - `SG` → `Number=Sing`, `PL` → `Number=Plur`
+  - `1`, `2`, `3` → `Person=1`, `Person=2`, `Person=3`
+  - `NOM`, `ACC`, `GEN`, `DAT` → `Case=Nom`, `Case=Acc`, `Case=Gen`, `Case=Dat`
+  - And more...
+
+**Usage**:
+```bash
+# Use as lexicon (OOV fallback only)
+python -m flexipipe tag input.txt --lexicon lexicon.tsv --vocab corpus_vocab.json --output output.conllu
+
+# Or use lexicon alone (if no corpus vocabulary available)
+python -m flexipipe tag input.txt --lexicon lexicon.tsv --output output.conllu
+```
+
+**Important**: Lexicons are used as **fallback for OOV words only**. They are not merged with vocabulary files. This means:
+- If a word is in the vocabulary (from `--vocab`), the vocabulary entry is used
+- If a word is OOV (not in vocabulary), the lexicon is checked as a fallback
+- This ensures corpus-specific vocabulary (with counts) takes priority over general lexicons
+
+UniMorph lexicons are particularly useful for:
+- Low-resource languages with available UniMorph data
+- Adding morphological information from external lexicons
+- Supplementing corpus-derived vocabularies with comprehensive morphological paradigms
+
+**Note**: UniMorph entries are assigned a default count of 1 (since UniMorph doesn't include frequency information). This works fine for lemmatization and tagging.
 
 **Vocabulary Features**:
 - **Arrays for ambiguity**: Multiple analyses stored as arrays, sorted by frequency (most frequent first)

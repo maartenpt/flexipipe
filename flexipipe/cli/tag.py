@@ -36,6 +36,8 @@ def main():
                        help='BERT base model if no trained model')
     parser.add_argument('--vocab', type=Path, nargs='+',
                        help='Vocabulary file(s) (JSON). Multiple files can be specified; later files override earlier ones for the same words.')
+    parser.add_argument('--lexicon', type=Path, nargs='+',
+                       help='Lexicon file(s) (UniMorph or JSON without counts). Used as fallback for OOV words only, not merged with vocabulary.')
     parser.add_argument('--vocab-priority', action='store_true',
                        help='Give vocabulary priority over model predictions')
     parser.add_argument('--confidence-threshold', type=float, default=0.7,
@@ -146,22 +148,43 @@ def main():
     vocab_metadata = None
     vocab_file_paths = []
     
+    # Load lexicons separately (used as fallback for OOV words only)
+    lexicons = {}
+    lexicon_file_paths = []
+    
+    if args.lexicon:
+        from flexipipe.vocabulary import load_vocabulary_file
+        
+        for lexicon_file in args.lexicon:
+            lexicon_file_path = Path(lexicon_file)
+            lexicon_from_file, _, _ = load_vocabulary_file(lexicon_file_path, default_count=1)
+            
+            # Merge lexicons (simple merge, no weighting since they're all fallback)
+            for form, entry in lexicon_from_file.items():
+                if form not in lexicons:
+                    lexicons[form] = entry
+                else:
+                    # Merge entries: combine into list if needed
+                    existing_entry = lexicons[form]
+                    new_entry = entry
+                    existing_list = existing_entry if isinstance(existing_entry, list) else [existing_entry]
+                    new_list = new_entry if isinstance(new_entry, list) else [new_entry]
+                    # Combine all analyses
+                    combined = existing_list + new_list
+                    lexicons[form] = combined[0] if len(combined) == 1 else combined
+            
+            lexicon_file_paths.append(lexicon_file_path)
+        
+        if lexicons:
+            print(f"Loaded {len(lexicons)} lexicon entries from {len(lexicon_file_paths)} file(s) (OOV fallback only)", file=sys.stderr)
+    
     if args.vocab:
         # Process vocab files in order - later files override earlier ones
+        from flexipipe.vocabulary import load_vocabulary_file
+        
         for vocab_file in args.vocab:
-            with open(vocab_file, 'r', encoding='utf-8') as f:
-                vocab_data = json.load(f)
-            
-            vocab_from_file = {}
-            transitions_from_file = None
-            metadata_from_file = None
-            
-            if isinstance(vocab_data, dict) and 'vocab' in vocab_data:
-                vocab_from_file = vocab_data.get('vocab', {})
-                transitions_from_file = vocab_data.get('transitions', None)
-                metadata_from_file = vocab_data.get('metadata', None)
-            else:
-                vocab_from_file = vocab_data
+            vocab_file_path = Path(vocab_file)
+            vocab_from_file, transitions_from_file, metadata_from_file = load_vocabulary_file(vocab_file_path, default_count=1)
             
             # Merge vocabularies: combine analyses, but prioritize later files
             # This preserves all analyses from all vocab files, but gives higher weight to later ones
@@ -349,7 +372,7 @@ def main():
             vocab_file_paths.append(vocab_file)
     
     # Create tagger
-    tagger = FlexiPipeTagger(config, vocab, model_path=args.model if args.model else None, transition_probs=transition_probs, vocab_metadata=vocab_metadata)
+    tagger = FlexiPipeTagger(config, vocab, model_path=args.model if args.model else None, transition_probs=transition_probs, vocab_metadata=vocab_metadata, lexicon=lexicons if lexicons else None)
     # Store vocabulary file path(s) for revision statement
     if vocab_file_paths:
         # Store as comma-separated list or just the most specific (last) one

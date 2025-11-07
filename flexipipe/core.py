@@ -890,6 +890,17 @@ class MultiTaskFlexiPipeTagger(nn.Module):
                     'arc_scores': arc_scores,
                     'logits_deprel': logits_deprel,
                 }
+        
+        # Inference mode (no labels): return logits without loss
+        return {
+                    'logits_upos': logits_upos,
+                    'logits_xpos': logits_xpos,
+                    'logits_feats': logits_feats,
+                    'logits_lemma': logits_lemma,
+                    'logits_norm': logits_norm,
+                    'arc_scores': arc_scores,
+                    'logits_deprel': logits_deprel,
+                }
 
 
 class MultiTaskTrainer(Trainer):
@@ -1526,11 +1537,12 @@ def find_similar_words(word: str, vocab: Dict[str, Dict], threshold: float = 0.7
 class FlexiPipeTagger:
     """Transformer-based FlexiPipe tagger."""
     
-    def __init__(self, config: FlexiPipeConfig, vocab: Optional[Dict[str, Dict]] = None, model_path: Optional[Path] = None, transition_probs: Optional[Dict] = None, vocab_metadata: Optional[Dict] = None):
+    def __init__(self, config: FlexiPipeConfig, vocab: Optional[Dict[str, Dict]] = None, model_path: Optional[Path] = None, transition_probs: Optional[Dict] = None, vocab_metadata: Optional[Dict] = None, lexicon: Optional[Dict[str, Dict]] = None):
         self.config = config
         self.model_path = model_path  # Store model path for vocabulary loading
         # vocab will be merged with model vocabulary in load_model
         self.external_vocab = vocab or {}
+        self.lexicon = lexicon or {}  # Lexicon (fallback for OOV words only, not merged with vocab)
         self.transition_probs = transition_probs  # Transition probabilities for Viterbi tagging
         self.vocab_metadata = vocab_metadata  # Vocabulary metadata (may contain language info)
         self.model_vocab = {}  # Vocabulary from training data
@@ -1677,154 +1689,9 @@ class FlexiPipeTagger:
         self.inflection_suffixes = suffixes
     
     def _build_lemmatization_patterns(self, vocab: Dict):
-        """
-        Build lemmatization patterns from vocabulary (like TreeTagger/Neotag).
-        
-        Extracts suffix transformation patterns grouped by XPOS:
-        - Example: "calidades" (NCFP000) -> "calidad" → pattern: -des -> -d for NCFP000
-        
-        IMPORTANT: If a vocabulary entry has a `reg` (normalized form) field, extract patterns
-        from the `reg` form → lemma, NOT from the original form → lemma. This ensures that
-        patterns are based on normalized forms, which is what we'll use for lemmatization.
-        
-        Patterns are stored as: {xpos: [(suffix_from, suffix_to, min_base_length, count), ...]}
-        Sorted by suffix length (longest first) for longest-match application.
-        """
-        patterns_by_xpos = defaultdict(list)  # xpos -> list of (suffix_from, suffix_to, min_length)
-        
-        for form, entry in vocab.items():
-            # Skip XPOS-specific entries (they're redundant)
-            if ':' in form:
-                continue
-            
-            form_lower = form.lower()
-            analyses = entry if isinstance(entry, list) else [entry]
-            
-            for analysis in analyses:
-                lemma = analysis.get('lemma', '_')
-                xpos = analysis.get('xpos', '_')
-                reg = analysis.get('reg', '_')
-                expan = analysis.get('expan', '_')
-                
-                if lemma == '_' or xpos == '_':
-                    continue
-                
-                # Skip entries with expan field - these are abbreviations, not morphological variants
-                # The expansion is the actual form, so we shouldn't use the abbreviation for pattern building
-                # Example: "sra" with expan "señora" should not create patterns from sra->señor/señora
-                if expan and expan != '_' and expan.lower() != form_lower:
-                    continue
-                
-                # If entry has reg field, use reg form for pattern extraction (not original form)
-                # This is crucial: lemmatization patterns should be based on normalized forms
-                pattern_form = reg if reg and reg != '_' and reg != form else form_lower
-                pattern_form_lower = pattern_form.lower()
-                lemma_lower = lemma.lower()
-                
-                # Extract suffix transformation pattern (TreeTagger/Neotag style)
-                # Strategy: find optimal prefix that gives best suffix pattern
-                # Goal: prefer patterns like -des → -d over -es → '' (deletion patterns)
-                # Example: "calidades" -> "calidad": should yield -des → -d, not -es → ''
-                
-                min_len = min(len(pattern_form_lower), len(lemma_lower))
-                
-                # Find longest common prefix (from the start)
-                max_prefix_len = 0
-                for i in range(min_len):
-                    if pattern_form_lower[i] == lemma_lower[i]:
-                        max_prefix_len = i + 1
-                    else:
-                        break
-                
-                if max_prefix_len > 0:
-                    # Try different prefix lengths to find the best pattern
-                    # Prefer patterns with non-empty suffix_to (transformation) over deletion (empty suffix_to)
-                    best_prefix_len = max_prefix_len
-                    best_suffix_from = pattern_form_lower[max_prefix_len:]
-                    best_suffix_to = lemma_lower[max_prefix_len:]
-                    
-                    # If we got a deletion pattern (empty suffix_to), try shorter prefixes
-                    if not best_suffix_to and len(best_suffix_from) > 1:
-                        # Try progressively shorter prefixes to find a better pattern
-                        for try_prefix_len in range(max_prefix_len - 1, 0, -1):
-                            try_suffix_from = pattern_form_lower[try_prefix_len:]
-                            try_suffix_to = lemma_lower[try_prefix_len:]
-                            # Prefer this if it gives a non-empty suffix_to
-                            if try_suffix_to:
-                                best_prefix_len = try_prefix_len
-                                best_suffix_from = try_suffix_from
-                                best_suffix_to = try_suffix_to
-                                break  # Stop at first non-empty suffix_to (longest prefix with transformation)
-                    
-                    suffix_from = best_suffix_from
-                    suffix_to = best_suffix_to
-                    min_base = best_prefix_len
-                    
-                    # Filter out unrealistic patterns:
-                    # 1. Very short suffix patterns that add characters (likely errors)
-                    #    Example: "o" -> "oto" is unrealistic (should be longer suffix or deletion)
-                    # 2. Patterns where suffix_to is much longer than suffix_from (unlikely morphological change)
-                    #    Example: "o" -> "oto" (1 char -> 3 chars) is suspicious
-                    if len(suffix_from) <= 1 and len(suffix_to) > len(suffix_from) + 1:
-                        # Skip: very short suffix adding more than 1 character is unrealistic
-                        continue
-                    if len(suffix_from) == 2 and len(suffix_to) > len(suffix_from) + 2:
-                        # Skip: 2-char suffix adding more than 2 characters is suspicious
-                        continue
-                    
-                    # IMPORTANT: Include "no change" patterns (form == lemma) as well
-                    # This prevents rare transformation patterns (like -a → -o for animate nouns)
-                    # from being over-applied to words that should have no change
-                    # Example: Most nouns ending in -a have lemma ending in -a (no change),
-                    # but a few animate nouns have lemma ending in -o. Without tracking
-                    # "no change" patterns, the rare -a → -o pattern gets applied incorrectly.
-                    patterns_by_xpos[xpos].append((suffix_from, suffix_to, min_base))
-        
-        # Count frequency of patterns (number of distinct lemma/form pairs per pattern)
-        # This is the count of distinct lemma/form pairs, not token frequency
-        pattern_counts = defaultdict(int)  # (xpos, suffix_from, suffix_to) -> count of distinct pairs
-        
-        for xpos, pattern_list in patterns_by_xpos.items():
-            for suffix_from, suffix_to, min_base in pattern_list:
-                pattern_counts[(xpos, suffix_from, suffix_to)] += 1
-        
-        # Build final patterns: keep only patterns that appear multiple times (more reliable)
-        # Store count with each pattern for conflict resolution
-        final_patterns = {}
-        pattern_info = {}  # (xpos, suffix_from, suffix_to) -> (min_base, suffix_len, count)
-        
-        for xpos in patterns_by_xpos.keys():
-            xpos_patterns = []
-            for suffix_from, suffix_to, min_base in patterns_by_xpos[xpos]:
-                count = pattern_counts[(xpos, suffix_from, suffix_to)]
-                # Require higher count for suspicious patterns:
-                # - Patterns that change accented characters to unaccented (e.g., "ón" -> "o")
-                #   These are often rare exceptions, not general rules
-                # - Patterns with very short suffixes that change significantly
-                min_required_count = 2
-                if len(suffix_from) >= 2 and len(suffix_to) >= 1:
-                    # Check if pattern removes accent: contains accented char in suffix_from but not in suffix_to
-                    has_accent_in_from = any(c in suffix_from for c in 'áéíóúÁÉÍÓÚñÑçÇ')
-                    has_accent_in_to = any(c in suffix_to for c in 'áéíóúÁÉÍÓÚñÑçÇ')
-                    if has_accent_in_from and not has_accent_in_to:
-                        # Accent removal pattern - require higher count (at least 5) to be reliable
-                        min_required_count = 5
-                
-                if count >= min_required_count:
-                    suffix_len = len(suffix_from)
-                    xpos_patterns.append((suffix_from, suffix_to, min_base, suffix_len, count))
-                    # Store pattern info for conflict resolution
-                    pattern_info[(xpos, suffix_from, suffix_to)] = (min_base, suffix_len, count)
-            
-            # Sort by: suffix length (longest first), then frequency (highest first)
-            # This ensures longest-match when applying, but count is available for conflicts
-            xpos_patterns.sort(key=lambda x: (x[3], x[4]), reverse=True)
-            # Store as (suffix_from, suffix_to, min_base, count) tuples
-            # Include count so we can resolve conflicts when multiple patterns match
-            final_patterns[xpos] = [(p[0], p[1], p[2], p[4]) for p in xpos_patterns]
-        
-        self.lemmatization_patterns = final_patterns
-        self.pattern_info = pattern_info  # Store detailed pattern info for conflict resolution
+        """Build lemmatization patterns from vocabulary using shared function."""
+        from flexipipe.lemmatizer import build_lemmatization_patterns
+        self.lemmatization_patterns, self.pattern_info = build_lemmatization_patterns(vocab)
         
         if self.config.debug and self.lemmatization_patterns:
             total_patterns = sum(len(patterns) for patterns in self.lemmatization_patterns.values())
@@ -1844,6 +1711,7 @@ class FlexiPipeTagger:
             
             # Load training configuration (if available)
             training_config_file = model_path / 'training_config.json'
+            has_metadata = False
             if training_config_file.exists():
                 with open(training_config_file, 'r', encoding='utf-8') as f:
                     training_config = json.load(f)
@@ -1855,6 +1723,27 @@ class FlexiPipeTagger:
                 self.config.train_lemmatizer = training_config.get('train_lemmatizer', self.config.train_lemmatizer)
                 self.config.train_normalizer = training_config.get('train_normalizer', False)
                 self.config.normalization_attr = training_config.get('normalization_attr', 'reg')
+                
+                # Check metadata for which components were actually trained
+                # This is more reliable than just the config flags
+                if 'has_lemmatizer' in training_config:
+                    has_metadata = True
+                    has_lemmatizer = training_config.get('has_lemmatizer', False)
+                    has_feats = training_config.get('has_feats', True)  # Default True for backward compatibility
+                    has_parser = training_config.get('has_parser', False)
+                    has_normalizer = training_config.get('has_normalizer', False)
+                    
+                    # Override config flags based on metadata
+                    if not has_lemmatizer:
+                        self.config.train_lemmatizer = False
+                        print("Note: Lemmatizer was not trained (according to metadata). Using vocabulary fallback.", file=sys.stderr)
+                    if not has_feats:
+                        print("Note: FEATS were not in training data (according to metadata). Using vocabulary fallback.", file=sys.stderr)
+                    if not has_parser:
+                        self.config.train_parser = False
+                    if not has_normalizer:
+                        self.config.train_normalizer = False
+                
                 print(f"Loaded training configuration: BERT={self.config.bert_model}, "
                       f"Tokenizer={self.config.train_tokenizer}, Tagger={self.config.train_tagger}, "
                       f"Parser={self.config.train_parser}, Lemmatizer={self.config.train_lemmatizer}, "
@@ -1877,6 +1766,19 @@ class FlexiPipeTagger:
                 self.feats_to_id = label_mappings.get('feats_to_id', {})
                 self.lemma_to_id = label_mappings.get('lemma_to_id', {})
                 self.deprel_to_id = label_mappings.get('deprel_to_id', {})
+                
+                # Auto-detect if components were actually trained based on label counts
+                # (only if metadata wasn't found in training_config.json)
+                if not has_metadata:
+                    # If lemmatizer wasn't trained, lemma_labels will be empty or only contain '_'
+                    if len(self.lemma_labels) == 0 or (len(self.lemma_labels) == 1 and self.lemma_labels[0] == '_'):
+                        if self.config.train_lemmatizer:
+                            print("Warning: Lemmatizer was marked as trained but no lemma labels found. Disabling lemmatizer.", file=sys.stderr)
+                        self.config.train_lemmatizer = False
+                    
+                    # If FEATS only has '_' or very few labels, FEATS weren't in training data
+                    if len(self.feats_labels) <= 1 or (len(self.feats_labels) == 2 and '_' in self.feats_labels):
+                        print("Warning: FEATS appear to be missing from training data. Will use vocabulary fallback for FEATS.", file=sys.stderr)
                 self.id_to_upos = {v: k for k, v in self.upos_to_id.items()}
                 self.id_to_xpos = {v: k for k, v in self.xpos_to_id.items()}
                 self.id_to_feats = {v: k for k, v in self.feats_to_id.items()}
@@ -1932,7 +1834,10 @@ class FlexiPipeTagger:
             self.vocab.update(self.external_vocab)  # External vocab overrides model vocab
             if self.external_vocab:
                 print(f"Merged vocabularies: {len(self.model_vocab)} model entries + {len(self.external_vocab)} external entries = {len(self.vocab)} total", file=sys.stderr)
-                # Rebuild lemmatization patterns with merged vocab
+            else:
+                print(f"Using model vocabulary: {len(self.vocab)} entries", file=sys.stderr)
+            # Rebuild lemmatization patterns with merged vocab (always, even if no external vocab)
+            if self.vocab:
                 self._build_lemmatization_patterns(self.vocab)
             
             # Fallback: use defaults if labels not loaded
@@ -1975,13 +1880,55 @@ class FlexiPipeTagger:
             # Load state dict
             state_dict_path = model_path / 'pytorch_model.bin'
             if state_dict_path.exists():
-                state_dict = torch.load(state_dict_path, map_location=str(self.device))
-                self.model.load_state_dict(state_dict)
+                # Load on CPU first to avoid MPS alignment issues, then move to device
+                # This is a workaround for PyTorch MPS bug with unaligned memory operations
+                state_dict = torch.load(state_dict_path, map_location='cpu')
+                
+                # Filter out keys that don't exist in the current model (e.g., lemmatizer embeddings if not trained)
+                model_state_dict = self.model.state_dict()
+                filtered_state_dict = {}
+                missing_keys = []
+                unexpected_keys = []
+                
+                for key, value in state_dict.items():
+                    if key in model_state_dict:
+                        # Check if shapes match
+                        if model_state_dict[key].shape == value.shape:
+                            filtered_state_dict[key] = value
+                        else:
+                            missing_keys.append(
+                                f"{key} (shape mismatch: model={model_state_dict[key].shape}, checkpoint={value.shape})"
+                            )
+                    else:
+                        unexpected_keys.append(key)
+                # Load with strict=False to allow missing keys (e.g., lemmatizer if not trained)
+                load_result = self.model.load_state_dict(filtered_state_dict, strict=False)
+                
+                if load_result.missing_keys:
+                    # Filter out expected missing keys (lemmatizer/normalizer if not trained)
+                    unexpected_missing = [k for k in load_result.missing_keys 
+                                        if not any(skip in k for skip in ['lemma_', 'norm_', 'orig_form_'])]
+                    if unexpected_missing:
+                        print(f"Warning: Missing keys in checkpoint (expected if model wasn't trained with these components):", file=sys.stderr)
+                        for key in unexpected_missing[:5]:  # Show first 5
+                            print(f"  - {key}", file=sys.stderr)
+                        if len(unexpected_missing) > 5:
+                            print(f"  ... and {len(unexpected_missing) - 5} more", file=sys.stderr)
+                
+                if load_result.unexpected_keys:
+                    print(f"Warning: Unexpected keys in checkpoint (will be ignored):", file=sys.stderr)
+                    for key in load_result.unexpected_keys[:5]:  # Show first 5
+                        print(f"  - {key}", file=sys.stderr)
+                    if len(load_result.unexpected_keys) > 5:
+                        print(f"  ... and {len(load_result.unexpected_keys) - 5} more", file=sys.stderr)
+                
+                # Model already moved to device above
             else:
                 print(f"Warning: No pytorch_model.bin found in {model_path}, using untrained model", file=sys.stderr)
-            
-            # Move model to device (MPS/CUDA/CPU)
+                # Move model to device if not already moved
             self.model.to(self.device)
+            
+            # Set model to evaluation mode
             self.model.eval()
         else:
             print(f"Initializing model from {self.config.bert_model}", file=sys.stderr)
@@ -2460,63 +2407,10 @@ class FlexiPipeTagger:
         # Build and save word-level vocabulary from training data
         # This is separate from tokenizer's vocab.txt (which contains subword tokens)
         # This vocabulary contains full words with linguistic annotations (form, lemma, upos, xpos, feats)
+        # Uses shared vocabulary building function to ensure consistency with create-vocab
         print("Building word-level vocabulary from training data...", file=sys.stderr)
-        model_vocab = {}
-        
-        # Collect all word forms and their most common annotations
-        # For words with multiple annotations, we'll use the most frequent one
-        word_annotations = defaultdict(lambda: defaultdict(int))  # form -> (upos, xpos, feats, lemma) -> count
-        
-        for sentence in train_sentences:
-            for token in sentence:
-                form = token.get('form', '').strip()
-                if not form or form == '_':
-                    continue
-                
-                form_lower = form.lower()
-                upos = token.get('upos', '_')
-                xpos = token.get('xpos', '_')
-                feats = token.get('feats', '_')
-                lemma = token.get('lemma', '_').lower() if token.get('lemma', '_') != '_' else '_'
-                
-                # Store annotation combination and count frequency
-                annotation_key = (upos, xpos, feats, lemma)
-                word_annotations[form_lower][annotation_key] += 1
-        
-        # Build vocabulary using most frequent annotation for each word
-        for form_lower, annotations in word_annotations.items():
-            # Get most frequent annotation combination
-            most_frequent = max(annotations.items(), key=lambda x: x[1])
-            upos, xpos, feats, lemma = most_frequent[0]
-            
-            # Store word-level entry
-            model_vocab[form_lower] = {
-                'upos': upos,
-                'xpos': xpos,
-                'feats': feats,
-                'lemma': lemma
-            }
-            
-            # Also add XPOS-specific lemma entries (for context-aware lemmatization)
-            if xpos and xpos != '_':
-                xpos_key = f"{form_lower}:{xpos}"
-                if xpos_key not in model_vocab and lemma != '_':
-                    model_vocab[xpos_key] = {'lemma': lemma}
-        
-        # Also include original case forms (for case-sensitive lookups)
-        # This helps with proper nouns and other case-sensitive words
-        for sentence in train_sentences:
-            for token in sentence:
-                form = token.get('form', '').strip()
-                if not form or form == '_':
-                    continue
-                
-                form_lower = form.lower()
-                if form != form_lower and form_lower in model_vocab:
-                    # Add case-sensitive entry if it's different from lowercase
-                    if form not in model_vocab:
-                        # Use same annotations as lowercase version
-                        model_vocab[form] = model_vocab[form_lower].copy()
+        from flexipipe.vocabulary import build_vocab_from_sentences
+        model_vocab = build_vocab_from_sentences(train_sentences)
         
         # Save model vocabulary
         with open(Path(self.config.output_dir) / 'model_vocab.json', 'w', encoding='utf-8') as f:
@@ -2551,6 +2445,15 @@ class FlexiPipeTagger:
         with open(Path(self.config.output_dir) / 'label_mappings.json', 'w', encoding='utf-8') as f:
             json.dump(label_mappings, f, ensure_ascii=False, indent=2)
         
+        # Determine which components were actually trained (based on label availability)
+        # This is more reliable than just checking the config flags
+        has_lemmatizer = (self.config.train_lemmatizer and len(self.lemma_labels) > 0 and 
+                         not (len(self.lemma_labels) == 1 and self.lemma_labels[0] == '_'))
+        has_feats = (len(self.feats_labels) > 2 or 
+                    (len(self.feats_labels) == 2 and '_' not in self.feats_labels))
+        has_parser = (self.config.train_parser and len(self.deprel_labels) > 0)
+        has_normalizer = (self.config.train_normalizer and len(self.norm_forms) > 0)
+        
         # Save training configuration (all settings used during training)
         training_config = {
             'bert_model': self.config.bert_model,
@@ -2559,6 +2462,11 @@ class FlexiPipeTagger:
             'train_parser': self.config.train_parser,
             'train_lemmatizer': self.config.train_lemmatizer,
             'train_normalizer': self.config.train_normalizer,
+            # Metadata: which components were actually trained (based on label availability)
+            'has_lemmatizer': has_lemmatizer,
+            'has_feats': has_feats,
+            'has_parser': has_parser,
+            'has_normalizer': has_normalizer,
             'batch_size': self.config.batch_size,
             'gradient_accumulation_steps': getattr(self.config, 'gradient_accumulation_steps', 1),
             'learning_rate': self.config.learning_rate,
@@ -3280,13 +3188,16 @@ class FlexiPipeTagger:
                     # Get FEATS from vocab (use UPOS+FEATS matching by default, fallback to XPOS)
                     feats = '_'
                     entry = self.vocab.get(form) or self.vocab.get(form.lower())
+                    # If not in vocab, try lexicon (OOV fallback)
+                    if not entry and self.lexicon:
+                        entry = self.lexicon.get(form) or self.lexicon.get(form.lower())
                     if entry:
                         if isinstance(entry, list):
                             # Find best matching analysis based on config
                             best_entry = None
                             best_count = 0
                             use_xpos = self.config.use_xpos_for_tagging
-                            
+
                             if use_xpos:
                                 # XPOS-first: try XPOS match, then UPOS+FEATS
                                 for analysis in entry:
@@ -3295,10 +3206,18 @@ class FlexiPipeTagger:
                                         if count > best_count:
                                             best_count = count
                                             best_entry = analysis
+
                                 if not best_entry and upos and upos != '_':
-                                    # Fallback to UPOS match
                                     for analysis in entry:
                                         if analysis.get('upos') == upos:
+                                            count = analysis.get('count', 0)
+                                            if count > best_count:
+                                                best_count = count
+                                                best_entry = analysis
+
+                                if not best_entry and xpos and xpos != '_':
+                                    for analysis in entry:
+                                        if analysis.get('xpos') == xpos:
                                             count = analysis.get('count', 0)
                                             if count > best_count:
                                                 best_count = count
@@ -3311,15 +3230,15 @@ class FlexiPipeTagger:
                                         if count > best_count:
                                             best_count = count
                                             best_entry = analysis
+
                                 if not best_entry and xpos and xpos != '_':
-                                    # Fallback to XPOS match
                                     for analysis in entry:
                                         if analysis.get('xpos') == xpos:
                                             count = analysis.get('count', 0)
                                             if count > best_count:
                                                 best_count = count
                                                 best_entry = analysis
-                            
+
                             if not best_entry:
                                 # Fallback to most frequent
                                 best_entry = max(entry, key=lambda a: a.get('count', 0))
@@ -3339,9 +3258,10 @@ class FlexiPipeTagger:
                         if isinstance(entry, list):
                             # Find best matching analysis based on UPOS/XPOS/FEATS
                             # Prioritize based on use_xpos_for_tagging config
+                            best_entry = None
                             best_count = 0
                             use_xpos = self.config.use_xpos_for_tagging
-                            
+
                             if use_xpos:
                                 # XPOS-first: try XPOS match, then UPOS+FEATS
                                 for analysis in entry:
@@ -3350,10 +3270,18 @@ class FlexiPipeTagger:
                                         if count > best_count:
                                             best_count = count
                                             best_entry = analysis
+
                                 if not best_entry and upos and upos != '_':
-                                    # Fallback to UPOS match
                                     for analysis in entry:
                                         if analysis.get('upos') == upos:
+                                            count = analysis.get('count', 0)
+                                            if count > best_count:
+                                                best_count = count
+                                                best_entry = analysis
+
+                                if not best_entry and xpos and xpos != '_':
+                                    for analysis in entry:
+                                        if analysis.get('xpos') == xpos:
                                             count = analysis.get('count', 0)
                                             if count > best_count:
                                                 best_count = count
@@ -3366,15 +3294,15 @@ class FlexiPipeTagger:
                                         if count > best_count:
                                             best_count = count
                                             best_entry = analysis
+
                                 if not best_entry and xpos and xpos != '_':
-                                    # Fallback to XPOS match
                                     for analysis in entry:
                                         if analysis.get('xpos') == xpos:
                                             count = analysis.get('count', 0)
                                             if count > best_count:
                                                 best_count = count
                                                 best_entry = analysis
-                            
+
                             if not best_entry:
                                 # Fallback to most frequent
                                 best_entry = max(entry, key=lambda a: a.get('count', 0))
@@ -3566,10 +3494,13 @@ class FlexiPipeTagger:
                 max_probs_xpos, pred_xpos = torch.max(probs_xpos, dim=-1)
                 max_probs_feats, pred_feats = torch.max(probs_feats, dim=-1)
                 
-                # Lemma predictions (if lemmatizer was trained)
+                # Lemma predictions and confidence (if lemmatizer was trained)
                 pred_lemmas = None
+                probs_lemma = None
+                max_probs_lemma = None
                 if self.model.train_lemmatizer and outputs.get('logits_lemma') is not None:
-                    pred_lemmas = torch.argmax(outputs['logits_lemma'], dim=-1)  # [batch, seq]
+                    probs_lemma = torch.nn.functional.softmax(outputs['logits_lemma'], dim=-1)
+                    max_probs_lemma, pred_lemmas = torch.max(probs_lemma, dim=-1)  # [batch, seq]
                 
                 # Normalization predictions (if normalizer was trained)
                 pred_norms = None
@@ -3604,7 +3535,7 @@ class FlexiPipeTagger:
                 
                 current_word_idx = None
                 word_predictions = {}  # orig_word_idx -> (upos, xpos, feats, lemma, norm, head, deprel)
-                word_confidence = {}  # orig_word_idx -> (upos_conf, xpos_conf, feats_conf) for confidence-based blending
+                word_confidence = {}  # orig_word_idx -> (upos_conf, xpos_conf, feats_conf, lemma_conf) for confidence-based blending
                 token_to_word = {}  # token_idx -> orig_word_idx (for head mapping)
                 
                 # Collect predictions for each word (take first subword token)
@@ -3622,19 +3553,37 @@ class FlexiPipeTagger:
                             upos_conf = max_probs_upos[sent_idx][token_idx].item()
                             xpos_conf = max_probs_xpos[sent_idx][token_idx].item()
                             feats_conf = max_probs_feats[sent_idx][token_idx].item()
+                            lemma_conf = max_probs_lemma[sent_idx][token_idx].item() if max_probs_lemma is not None else 0.0
                             
                             upos = self.id_to_upos.get(upos_id, '_')
                             xpos = self.id_to_xpos.get(xpos_id, '_')
-                            feats = self.id_to_feats.get(feats_id, '_')
+                            
+                            # FEATS prediction: check if FEATS were actually trained
+                            # If FEATS labels only contain '_' or very few labels, FEATS weren't in training data
+                            feats = '_'
+                            feats_were_trained = False
+                            if hasattr(self, 'feats_labels'):
+                                if len(self.feats_labels) > 2:
+                                    feats_were_trained = True
+                                elif len(self.feats_labels) == 2 and '_' not in self.feats_labels:
+                                    feats_were_trained = True
+                            
+                            if feats_were_trained:
+                                # FEATS were trained - use model prediction
+                                feats = self.id_to_feats.get(feats_id, '_')
+                            # If FEATS weren't trained, feats stays '_' and will fall back to vocabulary later
                             
                             # Store confidence scores for confidence-based blending
-                            word_confidence[orig_word_idx] = (upos_conf, xpos_conf, feats_conf)
+                            word_confidence[orig_word_idx] = (upos_conf, xpos_conf, feats_conf, lemma_conf)
                             
-                            # Lemma prediction
+                            # Lemma prediction: only use if lemmatizer was actually trained
                             lemma = '_'
-                            if pred_lemmas is not None and hasattr(self, 'id_to_lemma'):
+                            if (self.model.train_lemmatizer and pred_lemmas is not None and 
+                                hasattr(self, 'id_to_lemma') and hasattr(self, 'lemma_labels') and 
+                                len(self.lemma_labels) > 0):
                                 lemma_id = pred_lemmas[sent_idx][token_idx].item()
                                 lemma = self.id_to_lemma.get(lemma_id, '_')
+                            # If lemmatizer wasn't trained, lemma stays '_' and will fall back to vocabulary in _get_lemma
                             
                             # Parsing predictions
                             head = 0
@@ -3741,6 +3690,7 @@ class FlexiPipeTagger:
                                 if word_idx in word_predictions:
                                     tagged_token['xpos'] = word_predictions[word_idx][1]
                                 else:
+                                    # Fallback to vocabulary or similarity
                                     tagged_token['xpos'] = self._predict_from_vocab(form, 'xpos')
                         
                         if existing_feats != '_':
@@ -3748,23 +3698,40 @@ class FlexiPipeTagger:
                         elif vocab_feats and vocab_feats != '_':
                             tagged_token['feats'] = vocab_feats
                         else:
-                            # Confidence-based blending: use vocab if model confidence is low
-                            use_vocab_for_feats = False
-                            if (self.config.use_vocabulary and 
-                                word_idx in word_confidence and 
-                                word_confidence[word_idx][2] < self.config.confidence_threshold):
-                                # Model confidence is low, try vocabulary
+                            # Check if FEATS were actually trained (not just random predictions)
+                            # If FEATS only has '_' or 1-2 labels, FEATS weren't in training data
+                            feats_were_trained = False
+                            if hasattr(self, 'feats_labels'):
+                                if len(self.feats_labels) > 2:
+                                    feats_were_trained = True
+                                elif len(self.feats_labels) == 2 and '_' not in self.feats_labels:
+                                    feats_were_trained = True
+                            
+                            if not feats_were_trained:
+                                # FEATS weren't in training data - use vocabulary fallback
                                 vocab_feats_fallback = self._predict_from_vocab(form, 'feats')
                                 if vocab_feats_fallback and vocab_feats_fallback != '_':
                                     tagged_token['feats'] = vocab_feats_fallback
-                                    use_vocab_for_feats = True
-                            
-                            if not use_vocab_for_feats:
-                                # Use model prediction (either high confidence or no vocab match)
-                                if word_idx in word_predictions:
-                                    tagged_token['feats'] = word_predictions[word_idx][2]
                                 else:
-                                    tagged_token['feats'] = self._predict_from_vocab(form, 'feats')
+                                    tagged_token['feats'] = '_'
+                            else:
+                                # FEATS were trained - use confidence-based blending
+                                use_vocab_for_feats = False
+                                if (self.config.use_vocabulary and 
+                                    word_idx in word_confidence and 
+                                    word_confidence[word_idx][2] < self.config.confidence_threshold):
+                                    # Model confidence is low, try vocabulary
+                                    vocab_feats_fallback = self._predict_from_vocab(form, 'feats')
+                                    if vocab_feats_fallback and vocab_feats_fallback != '_':
+                                        tagged_token['feats'] = vocab_feats_fallback
+                                        use_vocab_for_feats = True
+                                
+                                if not use_vocab_for_feats:
+                                    # Use model prediction (either high confidence or no vocab match)
+                                    if word_idx in word_predictions:
+                                        tagged_token['feats'] = word_predictions[word_idx][2]
+                                    else:
+                                        tagged_token['feats'] = self._predict_from_vocab(form, 'feats')
                         
                         if existing_lemma != '_':
                             tagged_token['lemma'] = existing_lemma
@@ -3780,7 +3747,9 @@ class FlexiPipeTagger:
                                 norm_form = token.get('norm_form') if 'norm_form' in token else None
                                 if norm_form == '_':
                                     norm_form = None
-                            tagged_token['lemma'] = self._get_lemma(form, word_idx, word_predictions, xpos=xpos, upos=upos, norm_form=norm_form)
+                            # Get lemma confidence for confidence-based blending
+                            lemma_conf = word_confidence.get(word_idx, (0, 0, 0, 0))[3] if word_idx in word_confidence else None
+                            tagged_token['lemma'] = self._get_lemma(form, word_idx, word_predictions, xpos=xpos, upos=upos, norm_form=norm_form, lemma_confidence=lemma_conf)
                         
                         # Copy head/deprel if they exist and we're respecting existing
                         existing_head = token.get('head', 0)
@@ -3879,7 +3848,9 @@ class FlexiPipeTagger:
                                 # Lemma: use lemma_method to determine priority (use normalized form if available)
                                 xpos = tagged_token.get('xpos', '_')
                                 upos = tagged_token.get('upos', '_')
-                                tagged_token['lemma'] = self._get_lemma(form, word_idx, word_predictions, xpos=xpos, upos=upos, norm_form=norm_form)
+                                # Get lemma confidence for confidence-based blending
+                                lemma_conf = word_confidence.get(word_idx, (0, 0, 0, 0))[3] if word_idx in word_confidence else None
+                                tagged_token['lemma'] = self._get_lemma(form, word_idx, word_predictions, xpos=xpos, upos=upos, norm_form=norm_form, lemma_confidence=lemma_conf)
                             else:
                                 # Normal mode: model predictions first, vocab as fallback
                                 tagged_token['upos'] = word_predictions[word_idx][0]
@@ -3902,7 +3873,9 @@ class FlexiPipeTagger:
                                 # Lemma: use lemma_method to determine priority (use normalized form if available)
                                 xpos = tagged_token.get('xpos', '_')
                                 upos = tagged_token.get('upos', '_')
-                                tagged_token['lemma'] = self._get_lemma(form, word_idx, word_predictions, xpos=xpos, upos=upos, norm_form=norm_form)
+                                # Get lemma confidence for confidence-based blending
+                            lemma_conf = word_confidence.get(word_idx, (0, 0, 0, 0))[3] if word_idx in word_confidence else None
+                            tagged_token['lemma'] = self._get_lemma(form, word_idx, word_predictions, xpos=xpos, upos=upos, norm_form=norm_form, lemma_confidence=lemma_conf)
                             
                             # Parsing
                             if self.config.parse and len(word_predictions[word_idx]) > 5:
@@ -3926,7 +3899,9 @@ class FlexiPipeTagger:
                                 norm_form_val = token.get('norm_form', '_')
                                 if norm_form_val and norm_form_val != '_':
                                     norm_form = norm_form_val
-                            tagged_token['lemma'] = self._get_lemma(form, word_idx, word_predictions, xpos=xpos, upos=upos, norm_form=norm_form)
+                            # Get lemma confidence for confidence-based blending
+                            lemma_conf = word_confidence.get(word_idx, (0, 0, 0, 0))[3] if word_idx in word_confidence else None
+                            tagged_token['lemma'] = self._get_lemma(form, word_idx, word_predictions, xpos=xpos, upos=upos, norm_form=norm_form, lemma_confidence=lemma_conf)
                             tagged_token['head'] = '_'
                             tagged_token['deprel'] = '_'
                         
@@ -4110,7 +4085,7 @@ class FlexiPipeTagger:
         
         return preprocessed
     
-    def _get_lemma(self, form: str, word_idx: int, word_predictions: Dict, xpos: str = None, upos: str = None, norm_form: str = None) -> str:
+    def _get_lemma(self, form: str, word_idx: int, word_predictions: Dict, xpos: str = None, upos: str = None, norm_form: str = None, lemma_confidence: float = None) -> str:
         """
         Get lemma based on lemma_method configuration.
         
@@ -4134,9 +4109,11 @@ class FlexiPipeTagger:
         if self.config.debug:
             print(f"[DEBUG LEMMA] Form: '{form}', Lemma form: '{lemma_form}', XPOS: '{xpos}', UPOS: '{upos}', Norm form: '{norm_form}'", file=sys.stderr)
         
-        # Get BERT prediction if available
+        # Get BERT prediction if available (only if lemmatizer was actually trained)
         bert_lemma = None
-        if self.model.train_lemmatizer and word_idx in word_predictions and len(word_predictions[word_idx]) > 3:
+        if (self.model.train_lemmatizer and 
+            hasattr(self, 'lemma_labels') and len(self.lemma_labels) > 0 and
+            word_idx in word_predictions and len(word_predictions[word_idx]) > 3):
             bert_lemma = word_predictions[word_idx][3]
             if bert_lemma == '_':
                 bert_lemma = None
@@ -4145,6 +4122,7 @@ class FlexiPipeTagger:
         
         # Get vocabulary prediction (use normalized form if available)
         vocab_lemma = None
+        vocab_lemma_original = None  # Store original capitalization from vocab
         if self.config.use_vocabulary:
             # Get FEATS if available from word_predictions
             feats = None
@@ -4153,59 +4131,224 @@ class FlexiPipeTagger:
                 if feats == '_':
                     feats = None
             
+            # Check if word is in vocabulary (exact match) - this determines if it's OOV
+            word_is_in_vocab = False
+            if hasattr(self, 'vocab') and self.vocab:
+                form_lower = lemma_form.lower()
+                # Check both exact case and lowercase
+                word_is_in_vocab = (lemma_form in self.vocab or form_lower in self.vocab or
+                                   (xpos and f"{lemma_form}:{xpos}" in self.vocab) or
+                                   (xpos and f"{form_lower}:{xpos}" in self.vocab))
+            
             vocab_lemma = self._predict_from_vocab(lemma_form, 'lemma', xpos=xpos, upos=upos, feats=feats, debug=self.config.debug)
             if vocab_lemma == '_':
                 vocab_lemma = None
+            else:
+                # Store original capitalization from vocabulary (before any modifications)
+                vocab_lemma_original = vocab_lemma
             if self.config.debug:
-                print(f"[DEBUG LEMMA] Vocab lemma: '{vocab_lemma}'", file=sys.stderr)
+                print(f"[DEBUG LEMMA] Vocab lemma: '{vocab_lemma}' (word_in_vocab={word_is_in_vocab})", file=sys.stderr)
         
         # Apply lemma_method priority
+        # Default: Use BERT lemmatization when lemmatizer is trained and confidence is high
+        # Fallback to vocabulary when:
+        #   - Lemmatizer wasn't trained (has_lemmatizer: false)
+        #   - BERT confidence is low (confidence-based blending)
+        #   - Vocabulary is explicitly prioritized (vocab_priority flag)
         final_lemma = None
-        if lemma_method == 'similarity':
-            # Similarity first: try vocab, then BERT, then fallback
-            if vocab_lemma:
-                final_lemma = vocab_lemma
-                if self.config.debug:
-                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from vocab, method=similarity)", file=sys.stderr)
-            elif bert_lemma:
-                final_lemma = bert_lemma
-                if self.config.debug:
-                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from BERT, method=similarity)", file=sys.stderr)
-            else:
-                final_lemma = form.lower()
-                if self.config.debug:
-                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (fallback to form.lower(), method=similarity)", file=sys.stderr)
         
-        elif lemma_method == 'bert':
-            # BERT first: try BERT, then vocab, then fallback
-            if bert_lemma:
-                final_lemma = bert_lemma
-                if self.config.debug:
-                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from BERT, method=bert)", file=sys.stderr)
-            elif vocab_lemma:
-                final_lemma = vocab_lemma
-                if self.config.debug:
-                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from vocab, method=bert)", file=sys.stderr)
-            else:
-                final_lemma = form.lower()
-                if self.config.debug:
-                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (fallback to form.lower(), method=bert)", file=sys.stderr)
+        # Check if lemmatizer was actually trained (from metadata)
+        lemmatizer_trained = (self.model.train_lemmatizer and 
+                             hasattr(self, 'lemma_labels') and 
+                             len(self.lemma_labels) > 0)
         
-        else:  # 'auto' - default behavior
-            # Auto: try BERT first, then vocab, then fallback
-            # This is the original behavior
-            if bert_lemma:
-                final_lemma = bert_lemma
-                if self.config.debug:
-                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from BERT, method=auto)", file=sys.stderr)
-            elif vocab_lemma:
+        # Use confidence-based blending: if BERT confidence is low, prefer vocabulary or fallback
+        use_bert_lemma = False
+        if lemmatizer_trained and bert_lemma:
+            if lemma_confidence is not None:
+                if lemma_confidence >= self.config.confidence_threshold:
+                    # BERT confidence is high enough - use it
+                    use_bert_lemma = True
+                else:
+                    # BERT confidence is too low - don't use it
+                    if self.config.debug:
+                        print(f"[DEBUG LEMMA] BERT confidence ({lemma_confidence:.3f}) below threshold ({self.config.confidence_threshold}), rejecting BERT prediction", file=sys.stderr)
+            else:
+                # No confidence score available - use BERT if available
+                use_bert_lemma = True
+        
+        # Priority: vocab (if available and exact match), then pattern-based (for OOV or when vocab returns form), then BERT (if confidence is acceptable), then fallback
+        # For OOV words (not in vocabulary), pattern-based is more reliable than BERT
+        # Also: if vocab returns the form itself (no useful lemma), try pattern-based
+        use_vocab_lemma = False
+        if vocab_lemma and word_is_in_vocab:
+            # Check if vocab returned a useful lemma (not the form itself)
+            lemma_form_lower = lemma_form.lower()
+            if vocab_lemma.lower() != lemma_form_lower:
+                # Vocab returned a different lemma - use it
+                use_vocab_lemma = True
                 final_lemma = vocab_lemma
                 if self.config.debug:
-                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from vocab, method=auto)", file=sys.stderr)
+                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from vocab, exact match)", file=sys.stderr)
             else:
-                final_lemma = form.lower()
+                # Vocab returned the form itself - not useful, try lexicon or pattern-based
                 if self.config.debug:
-                    print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (fallback to form.lower(), method=auto)", file=sys.stderr)
+                    print(f"[DEBUG LEMMA] Vocab returned form itself '{vocab_lemma}', checking lexicon or pattern-based", file=sys.stderr)
+
+        # Check lexicon as fallback when vocab doesn't provide a useful lemma
+        # Use context-aware lookup (XPOS/UPOS/FEATS) to match the right lexicon entry
+        if not use_vocab_lemma and self.lexicon:
+            if self.config.debug:
+                print(f"[DEBUG LEMMA] Checking lexicon for '{lemma_form}' (vocab result not usable)", file=sys.stderr)
+            # Get FEATS if available from word_predictions
+            feats_for_lexicon = None
+            if word_idx in word_predictions and len(word_predictions[word_idx]) > 2:
+                feats_for_lexicon = word_predictions[word_idx][2]
+                if feats_for_lexicon == '_':
+                    feats_for_lexicon = None
+            if self.config.debug:
+                print(f"[DEBUG LEMMA] Looking up lexicon with xpos='{xpos}', upos='{upos}', feats='{feats_for_lexicon}'", file=sys.stderr)
+            
+            # Use context-aware matching directly against lexicon entries
+            lemma_form_lower = lemma_form.lower()
+            lexicon_entry = self.lexicon.get(lemma_form) or self.lexicon.get(lemma_form_lower)
+            if lexicon_entry:
+                # Use the same get_field_from_entry helper from _predict_from_vocab
+                # We'll create a temporary version that works with lexicon
+                def get_field_from_lexicon_entry(entry, field, xpos=None, upos=None, feats=None):
+                            """Helper to extract field from lexicon entry with context matching."""
+                            if isinstance(entry, list):
+                                matches = []
+                                use_xpos = self.config.use_xpos_for_tagging
+                                
+                                if use_xpos:
+                                    if xpos and xpos != '_':
+                                        for analysis in entry:
+                                            if analysis.get('xpos') == xpos:
+                                                matches.append((analysis.get('count', 0), analysis))
+                                    if not matches and upos and upos != '_':
+                                        for analysis in entry:
+                                            if analysis.get('upos') == upos:
+                                                analysis_feats = analysis.get('feats', '_')
+                                                if feats and feats != '_' and analysis_feats and analysis_feats != '_':
+                                                    lexicon_feat_dict = {f.split('=')[0]: f.split('=')[1] for f in analysis_feats.split('|') if '=' in f}
+                                                    actual_feat_dict = {f.split('=')[0]: f.split('=')[1] for f in feats.split('|') if '=' in f}
+                                                    feats_match = all(actual_feat_dict.get(k) == v for k, v in lexicon_feat_dict.items())
+                                                    if feats_match:
+                                                        matches.append((analysis.get('count', 0), analysis))
+                                                    else:
+                                                        matches.append((analysis.get('count', 0), analysis))
+                                else:
+                                    if upos and upos != '_':
+                                        for analysis in entry:
+                                            if analysis.get('upos') == upos:
+                                                analysis_feats = analysis.get('feats', '_')
+                                                if feats and feats != '_' and analysis_feats and analysis_feats != '_':
+                                                    lexicon_feat_dict = {f.split('=')[0]: f.split('=')[1] for f in analysis_feats.split('|') if '=' in f}
+                                                    actual_feat_dict = {f.split('=')[0]: f.split('=')[1] for f in feats.split('|') if '=' in f}
+                                                    feats_match = all(actual_feat_dict.get(k) == v for k, v in lexicon_feat_dict.items())
+                                                    if feats_match:
+                                                        matches.append((analysis.get('count', 0), analysis))
+                                                else:
+                                                    matches.append((analysis.get('count', 0), analysis))
+                                    if not matches and xpos and xpos != '_':
+                                        for analysis in entry:
+                                            if analysis.get('xpos') == xpos:
+                                                matches.append((analysis.get('count', 0), analysis))
+                                
+                                if matches:
+                                    matches.sort(key=lambda x: x[0], reverse=True)
+                                    return matches[0][1].get(field, '_')
+                                elif entry:
+                                    # Fallback to first entry
+                                    return entry[0].get(field, '_')
+                                return '_'
+                            elif isinstance(entry, dict):
+                                return entry.get(field, '_')
+                            return '_'
+                        
+                lexicon_lemma = get_field_from_lexicon_entry(lexicon_entry, 'lemma', xpos=xpos, upos=upos, feats=feats_for_lexicon)
+                if self.config.debug:
+                    print(f"[DEBUG LEMMA] Lexicon lookup result: '{lexicon_lemma}'", file=sys.stderr)
+                
+                if lexicon_lemma and lexicon_lemma != '_' and lexicon_lemma.lower() != lemma_form.lower():
+                    # Lexicon has a useful lemma - use it
+                    use_vocab_lemma = True
+                    final_lemma = lexicon_lemma
+                    if self.config.debug:
+                        print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from lexicon)", file=sys.stderr)
+            else:
+                if self.config.debug:
+                    print(f"[DEBUG LEMMA] '{lemma_form}' not found in lexicon", file=sys.stderr)
+        
+        if not use_vocab_lemma:
+            # Word is OOV (not in vocabulary) OR vocab_lemma came from similarity matching (less reliable)
+            # For OOV words, pattern-based is more reliable than similarity matching or BERT
+            # Vocabulary doesn't have the word (OOV) - try pattern-based lemmatization
+            # IMPORTANT: For OOV words, pattern-based is more reliable than BERT
+            pattern_lemma = None
+            if self.config.use_vocabulary and xpos and xpos != '_':
+                # Try pattern-based lemmatization for OOV words
+                if hasattr(self, 'lemmatization_patterns') and self.lemmatization_patterns:
+                    from flexipipe.lemmatizer import apply_lemmatization_patterns
+                    pattern_lemma = apply_lemmatization_patterns(
+                        lemma_form,
+                        xpos,
+                        self.lemmatization_patterns,
+                        known_lemmas=self._get_known_lemmas(),
+                        debug=self.config.debug
+                    )
+                    if pattern_lemma and pattern_lemma != '_':
+                        final_lemma = pattern_lemma
+                        if self.config.debug:
+                            print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from pattern-based, OOV word)", file=sys.stderr)
+            
+            # If pattern-based didn't work, be very cautious with BERT for OOV words
+            # BERT lemmatizer often produces random results for OOV words
+            # For OOV words with vocabulary available, prefer form over BERT (pattern-based is more reliable)
+            if not pattern_lemma or pattern_lemma == '_':
+                # For OOV words, disable BERT entirely if vocabulary is available
+                # Pattern-based is more reliable for morphological patterns, and BERT often produces random results
+                if self.config.use_vocabulary:
+                    # Vocabulary available: don't use BERT for OOV words (too unreliable)
+                    final_lemma = form
+                    if self.config.debug:
+                        print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (fallback to form, OOV word, pattern-based failed, BERT disabled for OOV when vocab available)", file=sys.stderr)
+            else:
+                    # No vocabulary: use BERT only if confidence is very high
+                    oov_bert_threshold = 0.9  # Very high threshold for OOV words
+                    use_bert_for_oov = (use_bert_lemma and bert_lemma and 
+                                       (lemma_confidence is None or lemma_confidence >= oov_bert_threshold))
+                    
+                    if use_bert_for_oov:
+                        # Use BERT only if confidence is very high for OOV words
+                        final_lemma = bert_lemma
+                        if self.config.debug:
+                            print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (from BERT, confidence={lemma_confidence:.3f if lemma_confidence else 'N/A'}, OOV word, threshold={oov_bert_threshold})", file=sys.stderr)
+                    else:
+                        # No pattern-based or BERT available/acceptable - use form as-is
+                        final_lemma = form
+                        if self.config.debug:
+                            reason = "pattern-based failed"
+                            if not use_bert_lemma:
+                                reason += ", BERT not available"
+                            elif bert_lemma and lemma_confidence is not None:
+                                reason += f", BERT confidence too low ({lemma_confidence:.3f} < {oov_bert_threshold})"
+                            print(f"[DEBUG LEMMA] Selected: '{final_lemma}' (fallback to form, OOV word, {reason})", file=sys.stderr)
+        
+        # Preserve capitalization: prefer vocabulary's capitalization, then form's capitalization
+        # Don't force everything to lowercase - preserve original capitalization when possible
+        if final_lemma and len(final_lemma) > 0:
+            # First, check if vocabulary provided capitalized lemma - use it as-is
+            if vocab_lemma_original and vocab_lemma_original[0].isupper():
+                # Vocabulary has capitalized lemma - use it (already in final_lemma)
+                if self.config.debug:
+                    print(f"[DEBUG LEMMA] Using capitalization from vocabulary: '{final_lemma}'", file=sys.stderr)
+            elif form and len(form) > 0 and form[0].isupper() and final_lemma[0].islower():
+                # Vocabulary lemma is lowercase but form is capitalized - capitalize lemma
+                final_lemma = final_lemma[0].upper() + final_lemma[1:]
+                if self.config.debug:
+                    print(f"[DEBUG LEMMA] Capitalized lemma: '{final_lemma}' (preserving capitalization from form)", file=sys.stderr)
         
         return final_lemma
     
@@ -4216,6 +4359,7 @@ class FlexiPipeTagger:
         1. First try (form, XPOS) lookup
         2. Then try form-only lookup (with XPOS context if available)
         3. Finally use similarity matching with XPOS context
+        4. If word is OOV (not in primary vocab), try lexicon as fallback
         
         Vocabulary entries can be:
         - Single object: {"upos": "NOUN", "lemma": "word"}
@@ -4227,6 +4371,10 @@ class FlexiPipeTagger:
         - Falls back to lowercase match if exact case not found
         - This handles cases like German "Band" (noun, book volume) vs "band" (verb, past tense)
         
+        Lexicon (OOV fallback):
+        - Lexicon is only checked if word is not in primary vocab at all
+        - This ensures corpus-specific vocabulary (with counts) takes priority over general lexicons
+        
         Args:
             form: Word form
             field: Field to predict ('lemma', 'upos', 'xpos', 'feats')
@@ -4236,6 +4384,13 @@ class FlexiPipeTagger:
         """
         form_lower = form.lower()
         use_xpos = self.config.use_xpos_for_tagging
+        
+        # Check if word is in primary vocab (to determine if it's OOV)
+        # Check both self.vocab (merged vocab) and self.external_vocab (in case load_model wasn't called)
+        vocab_to_check = self.vocab if self.vocab else self.external_vocab
+        word_in_vocab = (form in vocab_to_check or form_lower in vocab_to_check or 
+                        (field == 'lemma' and xpos and xpos != '_' and 
+                         (f"{form}:{xpos}" in vocab_to_check or f"{form_lower}:{xpos}" in vocab_to_check)))
         
         def get_field_from_entry(entry, field, xpos=None, upos=None, feats=None, debug_entry=False):
             """Helper to extract field from vocabulary entry (single object or array).
@@ -4262,23 +4417,30 @@ class FlexiPipeTagger:
                                 matches.append((count, analysis))
                                 if debug_entry or debug:
                                     print(f"[DEBUG LEMMA]   MATCH found! xpos='{analysis_xpos}' == '{xpos}'", file=sys.stderr)
-                    
+                
+                    # Fallback to UPOS+FEATS if no XPOS match
                     # Fallback to UPOS+FEATS if no XPOS match
                     if not matches and upos and upos != '_':
-                        if debug_entry or debug:
                             print(f"[DEBUG LEMMA] No XPOS match, trying UPOS+FEATS: upos='{upos}', feats='{feats}'", file=sys.stderr)
-                        for analysis in entry:
+                    for analysis in entry:
                             analysis_upos = analysis.get('upos', '_')
                             analysis_feats = analysis.get('feats', '_')
                             if analysis_upos == upos:
-                                # If FEATS provided, require match; otherwise just UPOS match
-                                if feats and feats != '_':
-                                    if analysis_feats == feats:
+                                # If FEATS provided, check if lexicon FEATS are subset of actual FEATS
+                                # (lexicon might have fewer features, which is fine)
+                                if feats and feats != '_' and analysis_feats and analysis_feats != '_':
+                                    # Check if all lexicon FEATS are present in actual FEATS
+                                    lexicon_feat_dict = {f.split('=')[0]: f.split('=')[1] for f in analysis_feats.split('|') if '=' in f}
+                                    actual_feat_dict = {f.split('=')[0]: f.split('=')[1] for f in feats.split('|') if '=' in f}
+                                    # All lexicon features must be present in actual features with same values
+                                    feats_match = all(actual_feat_dict.get(k) == v for k, v in lexicon_feat_dict.items())
+                                    if feats_match:
                                         count = analysis.get('count', 0)
                                         matches.append((count, analysis))
-                                else:
-                                    count = analysis.get('count', 0)
-                                    matches.append((count, analysis))
+                                    elif not feats or feats == '_':
+                                        # No FEATS provided, just match on UPOS
+                                        count = analysis.get('count', 0)
+                                        matches.append((count, analysis))
                 else:
                     # UPOS+FEATS-first mode (default): try UPOS+FEATS match first
                     if upos and upos != '_':
@@ -4288,14 +4450,21 @@ class FlexiPipeTagger:
                             analysis_upos = analysis.get('upos', '_')
                             analysis_feats = analysis.get('feats', '_')
                             if analysis_upos == upos:
-                                # If FEATS provided, require match; otherwise just UPOS match
-                                if feats and feats != '_':
-                                    if analysis_feats == feats:
+                                # If FEATS provided, check if lexicon FEATS are subset of actual FEATS
+                                # (lexicon might have fewer features, which is fine)
+                                if feats and feats != '_' and analysis_feats and analysis_feats != '_':
+                                    # Check if all lexicon FEATS are present in actual FEATS
+                                    lexicon_feat_dict = {f.split('=')[0]: f.split('=')[1] for f in analysis_feats.split('|') if '=' in f}
+                                    actual_feat_dict = {f.split('=')[0]: f.split('=')[1] for f in feats.split('|') if '=' in f}
+                                    # All lexicon features must be present in actual features with same values
+                                    feats_match = all(actual_feat_dict.get(k) == v for k, v in lexicon_feat_dict.items())
+                                    if feats_match:
                                         count = analysis.get('count', 0)
                                         matches.append((count, analysis))
                                         if debug_entry or debug:
-                                            print(f"[DEBUG LEMMA]   MATCH found! upos='{analysis_upos}', feats='{analysis_feats}'", file=sys.stderr)
-                                else:
+                                            print(f"[DEBUG LEMMA]   MATCH found! upos='{analysis_upos}', feats='{analysis_feats}' (subset match)", file=sys.stderr)
+                                elif not feats or feats == '_':
+                                    # No FEATS provided, just match on UPOS
                                     count = analysis.get('count', 0)
                                     matches.append((count, analysis))
                                     if debug_entry or debug:
@@ -4382,10 +4551,10 @@ class FlexiPipeTagger:
         if field == 'lemma' and xpos and xpos != '_':
             # Try exact case first
             key = f"{form}:{xpos}"
-            if key in self.vocab:
+            if key in vocab_to_check:
                 if debug:
                     print(f"[DEBUG LEMMA] Found form:xpos key: '{key}'", file=sys.stderr)
-                result = get_field_from_entry(self.vocab[key], field, xpos, upos, debug_entry=debug)
+                result = get_field_from_entry(vocab_to_check[key], field, xpos, upos, debug_entry=debug)
                 if debug:
                     print(f"[DEBUG LEMMA] Result from '{key}': '{result}'", file=sys.stderr)
                 return result
@@ -4394,10 +4563,10 @@ class FlexiPipeTagger:
             
             # Try lowercase
             key = f"{form_lower}:{xpos}"
-            if key in self.vocab:
+            if key in vocab_to_check:
                 if debug:
                     print(f"[DEBUG LEMMA] Found form:xpos key (lowercase): '{key}'", file=sys.stderr)
-                result = get_field_from_entry(self.vocab[key], field, xpos, upos, debug_entry=debug)
+                result = get_field_from_entry(vocab_to_check[key], field, xpos, upos, debug_entry=debug)
                 if debug:
                     print(f"[DEBUG LEMMA] Result from '{key}': '{result}'", file=sys.stderr)
                 return result
@@ -4410,17 +4579,17 @@ class FlexiPipeTagger:
         # - English: "Apple" (proper noun, company) vs "apple" (common noun, fruit)
         
         # Try exact case match first
-        if form in self.vocab:
+        if form in vocab_to_check:
             if debug:
                 print(f"[DEBUG LEMMA] Found form in vocab: '{form}'", file=sys.stderr)
-                entry = self.vocab[form]
+                entry = vocab_to_check[form]
                 if isinstance(entry, list):
                     print(f"[DEBUG LEMMA] Entry has {len(entry)} analyses:", file=sys.stderr)
                     for i, analysis in enumerate(entry):
                         print(f"[DEBUG LEMMA]   [{i}] xpos={analysis.get('xpos', '_')}, upos={analysis.get('upos', '_')}, lemma={analysis.get('lemma', '_')}, count={analysis.get('count', 0)}", file=sys.stderr)
                 else:
                     print(f"[DEBUG LEMMA] Entry: xpos={entry.get('xpos', '_')}, upos={entry.get('upos', '_')}, lemma={entry.get('lemma', '_')}", file=sys.stderr)
-            vocab_result = get_field_from_entry(self.vocab[form], field, xpos, upos, debug_entry=debug)
+            vocab_result = get_field_from_entry(vocab_to_check[form], field, xpos, upos, debug_entry=debug)
             if debug:
                 print(f"[DEBUG LEMMA] Result from form '{form}': '{vocab_result}'", file=sys.stderr)
             # For lemmatization: if vocab returns '_', try pattern-based as fallback
@@ -4441,17 +4610,17 @@ class FlexiPipeTagger:
             return vocab_result
         
         # Fall back to lowercase match
-        if form_lower in self.vocab:
+        if form_lower in vocab_to_check:
             if debug:
                 print(f"[DEBUG LEMMA] Found form_lower in vocab: '{form_lower}'", file=sys.stderr)
-                entry = self.vocab[form_lower]
+                entry = vocab_to_check[form_lower]
                 if isinstance(entry, list):
                     print(f"[DEBUG LEMMA] Entry has {len(entry)} analyses:", file=sys.stderr)
                     for i, analysis in enumerate(entry):
                         print(f"[DEBUG LEMMA]   [{i}] xpos={analysis.get('xpos', '_')}, upos={analysis.get('upos', '_')}, lemma={analysis.get('lemma', '_')}, count={analysis.get('count', 0)}", file=sys.stderr)
                 else:
                     print(f"[DEBUG LEMMA] Entry: xpos={entry.get('xpos', '_')}, upos={entry.get('upos', '_')}, lemma={entry.get('lemma', '_')}", file=sys.stderr)
-            vocab_result = get_field_from_entry(self.vocab[form_lower], field, xpos, upos, debug_entry=debug)
+            vocab_result = get_field_from_entry(vocab_to_check[form_lower], field, xpos, upos, debug_entry=debug)
             if debug:
                 print(f"[DEBUG LEMMA] Result from form_lower '{form_lower}': '{vocab_result}'", file=sys.stderr)
             # For lemmatization: if vocab returns '_', try pattern-based as fallback
@@ -4501,16 +4670,17 @@ class FlexiPipeTagger:
                 # For non-inflecting POS, lemma should be the form itself
                 return form_lower
         
+        # Try similarity matching in primary vocab (fallback for cases where pattern-based doesn't work)
         if debug:
             print(f"[DEBUG LEMMA] Trying similarity matching for form '{form}'", file=sys.stderr)
-        similar = find_similar_words(form, self.vocab, self.config.similarity_threshold)
+        similar = find_similar_words(form, vocab_to_check, self.config.similarity_threshold)
         if similar:
             best_match = similar[0][0]
             if debug:
                 print(f"[DEBUG LEMMA] Found similar words (showing top 5):", file=sys.stderr)
                 for i, (match_word, score) in enumerate(similar[:5]):
                     print(f"[DEBUG LEMMA]   [{i}] '{match_word}' (similarity: {score:.3f})", file=sys.stderr)
-            similar_entry = self.vocab[best_match]
+            similar_entry = vocab_to_check[best_match]
             
             # Handle array format
             if isinstance(similar_entry, list):
@@ -4540,7 +4710,7 @@ class FlexiPipeTagger:
                     if len(similar) > 1:
                         # Try next similar word
                         for next_match, next_score in similar[1:]:
-                            next_entry = self.vocab.get(next_match)
+                            next_entry = vocab_to_check.get(next_match)
                             if not next_entry:
                                 continue
                             if isinstance(next_entry, list):
@@ -4596,107 +4766,66 @@ class FlexiPipeTagger:
             
             return result
         
-        return '_'
-    
-    def _apply_lemmatization_patterns(self, form: str, xpos: str, debug: bool = False) -> str:
-        """
-        Apply lemmatization patterns to OOV word (TreeTagger/Neotag style).
-        
-        Finds all matching patterns and applies the one with highest count of distinct lemma/form pairs.
-        When multiple patterns match the same suffix length, picks the one with most examples.
-        Example: 
-        - "estudiantes" with patterns (-es, ""), (-des, "d"), (-edes, "ed") -> "estudiante" (uses longest: -edes)
-        - For "palabrades" ending in -ades: if both (-ade, "") and (-ad, "") match, pick the one with highest count
-        
-        Args:
-            form: Word form to lemmatize
-            xpos: XPOS tag for pattern matching
-        
-        Returns:
-            Lemma or '_' if no pattern matches
-        """
-        if not self.lemmatization_patterns or xpos not in self.lemmatization_patterns:
+        # Final fallback: check lexicon if word is OOV (not in primary vocab)
+        # Lexicon is only used when word is not in primary vocab at all, as a fallback for OOV words
+        # This ensures corpus-specific vocabulary (with counts) takes priority over general lexicons
+        if not word_in_vocab and self.lexicon:
             if debug:
-                print(f"[DEBUG LEMMA PATTERNS] No patterns for XPOS '{xpos}'", file=sys.stderr)
-            return '_'
-        
-        form_lower = form.lower()
-        patterns = self.lemmatization_patterns[xpos]
-        
-        if debug:
-            print(f"[DEBUG LEMMA PATTERNS] Found {len(patterns)} patterns for XPOS '{xpos}'", file=sys.stderr)
-        
-        # Find all matching patterns (patterns where suffix_from matches the end of the form)
-        matching_patterns = []
-        
-        for pattern_tuple in patterns:
-            if len(pattern_tuple) == 4:
-                suffix_from, suffix_to, min_base, count = pattern_tuple
-            else:
-                # Backward compatibility: old format without count
-                suffix_from, suffix_to, min_base = pattern_tuple[:3]
-                count = 1  # Default count if not available
+                print(f"[DEBUG] Word '{form}' not found in primary vocab, checking lexicon (OOV fallback)", file=sys.stderr)
             
-            # Check if form matches this pattern
-            if suffix_from:
-                # Include deletion patterns (empty suffix_to) if they have high enough count
-                # Deletion patterns like -es → '' are valid for cases like "mercedes" → "merced"
-                # But we need to be careful - only allow deletion if count is high enough (reliable)
-                if not suffix_to and suffix_from:
-                    # Empty suffix_to: deletion pattern (e.g., -es → '' for "mercedes" → "merced")
-                    # Only allow if count is high enough (at least 3) to be reliable
-                    if count < 3:
-                        # Skip unreliable deletion patterns
-                        continue
-                if form_lower.endswith(suffix_from):
-                    base = form_lower[:-len(suffix_from)]
-                    if len(base) >= min_base:
-                        lemma = base + suffix_to  # Will be just "base" if suffix_to is empty
-                        # Verify lemma is reasonable (not empty, not too short)
-                        if len(lemma) >= 2:
-                            # Additional validation: filter out unrealistic patterns at application time
-                            # This catches patterns that might have slipped through during building
-                            # 1. Very short suffix patterns that add characters (likely errors)
-                            if len(suffix_from) <= 1 and len(suffix_to) > len(suffix_from) + 1:
-                                # Skip: very short suffix adding more than 1 character is unrealistic
-                                # Example: "o" -> "oto" (1 char -> 3 chars) is suspicious
-                                if debug:
-                                    print(f"[DEBUG LEMMA PATTERNS] Skipping unrealistic pattern: suffix_from='{suffix_from}' -> suffix_to='{suffix_to}' (too short, adds too many chars)", file=sys.stderr)
-                                continue
-                            if len(suffix_from) == 2 and len(suffix_to) > len(suffix_from) + 2:
-                                # Skip: 2-char suffix adding more than 2 characters is suspicious
-                                if debug:
-                                    print(f"[DEBUG LEMMA PATTERNS] Skipping unrealistic pattern: suffix_from='{suffix_from}' -> suffix_to='{suffix_to}' (adds too many chars)", file=sys.stderr)
-                                continue
-                            
-                            # Store: (suffix_length, count, lemma)
-                            # "No change" patterns (suffix_from == suffix_to) are valid and important
-                            # Deletion patterns (suffix_to == '') are also valid if count is high
-                            matching_patterns.append((len(suffix_from), count, lemma))
-                            if debug:
-                                print(f"[DEBUG LEMMA PATTERNS] Pattern matches: suffix_from='{suffix_from}' -> suffix_to='{suffix_to}', lemma='{lemma}', count={count}", file=sys.stderr)
-            elif suffix_to:
-                # Pattern: add suffix_to (less common, but possible)
-                if len(form_lower) >= min_base:
-                    lemma = form_lower + suffix_to
-                    if len(lemma) >= 2:
-                        matching_patterns.append((0, count, lemma))  # Suffix length 0 for add patterns
+            # Try lexicon lookup (same logic as vocab, but only for OOV words)
+            if form in self.lexicon:
+                lexicon_result = get_field_from_entry(self.lexicon[form], field, xpos, upos, feats, debug_entry=debug)
+                if lexicon_result and lexicon_result != '_':
+                    if debug:
+                        print(f"[DEBUG] Found in lexicon: '{lexicon_result}'", file=sys.stderr)
+                    return lexicon_result
+            elif form_lower in self.lexicon:
+                lexicon_result = get_field_from_entry(self.lexicon[form_lower], field, xpos, upos, feats, debug_entry=debug)
+                if lexicon_result and lexicon_result != '_':
+                    if debug:
+                        print(f"[DEBUG] Found in lexicon (lowercase): '{lexicon_result}'", file=sys.stderr)
+                    return lexicon_result
         
-        if not matching_patterns:
-            if debug:
-                print(f"[DEBUG LEMMA PATTERNS] No matching patterns for form '{form}'", file=sys.stderr)
             return '_'
         
-        # Resolve conflicts: if multiple patterns match, prefer:
-        # 1. Longest suffix (most specific match)
-        # 2. Highest count (most distinct lemma/form pairs) when suffix lengths are equal
-        matching_patterns.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        
-        if debug:
-            print(f"[DEBUG LEMMA PATTERNS] Selected best pattern: suffix_length={matching_patterns[0][0]}, count={matching_patterns[0][1]}, lemma='{matching_patterns[0][2]}'", file=sys.stderr)
-        
-        # Return lemma from the best matching pattern
-        return matching_patterns[0][2]
+    def _apply_lemmatization_patterns(self, form: str, xpos: str, debug: bool = False) -> str:
+        """Apply lemmatization patterns to OOV word using shared function."""
+        from flexipipe.lemmatizer import apply_lemmatization_patterns
+        if not self.lemmatization_patterns:
+            return '_'
+        return apply_lemmatization_patterns(
+            form,
+            xpos,
+            self.lemmatization_patterns,
+            known_lemmas=self._get_known_lemmas(),
+            debug=debug
+        )
+
+    def _get_known_lemmas(self) -> set:
+        """Collect known lemmas from vocabulary and lexicon for pattern preference."""
+        lemmas = set()
+
+        def collect(source):
+            if not source:
+                return
+            for entry in source.values():
+                if isinstance(entry, list):
+                    for analysis in entry:
+                        lemma = analysis.get('lemma') if isinstance(analysis, dict) else None
+                        if lemma and lemma != '_':
+                            lemmas.add(lemma.lower())
+                elif isinstance(entry, dict):
+                    lemma = entry.get('lemma')
+                    if lemma and lemma != '_':
+                        lemmas.add(lemma.lower())
+
+        collect(self.vocab)
+        collect(self.external_vocab)
+        collect(self.lexicon)
+
+        return lemmas
+    
     
     def write_output(self, sentences: List[List[Dict]], output_file: Optional[Path], format: str = "conllu"):
         """Write tagged sentences to output file or stdout.
