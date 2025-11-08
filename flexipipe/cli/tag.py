@@ -430,9 +430,10 @@ def main():
                                     vocab_metadata['capitalizable_tags'][tag_type][tag] = stats.copy()
                 
             # Other metadata: later files override
-            for key, value in metadata_from_file.items():
-                if key != 'capitalizable_tags':
-                    vocab_metadata[key] = value
+            if metadata_from_file:
+                for key, value in metadata_from_file.items():
+                    if key != 'capitalizable_tags':
+                        vocab_metadata[key] = value
             
             # Check if tagset is in metadata
             if metadata_from_file and 'tagset' in metadata_from_file:

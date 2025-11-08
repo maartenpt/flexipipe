@@ -301,9 +301,12 @@ def build_vocab_from_sentences(sentences: List[List[Dict]]) -> Dict:
             lemma = token.get('lemma', '_').lower() if token.get('lemma', '_') != '_' else '_'
             norm_form = token.get('norm_form', '_')
             expan_form = token.get('expan', '_')
+            parts = token.get('parts', [])  # Contraction split forms (e.g., ["in", "dem"] for "im")
             
             # Store annotation combination and count frequency
-            annotation_key = (upos, xpos, feats, lemma, norm_form, expan_form)
+            # parts is stored as tuple for hashing (convert list to tuple)
+            parts_tuple = tuple(parts) if parts else ()
+            annotation_key = (upos, xpos, feats, lemma, norm_form, expan_form, parts_tuple)
             all_annotations_case[form][annotation_key] += 1
             all_annotations_lower[form_lower][annotation_key] += 1
     
@@ -318,8 +321,8 @@ def build_vocab_from_sentences(sentences: List[List[Dict]]) -> Dict:
         entries = []
         seen_combinations = set()
         
-        for (upos, xpos, feats, lemma, norm_form, expan_form), count in annotation_list:
-            combination_key = (upos, xpos, feats, lemma, norm_form, expan_form)
+        for (upos, xpos, feats, lemma, norm_form, expan_form, parts), count in annotation_list:
+            combination_key = (upos, xpos, feats, lemma, norm_form, expan_form, parts)
             if combination_key in seen_combinations:
                 continue
             seen_combinations.add(combination_key)
@@ -338,6 +341,9 @@ def build_vocab_from_sentences(sentences: List[List[Dict]]) -> Dict:
                 entry['reg'] = norm_form
             if expan_form and expan_form != '_':
                 entry['expan'] = expan_form
+            # Include parts (contraction split forms) if present
+            if parts:
+                entry['parts'] = list(parts)  # Convert tuple to list for JSON serialization
             # Include count/frequency
             entry['count'] = count
             
@@ -376,8 +382,8 @@ def build_vocab_from_sentences(sentences: List[List[Dict]]) -> Dict:
         entries = []
         seen_combinations = set()
         
-        for (upos, xpos, feats, lemma, norm_form, expan_form), count in annotation_list:
-            combination_key = (upos, xpos, feats, lemma, norm_form, expan_form)
+        for (upos, xpos, feats, lemma, norm_form, expan_form, parts), count in annotation_list:
+            combination_key = (upos, xpos, feats, lemma, norm_form, expan_form, parts)
             if combination_key in seen_combinations:
                 continue
             seen_combinations.add(combination_key)
@@ -395,6 +401,9 @@ def build_vocab_from_sentences(sentences: List[List[Dict]]) -> Dict:
                 entry['reg'] = norm_form
             if expan_form and expan_form != '_':
                 entry['expan'] = expan_form
+            # Include parts (contraction split forms) if present
+            if parts:
+                entry['parts'] = list(parts)  # Convert tuple to list for JSON serialization
             entry['count'] = count
             
             if entry:

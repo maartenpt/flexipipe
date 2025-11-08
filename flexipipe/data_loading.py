@@ -115,10 +115,12 @@ def load_conllu_file(file_path: Path) -> List[List[Dict]]:
     """Load CoNLL-U file, returning list of sentences (each sentence is a list of tokens).
     
     Preserves the original text from # text = comments for accurate spacing reconstruction.
+    Also handles MWT (Multi-Word Tokens) by extracting the orthographic form and split information.
     """
     sentences = []
     current_sentence = []
     current_text = None  # Store original text from # text = comment
+    mwt_info = {}  # Map token ID range (e.g., "5-6") to (orthographic_form, split_forms)
     
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
@@ -129,11 +131,66 @@ def load_conllu_file(file_path: Path) -> List[List[Dict]]:
                 current_text = line_stripped[8:].strip()  # Extract text after "# text ="
                 continue
             
+            # Check for MWT line (e.g., "5-6	im	...")
+            parts = line_stripped.split('\t')
+            if len(parts) >= 2:
+                tid = parts[0].strip()
+                if '-' in tid:
+                    # MWT line: extract orthographic form and token range
+                    try:
+                        start_id, end_id = tid.split('-')
+                        start_id = int(start_id)
+                        end_id = int(end_id)
+                        ortho_form = parts[1].strip()  # The orthographic form (e.g., "im")
+                        # Store MWT info - we'll populate split_forms when we see the tokens
+                        mwt_info[tid] = {
+                            'ortho_form': ortho_form,
+                            'start_id': start_id,
+                            'end_id': end_id,
+                            'split_forms': []  # Will be filled when we process tokens start_id to end_id
+                        }
+                    except (ValueError, IndexError):
+                        pass
+                    continue
+            
             token = parse_conllu_simple(line)
             if token:
+                token_id = token.get('id')
+                # Check if this token is part of an MWT
+                for mwt_key, mwt_data in mwt_info.items():
+                    if mwt_data['start_id'] <= token_id <= mwt_data['end_id']:
+                        mwt_data['split_forms'].append(token.get('form', ''))
+                        # Mark token as part of MWT
+                        token['_mwt_key'] = mwt_key
+                        break
                 current_sentence.append(token)
             elif not line_stripped:
                 if current_sentence:
+                    # Process MWT info: add orthographic forms to vocabulary
+                    # We'll add them as separate tokens with parts information
+                    for mwt_key, mwt_data in mwt_info.items():
+                        if mwt_data['split_forms']:
+                            # Create a token for the orthographic form with parts
+                            ortho_token = {
+                                'id': mwt_data['start_id'],  # Use start ID
+                                'form': mwt_data['ortho_form'],
+                                'upos': '_',  # Contractions don't have a single UPOS
+                                'xpos': '_',  # Contractions don't have a single XPOS
+                                'feats': '_',
+                                'lemma': '_',
+                                'head': 0,
+                                'deprel': '_',
+                                'norm_form': '_',
+                                'expan': '_',
+                                'parts': mwt_data['split_forms'],  # Store split forms
+                                '_is_mwt_ortho': True  # Mark as MWT orthographic form
+                            }
+                            # Insert at the position of the first split token
+                            for i, tok in enumerate(current_sentence):
+                                if tok.get('id') == mwt_data['start_id']:
+                                    current_sentence.insert(i, ortho_token)
+                                    break
+                    
                     # Store original text as metadata in first token or as sentence-level data
                     if current_text:
                         # Store in first token's misc field for later retrieval
@@ -145,8 +202,30 @@ def load_conllu_file(file_path: Path) -> List[List[Dict]]:
                     sentences.append(current_sentence)
                     current_sentence = []
                     current_text = None
+                    mwt_info = {}  # Reset MWT info for next sentence
     
     if current_sentence:
+        # Process any remaining MWT info
+        for mwt_key, mwt_data in mwt_info.items():
+            if mwt_data['split_forms']:
+                ortho_token = {
+                    'id': mwt_data['start_id'],
+                    'form': mwt_data['ortho_form'],
+                    'upos': '_',
+                    'xpos': '_',
+                    'feats': '_',
+                    'lemma': '_',
+                    'head': 0,
+                    'deprel': '_',
+                    'norm_form': '_',
+                    'expan': '_',
+                    'parts': mwt_data['split_forms'],
+                    '_is_mwt_ortho': True
+                }
+                for i, tok in enumerate(current_sentence):
+                    if tok.get('id') == mwt_data['start_id']:
+                        current_sentence.insert(i, ortho_token)
+                        break
         if current_text:
             if current_sentence:
                 current_sentence[0]['_original_text'] = current_text
@@ -382,18 +461,23 @@ def load_teitok_xml(file_path: Path, normalization_attr: str = 'reg') -> List[Li
                 dtoks = tok.findall('.//dtok')
                 
                 if dtoks:
-                    # Contraction: process each dtok
+                    # Contraction: collect split forms for the orthographic token
+                    split_forms = []
+                    dtok_tokens = []  # Store dtok tokens for later addition
+                    
+                    # First pass: collect all dtok forms
                     for dt in dtoks:
                         # Get dtok ID: try @id first, then @xml:id
                         dt_id = dt.get('id', '') or dt.get('{http://www.w3.org/XML/1998/namespace}id', '')
                         form = dt.get('form', '') or (dt.text or '').strip()
                         if form:
+                            split_forms.append(form)
                             # Get normalization (try specified attr first, then common fallbacks)
                             nform = get_attr_with_fallback(dt, normalization_attr) or dt.get('reg', '') or dt.get('nform', '')
                             xpos_val = get_attr_with_fallback(dt, xpos_attr) or dt.get('xpos', '_')
                             expan_val = get_attr_with_fallback(dt, expan_attr) or dt.get('expan', '') or dt.get('fform', '')
                             
-                            sentence_tokens.append({
+                            dtok_token = {
                                 'id': token_num,
                                 'form': form,
                                 'norm_form': nform if nform else '_',
@@ -406,8 +490,32 @@ def load_teitok_xml(file_path: Path, normalization_attr: str = 'reg') -> List[Li
                                 'tok_id': tok_id,
                                 'dtok_id': dt_id,
                                 'expan': expan_val if expan_val else '_',
+                            }
+                            dtok_tokens.append(dtok_token)
+                            token_num += 1
+                    
+                    # Add orthographic form ("im") with parts information for training
+                    if len(split_forms) > 1:
+                        ortho_form = tok.get('form', '') or (tok.text or '').strip()
+                        if ortho_form:
+                            sentence_tokens.append({
+                                'id': token_num,
+                                'form': ortho_form,
+                                'norm_form': '_',
+                                'lemma': '_',
+                                'upos': '_',  # Contractions don't have a single UPOS
+                                'xpos': '_',  # Contractions don't have a single XPOS
+                                'feats': '_',
+                                'head': '0',
+                                'deprel': '_',
+                                'tok_id': tok_id,
+                                'parts': split_forms,  # Store split forms
+                                'expan': '_',
                             })
                             token_num += 1
+                    
+                    # Add all dtok tokens (grammatical tokens)
+                    sentence_tokens.extend(dtok_tokens)
                 else:
                     # Regular token
                     form = (tok.text or '').strip()

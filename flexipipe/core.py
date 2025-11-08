@@ -432,18 +432,23 @@ def load_teitok_xml(file_path: Path, normalization_attr: str = 'reg') -> List[Li
                 dtoks = tok.findall('.//dtok')
                 
                 if dtoks:
-                    # Contraction: process each dtok
+                    # Contraction: collect split forms for the orthographic token
+                    split_forms = []
+                    dtok_tokens = []  # Store dtok tokens for later addition
+                    
+                    # First pass: collect all dtok forms
                     for dt in dtoks:
                         # Get dtok ID: try @id first, then @xml:id
                         dt_id = dt.get('id', '') or dt.get('{http://www.w3.org/XML/1998/namespace}id', '')
                         form = dt.get('form', '') or (dt.text or '').strip()
                         if form:
+                            split_forms.append(form)
                             # Get normalization (try specified attr first, then common fallbacks)
                             nform = get_attr_with_fallback(dt, normalization_attr) or dt.get('reg', '') or dt.get('nform', '')
                             xpos_val = get_attr_with_fallback(dt, xpos_attr) or dt.get('xpos', '_')
                             expan_val = get_attr_with_fallback(dt, expan_attr) or dt.get('expan', '') or dt.get('fform', '')
                             
-                            sentence_tokens.append({
+                            dtok_token = {
                                 'id': token_num,
                                 'form': form,
                                 'norm_form': nform if nform else '_',
@@ -456,8 +461,32 @@ def load_teitok_xml(file_path: Path, normalization_attr: str = 'reg') -> List[Li
                                 'tok_id': tok_id,
                                 'dtok_id': dt_id,
                                 'expan': expan_val if expan_val else '_',
+                            }
+                            dtok_tokens.append(dtok_token)
+                            token_num += 1
+                    
+                    # Add orthographic form ("im") with parts information for training
+                    if len(split_forms) > 1:
+                        ortho_form = tok.get('form', '') or (tok.text or '').strip()
+                        if ortho_form:
+                            sentence_tokens.append({
+                                'id': token_num,
+                                'form': ortho_form,
+                                'norm_form': '_',
+                                'lemma': '_',
+                                'upos': '_',  # Contractions don't have a single UPOS
+                                'xpos': '_',  # Contractions don't have a single XPOS
+                                'feats': '_',
+                                'head': '0',
+                                'deprel': '_',
+                                'tok_id': tok_id,
+                                'parts': split_forms,  # Store split forms
+                                'expan': '_',
                             })
                             token_num += 1
+                    
+                    # Add all dtok tokens (grammatical tokens)
+                    sentence_tokens.extend(dtok_tokens)
                 else:
                     # Regular token
                     form = (tok.text or '').strip()

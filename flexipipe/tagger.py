@@ -31,6 +31,8 @@ from flexipipe.core import (
 from flexipipe.tokenizer import tokenize_words_ud_style, tokenize
 # Import vocabulary-based parser
 from flexipipe.parser import parse_sentence
+# Import contraction splitting
+from flexipipe.contractions import split_contraction
 
 if TYPE_CHECKING:
     if TRANSFORMERS_AVAILABLE:
@@ -379,12 +381,31 @@ class FlexiPipeTagger:
                         self.id_to_norm = {v: k for k, v in self.norm_to_id.items()} if self.norm_to_id else {}
             
             # Load model vocabulary (built from training data)
+            # Format: {'metadata': {...}, 'vocab': {...}, 'transitions': {...}}
             model_vocab_file = model_path / 'model_vocab.json'
             if model_vocab_file.exists():
                 with open(model_vocab_file, 'r', encoding='utf-8') as f:
-                    self.model_vocab = json.load(f)
+                    model_vocab_data = json.load(f)
+                
+                # Extract vocab, transitions, and metadata
+                self.model_vocab = model_vocab_data.get('vocab', {})
+                model_transitions = model_vocab_data.get('transitions', {})
+                model_metadata = model_vocab_data.get('metadata', {})
+                
+                # Merge model transitions with existing transition_probs (if provided)
+                if model_transitions and self.transition_probs is None:
+                    self.transition_probs = model_transitions
+                elif model_transitions and self.transition_probs:
+                    # Merge transitions (model transitions take precedence for same keys)
+                    for key, value in model_transitions.items():
+                        if key not in self.transition_probs:
+                            self.transition_probs[key] = value
+                        elif isinstance(value, dict) and isinstance(self.transition_probs[key], dict):
+                            # Merge nested dicts (e.g., 'upos', 'xpos', 'start', 'deprel')
+                            self.transition_probs[key].update(value)
+                
                 if self.config.debug:
-                    print(f"Loaded model vocabulary with {len(self.model_vocab)} entries", file=sys.stderr)
+                    print(f"Loaded model vocabulary with {len(self.model_vocab)} entries (includes transitions)", file=sys.stderr)
             else:
                 self.model_vocab = {}
                 print("Warning: No model_vocab.json found, using empty model vocabulary", file=sys.stderr)
@@ -980,15 +1001,69 @@ class FlexiPipeTagger:
         # Build and save word-level vocabulary from training data
         # This is separate from tokenizer's vocab.txt (which contains subword tokens)
         # This vocabulary contains full words with linguistic annotations (form, lemma, upos, xpos, feats)
-        # Uses shared vocabulary building function to ensure consistency with create-vocab
+        # Uses shared functions from create-vocab to ensure consistency
         print("Building word-level vocabulary from training data...", file=sys.stderr)
         from flexipipe.vocabulary import build_vocab_from_sentences
+        from flexipipe.cli.create_vocab import (
+            _extract_transitions_from_sentences,
+            _extract_dependency_transitions_from_conllu
+        )
+        from collections import defaultdict
+        from datetime import datetime
+        
+        # Build vocabulary using shared function (same as create-vocab)
         model_vocab = build_vocab_from_sentences(train_sentences)
         
-        # Save model vocabulary
+        # Extract transition probabilities using shared function (same as create-vocab)
+        print("Extracting transition probabilities...", file=sys.stderr)
+        transition_probs = _extract_transitions_from_sentences(train_sentences)
+        
+        # Extract dependency transitions using shared function (same as create-vocab)
+        deprel_transitions = {'upos': defaultdict(int), 'xpos': defaultdict(int)}
+        _extract_dependency_transitions_from_conllu(train_sentences, deprel_transitions, use_xpos=False)
+        
+        # Add dependency transitions to transition_probs (same format as create-vocab)
+        if deprel_transitions['upos'] or deprel_transitions['xpos']:
+            if 'deprel' not in transition_probs:
+                transition_probs['deprel'] = {}
+            # Convert counts to probabilities (simple normalization)
+            for tag_format in ['upos', 'xpos']:
+                if deprel_transitions[tag_format]:
+                    total = sum(deprel_transitions[tag_format].values())
+                    transition_probs['deprel'][tag_format] = {
+                        key: count / total for key, count in deprel_transitions[tag_format].items()
+                    }
+        
+        # Build metadata (same format as create-vocab)
+        total_sentences = transition_probs.get('sentences', 0)
+        metadata = {
+            'corpus_name': 'training_data',
+            'creation_date': datetime.now().isoformat(),
+            'source_files': [str(f) for f in train_files],
+            'sentence_count': total_sentences,
+            'vocab_stats': {
+                'total_entries': len(model_vocab),
+            },
+            'transition_stats': {
+                'upos_transitions': len(transition_probs.get('upos', {})),
+                'xpos_transitions': len(transition_probs.get('xpos', {})),
+                'start_states': len(transition_probs.get('start', {})),
+                'has_transitions': bool(transition_probs),
+                'has_dependency_transitions': bool(deprel_transitions['upos'] or deprel_transitions['xpos'])
+            }
+        }
+        
+        # Save model vocabulary in same format as create-vocab (for consistency)
+        # This allows model_vocab.json to be used directly or with create-vocab output
+        output_data = {
+            'metadata': metadata,
+            'vocab': model_vocab,
+            'transitions': transition_probs
+        }
+        
         with open(Path(self.config.output_dir) / 'model_vocab.json', 'w', encoding='utf-8') as f:
-            json.dump(model_vocab, f, ensure_ascii=False, indent=2)
-        print(f"Saved model vocabulary with {len(model_vocab)} entries", file=sys.stderr)
+            json.dump(output_data, f, ensure_ascii=False, indent=2)
+        print(f"Saved model vocabulary with {len(model_vocab)} entries (format: metadata + vocab + transitions)", file=sys.stderr)
         
         # Save label mappings
         label_mappings = {
@@ -1797,8 +1872,31 @@ class FlexiPipeTagger:
                 if self.config.debug:
                     print(f"[DEBUG] Processing sentence {sent_idx + 1}/{len(sentences)}: {len(sentence)} tokens", file=sys.stderr)
                 
-                # Extract word forms
-                words = [token.get('form', '_') for token in sentence]
+                # Check for contractions before tagging (using vocabulary parts field)
+                # This must happen before Viterbi tagging so contractions are split correctly
+                expanded_sentence = []
+                for token in sentence:
+                    form = token.get('form', '_')
+                    # Check if this form has parts in vocabulary (contraction)
+                    contraction_parts = split_contraction(form, self.vocab, language=None)
+                    if contraction_parts and len(contraction_parts) > 1:
+                        # Split contraction into multiple tokens (like MWT in UD)
+                        if self.config.debug:
+                            print(f"[DEBUG] Splitting contraction '{form}' -> {contraction_parts}", file=sys.stderr)
+                        for i, part_form in enumerate(contraction_parts):
+                            part_token = token.copy()
+                            part_token['form'] = part_form
+                            part_token['_is_contraction_part'] = True
+                            part_token['_contraction_original'] = form
+                            part_token['_contraction_index'] = i
+                            part_token['_contraction_total'] = len(contraction_parts)
+                            expanded_sentence.append(part_token)
+                    else:
+                        # Not a contraction, keep as-is
+                        expanded_sentence.append(token)
+                
+                # Extract word forms from expanded sentence (after contraction splitting)
+                words = [token.get('form', '_') for token in expanded_sentence]
                 
                 # Get capitalizable tags statistics from vocabulary metadata (language-agnostic)
                 capitalizable_tags = None
@@ -1806,17 +1904,79 @@ class FlexiPipeTagger:
                     # Use statistics directly (already in dict format)
                     capitalizable_tags = self.vocab_metadata['capitalizable_tags']
                 
-                # Tag with Viterbi
+                # Tag with Viterbi (using expanded sentence with split contractions)
                 upos_tags = viterbi_tag_sentence(words, self.vocab, self.transition_probs, tag_type='upos', capitalizable_tags=capitalizable_tags)
                 xpos_tags = viterbi_tag_sentence(words, self.vocab, self.transition_probs, tag_type='xpos', capitalizable_tags=capitalizable_tags)
                 
-                # Build tagged sentence
-                tagged_sentence = []
-                for word_idx, token in enumerate(sentence):
-                    token_id = token.get('id', word_idx + 1)
-                    if token_id == 0:
-                        token_id = word_idx + 1
+                # Build tagged sentence (use expanded_sentence which includes split contractions)
+                # First pass: collect contraction groups and assign IDs
+                contraction_groups = {}  # Maps (start_word_idx) -> {original_form, parts: [(word_idx, form, ...)]}
+                base_word_id = 1
+                token_id_map = {}  # Maps word_idx -> token_id
+                
+                # First pass: identify contraction groups and assign IDs
+                i = 0
+                while i < len(expanded_sentence):
+                    token = expanded_sentence[i]
+                    is_contraction_part = token.get('_is_contraction_part', False)
                     
+                    if is_contraction_part and token.get('_contraction_index', 0) == 0:
+                        # Start of a contraction group
+                        original_form = token.get('_contraction_original', token.get('form', '_'))
+                        total_parts = token.get('_contraction_total', 1)
+                        mwt_id = f"{base_word_id}-{base_word_id + total_parts - 1}"
+                        
+                        # Store MWT token ID for the original form
+                        contraction_groups[i] = {
+                            'mwt_id': mwt_id,
+                            'original_form': original_form,
+                            'start_idx': i,
+                            'total_parts': total_parts
+                        }
+                        
+                        # Assign IDs to all parts
+                        for part_idx in range(total_parts):
+                            if i + part_idx < len(expanded_sentence):
+                                part_token = expanded_sentence[i + part_idx]
+                                if part_token.get('_contraction_index', 0) == part_idx:
+                                    token_id_map[i + part_idx] = base_word_id + part_idx
+                        
+                        # Increment base_word_id by total_parts (for the MWT: 5-6 means we used 5 and 6, next is 7)
+                        base_word_id += total_parts
+                        i += total_parts
+                    else:
+                        # Regular token (not part of a contraction)
+                        # Always use base_word_id for new tokens (don't preserve original IDs after contractions)
+                        # This ensures correct numbering after MWT tokens
+                        token_id = base_word_id
+                        base_word_id += 1
+                        token_id_map[i] = token_id
+                        i += 1
+                
+                # Second pass: build tagged tokens
+                tagged_sentence = []
+                for word_idx, token in enumerate(expanded_sentence):
+                    is_contraction_part = token.get('_is_contraction_part', False)
+                    
+                    # Check if this is the start of a contraction group
+                    if word_idx in contraction_groups:
+                        # Create MWT line first (original form, no tags)
+                        group = contraction_groups[word_idx]
+                        mwt_token = {
+                            'id': group['mwt_id'],
+                            'form': group['original_form'],
+                            'lemma': '_',
+                            'upos': '_',
+                            'xpos': '_',
+                            'feats': '_',
+                            'head': '_',
+                            'deprel': '_',
+                            '_is_mwt': True
+                        }
+                        tagged_sentence.append(mwt_token)
+                    
+                    # Get token ID
+                    token_id = token_id_map.get(word_idx, word_idx + 1)
                     form = token.get('form', '_')
                     
                     # Get predicted tags
@@ -1989,16 +2149,32 @@ class FlexiPipeTagger:
                     if lemma == '_':
                         lemma = form.lower()
                     
-                    tagged_token = {
-                        'id': token_id,
-                        'form': form,
-                        'lemma': lemma if lemma != '_' else form.lower(),  # Fallback to lowercase form
-                        'upos': upos,
-                        'xpos': xpos,
-                        'feats': feats,
-                        'head': '_',  # No parsing in Viterbi mode
-                        'deprel': '_',
-                    }
+                    # Skip MWT parts - we already added the MWT line above
+                    if is_contraction_part:
+                        # This is a contraction part - create the tagged token for the part
+                        tagged_token = {
+                            'id': token_id,
+                            'form': form,
+                            'lemma': lemma if lemma != '_' else form.lower(),
+                            'upos': upos,
+                            'xpos': xpos,
+                            'feats': feats,
+                            'head': '_',
+                            'deprel': '_',
+                            '_is_mwt_part': True
+                        }
+                    else:
+                        # Regular token
+                        tagged_token = {
+                            'id': token_id,
+                            'form': form,
+                            'lemma': lemma if lemma != '_' else form.lower(),
+                            'upos': upos,
+                            'xpos': xpos,
+                            'feats': feats,
+                            'head': '_',  # No parsing in Viterbi mode
+                            'deprel': '_',
+                        }
                     
                     # Preserve original text and sentence ID
                     if '_original_text' in token:
@@ -2374,6 +2550,8 @@ class FlexiPipeTagger:
                         else:
                             # Confidence-based blending: use vocab if model confidence is low
                             use_vocab_for_upos = False
+                            contraction_split = None
+                            
                             if (self.config.use_vocabulary and 
                                 word_idx in word_confidence and 
                                 word_confidence[word_idx][0] < self.config.confidence_threshold):
@@ -2382,6 +2560,17 @@ class FlexiPipeTagger:
                                 if vocab_upos_fallback and vocab_upos_fallback != '_':
                                     tagged_token['upos'] = vocab_upos_fallback
                                     use_vocab_for_upos = True
+                                else:
+                                    # Vocabulary doesn't have it - try contraction splitting as fallback
+                                    # Only if confidence is very low (< 0.3) and vocabulary is available
+                                    # Contraction splitting relies on vocabulary patterns from training data
+                                    if (word_confidence[word_idx][0] < 0.3 and self.vocab):
+                                        contraction_split = split_contraction(
+                                            form,
+                                            self.vocab,
+                                            aggressive=False,
+                                            language=None  # Language-agnostic: rely on vocab patterns only
+                                        )
                             
                             if not use_vocab_for_upos:
                                 # Use model prediction (either high confidence or no vocab match)
@@ -2390,6 +2579,10 @@ class FlexiPipeTagger:
                                 else:
                                     # Fallback to vocabulary or similarity
                                     tagged_token['upos'] = self._predict_from_vocab(form, 'upos')
+                            
+                            # If contraction was detected, we'll handle it after XPOS/lemma are determined
+                            if contraction_split and len(contraction_split) > 1:
+                                tagged_token['_contraction_split'] = contraction_split
                         
                         if existing_xpos != '_':
                             tagged_token['xpos'] = existing_xpos
@@ -2627,7 +2820,7 @@ class FlexiPipeTagger:
                             # Head and deprel will be set by fallback parser if parsing is enabled
                             tagged_token['head'] = '_'
                             tagged_token['deprel'] = '_'
-                        
+                    
                         # Add expan from vocabulary entry that matches the selected XPOS/UPOS
                         # Only use expan from the same entry that was used for tagging
                         expan = None
@@ -2686,7 +2879,48 @@ class FlexiPipeTagger:
                         if expan:
                             tagged_token['expan'] = expan
                     
-                    tagged_sentence.append(tagged_token)
+                    # Handle contraction splitting detected during low-confidence fallback
+                    if '_contraction_split' in tagged_token:
+                        contraction_parts = tagged_token.pop('_contraction_split')
+                        # Replace the single token with multiple tokens (like MWT in UD)
+                        base_id = tagged_token.get('id', word_idx + 1)
+                        for i, part_form in enumerate(contraction_parts):
+                            if i == 0:
+                                # First part: update existing token
+                                tagged_token['form'] = part_form
+                                tagged_token['id'] = f"{base_id}-{len(contraction_parts)}"
+                                # Re-tag the part using vocabulary
+                                part_upos = self._predict_from_vocab(part_form, 'upos')
+                                part_xpos = self._predict_from_vocab(part_form, 'xpos')
+                                part_feats = self._predict_from_vocab(part_form, 'feats')
+                                if part_upos and part_upos != '_':
+                                    tagged_token['upos'] = part_upos
+                                if part_xpos and part_xpos != '_':
+                                    tagged_token['xpos'] = part_xpos
+                                if part_feats and part_feats != '_':
+                                    tagged_token['feats'] = part_feats
+                                # Re-lemmatize
+                                xpos = tagged_token.get('xpos', '_')
+                                upos = tagged_token.get('upos', '_')
+                                tagged_token['lemma'] = self._get_lemma(part_form, word_idx, word_predictions, xpos=xpos, upos=upos, norm_form=None, lemma_confidence=None)
+                                tagged_sentence.append(tagged_token)
+                            else:
+                                # Additional parts: create new tokens
+                                part_token = {
+                                    'id': f"{base_id}-{i+1}",
+                                    'form': part_form,
+                                    'upos': self._predict_from_vocab(part_form, 'upos') or '_',
+                                    'xpos': self._predict_from_vocab(part_form, 'xpos') or '_',
+                                    'feats': self._predict_from_vocab(part_form, 'feats') or '_',
+                                    'head': '_',
+                                    'deprel': '_',
+                                }
+                                xpos = part_token.get('xpos', '_')
+                                upos = part_token.get('upos', '_')
+                                part_token['lemma'] = self._get_lemma(part_form, word_idx, word_predictions, xpos=xpos, upos=upos, norm_form=None, lemma_confidence=None)
+                                tagged_sentence.append(part_token)
+                    else:
+                        tagged_sentence.append(tagged_token)
                 
                 tagged_sentences.append(tagged_sentence)
         
@@ -3025,7 +3259,8 @@ class FlexiPipeTagger:
                                                     feats_match = all(actual_feat_dict.get(k) == v for k, v in lexicon_feat_dict.items())
                                                     if feats_match:
                                                         matches.append((analysis.get('count', 0), analysis))
-                                                    else:
+                                                    elif not feats or feats == '_':
+                                                        # No FEATS provided, just match on UPOS
                                                         matches.append((analysis.get('count', 0), analysis))
                                 else:
                                     if upos and upos != '_':
@@ -3875,7 +4110,14 @@ class FlexiPipeTagger:
                     
                     # Write tokens
                     for token_idx, token in enumerate(sentence):
-                        tid = token.get('id', 0)
+                        # Handle MWT tokens (contractions) - output original form with empty tags
+                        if token.get('_is_mwt'):
+                            tid = str(token.get('id', 0))
+                            form = token.get('form', '_')
+                            f.write(f"{tid}\t{form}\t_\t_\t_\t_\t_\t_\t_\t_\n")
+                            continue
+                        
+                        tid = str(token.get('id', 0))
                         form = token.get('form', '_')
                         lemma = token.get('lemma', '_')
                         upos = token.get('upos', '_')

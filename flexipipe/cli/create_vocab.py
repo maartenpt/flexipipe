@@ -25,6 +25,108 @@ def extract_form_from_tok(tok):
     return form
 
 
+def _extract_transitions_from_sentences(sentences: List[List[Dict]]) -> Dict:
+    """
+    Extract transition probabilities from sentences (works for both CoNLL-U and TEITOK).
+    
+    Returns a dictionary with 'upos', 'xpos', 'start', and 'sentences' keys,
+    in the same format as create-vocab output.
+    """
+    from collections import defaultdict
+    
+    upos_transitions = defaultdict(int)  # (prev_upos, curr_upos) -> count
+    xpos_transitions = defaultdict(int)  # (prev_xpos, curr_xpos) -> count
+    upos_start_counts = defaultdict(int)  # upos -> count
+    total_sentences = 0
+    
+    for sentence in sentences:
+        if not sentence:
+            continue
+        prev_upos = None
+        prev_xpos = None
+        is_first = True
+        
+        for token in sentence:
+            upos = token.get('upos', '_')
+            xpos = token.get('xpos', '_')
+            
+            if is_first:
+                if upos and upos != '_':
+                    upos_start_counts[upos] += 1
+                is_first = False
+                prev_upos = upos
+                prev_xpos = xpos
+            else:
+                if prev_upos and upos != '_' and prev_upos != '_':
+                    upos_transitions[(prev_upos, upos)] += 1
+                if prev_xpos and xpos != '_' and prev_xpos != '_':
+                    xpos_transitions[(prev_xpos, xpos)] += 1
+                prev_upos = upos
+                prev_xpos = xpos
+        
+        if not is_first:  # At least one token processed
+            total_sentences += 1
+    
+    # Convert to probabilities (with smoothing, same as build_vocabulary_from_folder)
+    transition_probs = {}
+    if total_sentences > 0:
+        smoothing = 0.01
+        all_upos = set()
+        for (prev, curr), count in upos_transitions.items():
+            all_upos.add(prev)
+            all_upos.add(curr)
+        
+        upos_from_counts = defaultdict(int)
+        for (prev, curr), count in upos_transitions.items():
+            upos_from_counts[prev] += count
+        
+        upos_trans_probs = {}
+        for prev in all_upos:
+            total = upos_from_counts[prev] + smoothing * len(all_upos)
+            upos_trans_probs[prev] = {}
+            for curr in all_upos:
+                count = upos_transitions.get((prev, curr), 0)
+                prob = (count + smoothing) / total
+                upos_trans_probs[prev][curr] = prob
+        
+        all_xpos = set()
+        for (prev, curr), count in xpos_transitions.items():
+            all_xpos.add(prev)
+            all_xpos.add(curr)
+        
+        xpos_from_counts = defaultdict(int)
+        for (prev, curr), count in xpos_transitions.items():
+            xpos_from_counts[prev] += count
+        
+        xpos_trans_probs = {}
+        for prev in all_xpos:
+            total = xpos_from_counts[prev] + smoothing * len(all_xpos)
+            xpos_trans_probs[prev] = {}
+            for curr in all_xpos:
+                count = xpos_transitions.get((prev, curr), 0)
+                prob = (count + smoothing) / total
+                xpos_trans_probs[prev][curr] = prob
+        
+        start_probs = {}
+        total_starts = sum(upos_start_counts.values())
+        if total_starts > 0:
+            for upos in all_upos:
+                count = upos_start_counts.get(upos, 0)
+                start_probs[upos] = (count + smoothing) / (total_starts + smoothing * len(all_upos))
+        else:
+            for upos in all_upos:
+                start_probs[upos] = 1.0 / len(all_upos) if all_upos else 0.0
+        
+        transition_probs = {
+            'upos': upos_trans_probs,
+            'xpos': xpos_trans_probs,
+            'start': start_probs,
+            'sentences': total_sentences
+        }
+    
+    return transition_probs
+
+
 def _extract_dependency_transitions_from_conllu(sentences: List[List[Dict]], deprel_transitions: Dict, use_xpos: bool = False):
     """
     Extract dependency transition probabilities from CoNLL-U sentences.
@@ -132,7 +234,7 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
             - capitalization_info: Dictionary with capitalization stats (or empty dict)
             - deprel_transitions: Dictionary {(head_pos, dep_pos, deprel): count} (or None)
     """
-    word_annotations = defaultdict(int)  # (form, form_lower, upos, xpos, feats, lemma, norm_form, expan_form) -> count
+    word_annotations = defaultdict(int)  # (form, form_lower, upos, xpos, feats, lemma, norm_form, expan_form, parts) -> count
     
     # Track transitions if requested
     transitions = None
@@ -196,7 +298,11 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
                 dtoks = tok.findall('.//dtok')
                 
                 if dtoks:
-                    # Contraction: process each dtok separately
+                    # Contraction: collect split forms for the orthographic token
+                    split_forms = []
+                    dtok_entries = []  # Store dtok data for later processing
+                    
+                    # First pass: collect all dtok forms and their data
                     for dt in dtoks:
                         # dtok always has @form attribute
                         form = dt.get('form', '').strip()
@@ -218,6 +324,27 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
                         # This is important for normalization - we need form->reg mappings even without POS tags
                         if (not xpos or xpos == '_') and (not norm_form or norm_form == '_'):
                             continue
+                        
+                        split_forms.append(form)
+                        dtok_entries.append({
+                            'form': form,
+                            'form_lower': form_lower,
+                            'upos': upos,
+                            'xpos': xpos,
+                            'norm_form': norm_form,
+                            'expan_form': expan_form,
+                            'dt': dt
+                        })
+                    
+                    # Process each dtok separately (grammatical tokens)
+                    for dtok_data in dtok_entries:
+                        form = dtok_data['form']
+                        form_lower = dtok_data['form_lower']
+                        upos = dtok_data['upos']
+                        xpos = dtok_data['xpos']
+                        norm_form = dtok_data['norm_form']
+                        expan_form = dtok_data['expan_form']
+                        dt = dtok_data['dt']
                         
                         # Store token info for dependency tracking (after XPOS/norm check)
                         # We include all tokens that made it past the XPOS/norm check for dependency extraction
@@ -256,7 +383,8 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
                                     capitalization_info['xpos'][xpos]['lowercase'] += 1
                         
                         # Store with both original case and lowercase for proper handling
-                        annotation_key = (form, form_lower, upos, xpos, feats, lemma, norm_form, expan_form)
+                        # parts is empty tuple for grammatical tokens (not contractions themselves)
+                        annotation_key = (form, form_lower, upos, xpos, feats, lemma, norm_form, expan_form, ())
                         word_annotations[annotation_key] += 1
                         
                         prev_form = form
@@ -336,7 +464,8 @@ def extract_vocab_from_teitok_xml(file_path: Path, xpos_attr: str = 'xpos', reg_
                                 capitalization_info['xpos'][xpos]['lowercase'] += 1
                     
                     # Store with both original case and lowercase for proper handling
-                    annotation_key = (form, form_lower, upos, xpos, feats, lemma, norm_form, expan_form)
+                    # parts is empty tuple for regular tokens (not contractions)
+                    annotation_key = (form, form_lower, upos, xpos, feats, lemma, norm_form, expan_form, ())
                     word_annotations[annotation_key] += 1
                     
                     prev_form = form
@@ -518,8 +647,8 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
         
         # Merge into main annotations dictionary
         # Track both case-sensitive and lowercase separately
-        for (form, form_lower, upos, xpos, feats, lemma, norm_form, expan_form), count in word_annotations.items():
-            annotation_key = (upos, xpos, feats, lemma, norm_form, expan_form)
+        for (form, form_lower, upos, xpos, feats, lemma, norm_form, expan_form, parts), count in word_annotations.items():
+            annotation_key = (upos, xpos, feats, lemma, norm_form, expan_form, parts)
             
             # Always track lowercase (for fallback)
             all_annotations_lower[form_lower][annotation_key] += count
@@ -638,9 +767,9 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
     # Each token appears as many times as its count
     fake_sentences = []
     for form, annotations in all_annotations_case.items():
-        for (upos, xpos, feats, lemma, norm_form, expan_form), count in annotations.items():
+        for (upos, xpos, feats, lemma, norm_form, expan_form, parts), count in annotations.items():
             for _ in range(count):
-                fake_sentences.append([{
+                token_dict = {
                     'form': form,
                     'upos': upos,
                     'xpos': xpos,
@@ -648,7 +777,11 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
                     'lemma': lemma,
                     'norm_form': norm_form,
                     'expan': expan_form
-                }])
+                }
+                # Add parts field if it's a contraction (non-empty tuple)
+                if parts:
+                    token_dict['parts'] = list(parts)  # Convert tuple to list for JSON serialization
+                fake_sentences.append([token_dict])
     
     for form_lower, annotations in all_annotations_lower.items():
         # Only add if no case-sensitive form exists with same annotations
@@ -666,9 +799,9 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
             if lowercase_annotations == case_sensitive_annotations:
                 continue  # Skip if same as case-sensitive
         
-        for (upos, xpos, feats, lemma, norm_form, expan_form), count in annotations.items():
+        for (upos, xpos, feats, lemma, norm_form, expan_form, parts), count in annotations.items():
             for _ in range(count):
-                fake_sentences.append([{
+                token_dict = {
                     'form': form_lower,
                     'upos': upos,
                     'xpos': xpos,
@@ -676,7 +809,11 @@ def build_vocabulary_from_folder(folder_path: Path, xpos_attr: str = 'xpos', reg
                     'lemma': lemma,
                     'norm_form': norm_form,
                     'expan': expan_form
-                }])
+                }
+                # Add parts field if it's a contraction (non-empty tuple)
+                if parts:
+                    token_dict['parts'] = list(parts)  # Convert tuple to list for JSON serialization
+                fake_sentences.append([token_dict])
     
     # Use shared vocabulary building function
     vocab = build_vocab_from_sentences(fake_sentences)
