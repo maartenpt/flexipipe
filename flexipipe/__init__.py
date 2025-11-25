@@ -1,14 +1,35 @@
-"""
-FlexiPipe: Flexible transformer-based NLP pipeline for tagging, parsing, and normalization.
+"""flexipipe – modular NLP pipeline combining BERT and flexitag."""
 
-Supports multiple annotation schemes (UD, XPOS-only) and works with both modern and historic texts.
-Language-agnostic and fine-tunable for specific corpora.
-"""
+__version__ = "0.1.0"
 
-__version__ = "1.0.0"
+from .doc import Document, Sentence, Token, SubToken, apply_nlpform
+from .engine import FlexitagFallback
+from .teitok import load_teitok, save_teitok, dump_teitok, update_teitok
+# Import insert_tokens_into_teitok implementation
+from .insert_tokens import insert_tokens_into_teitok
+from .pipeline import FlexiPipeline, PipelineConfig
+from .conllu import document_to_conllu, conllu_to_document
+from .train import train_ud_treebank
+from .check import evaluate_model
+from .tag_mapping import TagMapping, build_tag_mapping_from_paths
 
-from flexipipe.config import FlexiPipeConfig
-from flexipipe.tagger import FlexiPipeTagger
-
-__all__ = ['FlexiPipeConfig', 'FlexiPipeTagger', '__version__']
-
+__all__ = [
+    "Document",
+    "Sentence",
+    "Token",
+    "SubToken",
+    "apply_nlpform",
+    "FlexitagFallback",
+    "FlexiPipeline",
+    "PipelineConfig",
+    "load_teitok",
+    "save_teitok",
+    "dump_teitok",
+    "update_teitok",
+    "document_to_conllu",
+    "conllu_to_document",
+    "train_ud_treebank",
+    "evaluate_model",
+    "TagMapping",
+    "build_tag_mapping_from_paths",
+]

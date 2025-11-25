@@ -34,14 +34,31 @@ ENV/
 
 # Development files
 dev/
+old/
+debug_stats.json
+*.bak
+
+# Test files and examples
+tests/
+examples/
+vocabs/
+
+# Web interface (optional, can be distributed but often local-only)
+# web/
+
+# Third-party submodules (if not using as submodules)
+# third_party/
 
 # Models and vocabularies
 models/
 *.pt
 *.bin
+# JSON files - ignore most, but allow registry files and package files
 *.json
 !requirements.txt
 !package.json
+!docs/registries/*.json
+!flexipipe/scripts/*.json
 
 # Logs
 *.log

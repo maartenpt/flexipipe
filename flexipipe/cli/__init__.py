@@ -1,4 +1,0 @@
-"""
-CLI modules for FlexiPipe.
-"""
-

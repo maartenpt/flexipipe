@@ -37,10 +37,9 @@ def parse_teitok_tagset(tagset_file: Path) -> Dict:
         
     Returns:
         Dictionary with:
-        - 'xpos_to_upos': Mapping from XPOS patterns to UPOS
-        - 'xpos_to_feats': Mapping from XPOS patterns to FEATS (UD format)
-        - 'position_defs': Position definitions for feature extraction
         - 'main_categories': Main category mappings
+        - 'position_defs': Position definitions for feature extraction
+        - 'tagset_file': Path to tagset file
     """
     tree = ET.parse(tagset_file)
     root = tree.getroot()
@@ -179,7 +178,6 @@ def _map_feature_value_to_ud(feat_name: Optional[str], value_display: str, value
     
     # Gender mappings
     if feat_name == 'Gender':
-        # Skip "0" key (non-relevant)
         if value_key == '0':
             return None
         mappings = {
@@ -192,7 +190,6 @@ def _map_feature_value_to_ud(feat_name: Optional[str], value_display: str, value
     
     # Number mappings
     if feat_name == 'Number':
-        # Skip "0" key (non-relevant)
         if value_key == '0':
             return None
         mappings = {
@@ -204,7 +201,6 @@ def _map_feature_value_to_ud(feat_name: Optional[str], value_display: str, value
     
     # Person mappings
     if feat_name == 'Person':
-        # Skip "0" key (non-relevant)
         if value_key == '0':
             return None
         mappings = {
@@ -216,7 +212,6 @@ def _map_feature_value_to_ud(feat_name: Optional[str], value_display: str, value
     
     # Mood mappings
     if feat_name == 'Mood':
-        # Skip "0" key (non-relevant)
         if value_key == '0':
             return None
         mappings = {
@@ -231,7 +226,6 @@ def _map_feature_value_to_ud(feat_name: Optional[str], value_display: str, value
     
     # Tense mappings
     if feat_name == 'Tense':
-        # Skip "0" key (non-relevant)
         if value_key == '0':
             return None
         mappings = {
@@ -245,7 +239,6 @@ def _map_feature_value_to_ud(feat_name: Optional[str], value_display: str, value
     
     # Case mappings
     if feat_name == 'Case':
-        # Skip "0" key (non-relevant)
         if value_key == '0':
             return None
         mappings = {
@@ -258,7 +251,6 @@ def _map_feature_value_to_ud(feat_name: Optional[str], value_display: str, value
     
     # Degree mappings
     if feat_name == 'Degree':
-        # Skip "0" key (non-relevant)
         if value_key == '0':
             return None
         mappings = {
@@ -290,12 +282,6 @@ def xpos_to_upos_feats(xpos: str, tagset_def: Dict) -> Tuple[str, str]:
     position_defs = tagset_def.get('position_defs', {})
     
     # Determine main category (first character or first two for multi-char categories)
-    # For EAGLES tagsets, multi-char categories like NP (proper noun) come first
-    # However, tags like NCMS000 should be parsed as N (main) + C (pos 1) + MS000 (remaining)
-    # because the multi-category items (NC, NP) share position definitions with N
-    # and the second character (C/P) is actually position 1 (type), not part of main category
-    # Exception: If the multi-char category has a different UPOS (e.g., NP -> PROPN vs N -> NOUN),
-    # it should be treated as a true multi-char category
     main_cat = None
     remaining = ''
     if len(xpos) >= 2 and xpos[:2] in main_categories:
@@ -331,31 +317,22 @@ def xpos_to_upos_feats(xpos: str, tagset_def: Dict) -> Tuple[str, str]:
     upos = cat_info.get('upos', 'X')
     
     # Extract features from remaining positions
-    # Position definitions are organized by main category, then by position index
     feats_dict = {}
     
     # Get position definitions for this main category
     cat_pos_defs = position_defs.get(main_cat, {})
     
     # Extract features from remaining positions
-    # For tags like NCMS000: N (main) + C (pos 1, type/subcategory) + M (pos 2, gender) + S (pos 3, number) + ...
-    # We need to map each character to its position index
     for char_index, char in enumerate(remaining, start=1):
         if char_index in cat_pos_defs:
             pos_def = cat_pos_defs[char_index]
-            # pos_def is a dict mapping character keys to feature info
-            # Structure: {char_key: {ud_feat, ud_value, display}}
-            # Only process if the character exists in the position definition
-            # Missing characters (not defined in tagset) are treated as non-relevant (like display="")
             if char in pos_def:
                 char_info = pos_def[char]
                 ud_feat = char_info.get('ud_feat')
                 ud_value = char_info.get('ud_value')
                 # Only add if it's a valid UD feature with a value
-                # Skip type/subcategory indicators (no UD feature) and non-relevant values
                 if ud_feat and ud_value:
                     feats_dict[ud_feat] = ud_value
-            # If char is not in pos_def, it's treated as non-relevant (like display="") and skipped
     
     # Convert feats_dict to UD format string
     if feats_dict:
@@ -364,51 +341,4 @@ def xpos_to_upos_feats(xpos: str, tagset_def: Dict) -> Tuple[str, str]:
         feats = '_'
     
     return upos, feats
-
-
-def check_agreement(token1_feats: str, token2_feats: str, required_features: list = None) -> bool:
-    """
-    Check if two tokens agree in morphological features.
-    
-    Args:
-        token1_feats: FEATS string for first token (UD format)
-        token2_feats: FEATS string for second token (UD format)
-        required_features: List of features to check (e.g., ['Gender', 'Number'])
-                          If None, checks all common features
-        
-    Returns:
-        True if tokens agree (or if agreement cannot be determined), False if they disagree
-    """
-    if not token1_feats or token1_feats == '_' or not token2_feats or token2_feats == '_':
-        return True  # Can't check agreement if features missing
-    
-    # Parse FEATS strings
-    def parse_feats(feats_str):
-        if not feats_str or feats_str == '_':
-            return {}
-        return {f.split('=')[0]: f.split('=')[1] for f in feats_str.split('|') if '=' in f}
-    
-    feats1 = parse_feats(token1_feats)
-    feats2 = parse_feats(token2_feats)
-    
-    if not feats1 or not feats2:
-        return True  # Can't check if either is empty
-    
-    # Determine which features to check
-    if required_features is None:
-        # Check all common features
-        common_features = set(feats1.keys()) & set(feats2.keys())
-        features_to_check = common_features
-    else:
-        features_to_check = [f for f in required_features if f in feats1 and f in feats2]
-    
-    if not features_to_check:
-        return True  # No features to check
-    
-    # Check agreement
-    for feat in features_to_check:
-        if feats1.get(feat) != feats2.get(feat):
-            return False  # Disagreement found
-    
-    return True  # All checked features agree
 

@@ -3,8 +3,11 @@
 Setup script for FlexiPipe
 """
 
-from setuptools import setup, find_packages
+from setuptools import setup, find_packages, Extension
+from setuptools.command.build_ext import build_ext
 from pathlib import Path
+import pybind11
+import sys
 
 # Read README for long description
 readme_file = Path(__file__).parent / "README.md"
@@ -33,11 +36,12 @@ setup(
     packages=find_packages(),
     python_requires=">=3.8",
     install_requires=[
-        "torch>=1.13.0",
+        "torch>=2.6.0",
         "transformers>=4.20.0",
         "datasets>=2.0.0",
         "scikit-learn>=1.0.0",
         "accelerate>=0.20.0",
+        "pybind11>=2.10",
     ],
     extras_require={
         "dev": [
@@ -64,5 +68,58 @@ setup(
         "Topic :: Text Processing :: Linguistic",
     ],
     keywords="nlp, universal-dependencies, tagging, parsing, bert, transformers, normalization",
+    ext_modules=[
+        Extension(
+            "flexipipe.viterbi_cpp",
+            [
+                "src/viterbi_cpp.cpp",
+            ],
+            include_dirs=[
+                pybind11.get_include(),
+            ],
+            language="c++",
+            extra_compile_args=[
+                "-std=c++17",
+                "-O3",  # Optimize for speed
+                "-Wall",
+            ] if sys.platform != "win32" else [
+                "/std:c++17",
+                "/O2",  # Optimize for speed on Windows
+            ],
+        ),
+        Extension(
+            "flexipipe.pipeline_cpp",
+            [
+                "src/pipeline_pybind.cpp",
+                "src/vocab_loader.cpp",
+                "src/tokenizer.cpp",
+                "src/normalizer.cpp",
+                "src/contractions.cpp",
+                "src/viterbi_optimized.cpp",
+                "src/io_conllu.cpp",
+                "src/io_teitok.cpp",
+            ],
+            include_dirs=[
+                pybind11.get_include(),
+                "src",
+                "third_party/rapidjson/include",
+                "third_party/pugixml/src",
+            ],
+            language="c++",
+            extra_compile_args=[
+                "-std=c++17",
+                "-O3",
+                "-Wall",
+            ] if sys.platform != "win32" else [
+                "/std:c++17",
+                "/O2",
+            ],
+            extra_objects=[
+                "third_party/pugixml/src/pugixml.cpp",
+            ] if sys.platform != "win32" else [],
+        ),
+    ],
+    cmdclass={"build_ext": build_ext},
+    zip_safe=False,
 )
 
