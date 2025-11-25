@@ -11,8 +11,8 @@ The CLI centers around several workflows:
 
 | Command | Purpose |
 | --- | --- |
-| `python -m flexipipe tag` / `process` | Tag/parse/normalize input with any backend |
-| `python -m flexipipe check` | Evaluate a backend against a gold treebank |
+| `python -m flexipipe process` | Tag/parse/normalize input with any backend |
+| `python -m flexipipe benchmark` | Evaluate backends against gold treebanks |
 | `python -m flexipipe train` | Train flexitag or (where implemented) neural backends |
 | `python -m flexipipe convert` | Convert between formats (tagged files, treebanks, lexicons) |
 | `python -m flexipipe info` | List backends, models, examples, or tasks |
@@ -92,10 +92,10 @@ available integrations, models, example texts, and supported tasks.
 
 ```bash
 # Raw text via STDIN, using default backend and output config
-echo "Don't even think he wouldn't do it." | python -m flexipipe tag --input -
+echo "Don't even think he wouldn't do it." | python -m flexipipe process --input -
 
-# Tag a CoNLL-U file with SpaCy and export TEITOK XML
-python -m flexipipe tag \
+# Process a CoNLL-U file with SpaCy and export TEITOK XML
+python -m flexipipe process \
   --input data/en.conllu \
   --backend spacy \
   --model en_core_web_md \
@@ -103,7 +103,7 @@ python -m flexipipe tag \
   --output out.xml
 
 # Use UDPipe REST in raw mode with debug logging
-python -m flexipipe tag \
+python -m flexipipe process \
   --backend udpipe \
   --udpipe-model english-ewt-ud-2.15-241121 \
   --input-format raw \
@@ -112,8 +112,8 @@ python -m flexipipe tag \
 
 # Chain backends: use UDPipe for tagging/parsing, then NameTag for NER
 echo "Mary bought a new bicycle in Germany." | \
-  python -m flexipipe tag --backend udpipe | \
-  python -m flexipipe tag --backend nametag --output-format conllu-ne
+  python -m flexipipe process --backend udpipe | \
+  python -m flexipipe process --backend nametag --output-format conllu-ne
 ```
 
 Important switches:
@@ -126,27 +126,33 @@ Important switches:
 | `--download-model` | Auto-fetch SpaCy/Stanza/Flair models when missing. |
 | `--output-format` | `tei`, `conllu`, or `json`. Falls back to configuration default. |
 | `--create-implicit-mwt` | Rebuilds implicit MWT ranges in output (default configurable). |
-| `--list-models --backend <name>` | Prints installed + remote models with metadata (cached). |
-| `--list-backends` | Shows all supported backends with short descriptions. |
-| `--refresh-cache` | Force `--list-models` to bypass cached model lists. |
-
-### Evaluation (`check`)
+### Benchmarking
 
 ```bash
-python -m flexipipe check \
+# Run a single backend/model evaluation (quick validation)
+python -m flexipipe benchmark --test \
   --test-file UD_English-EWT/en_ewt-ud-test.conllu \
   --backend spacy \
   --model en_core_web_trf \
   --mode tokenized \
-  --output-dir tmp \
   --verbose --debug
+
+# Run benchmark sweep across languages/backends
+python -m flexipipe benchmark --run \
+  --languages en nl de \
+  --backends spacy stanza
+
+# Show stored benchmark results
+python -m flexipipe benchmark --show \
+  --sort-by upos
 ```
 
-* Accepts the same backend selection flags as `tag`.
+* Accepts the same backend selection flags as `process`.
 * `--mode` chooses how the gold data is fed to the backend (`raw`, `tokenized`,
   `split`, or `auto`).
-* Generates alignment-aware metrics and writes `metrics.json` +
-  predicted/detagged CoNLL-U files inside `--output-dir`.
+* `--test` runs a single evaluation (replaces the old `check` command).
+* `--run` performs a benchmark sweep across multiple languages/backends.
+* `--show` displays stored benchmark results with various sorting options.
 
 ### Training
 
@@ -210,7 +216,7 @@ Usage example:
 
 ```bash
 echo "Why do we need an Old French model?" | \
-  python -m flexipipe tag \
+  python -m flexipipe process \
     --backend transformers \
     --model Davlan/bert-base-multilingual-cased-ner-hrl \
     --transformers-device cpu \
@@ -357,7 +363,7 @@ python -m flexipipe process \
 
 ## Evaluation & Debugging Tips
 
-* Use `--debug` for both `tag` and `check` to enable:
+* Use `--debug` for both `process` and `benchmark` to enable:
   * Curl representations of REST payloads (UDPipe/UDMorph).
   * Tokenization difference samples.
   * Backend-specific log statements (e.g., SPD request durations).
