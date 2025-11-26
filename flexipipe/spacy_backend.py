@@ -20,6 +20,7 @@ try:
 except ImportError:
     requests = None  # type: ignore
 
+from .dependency_utils import ensure_extra_installed
 from .doc import Document, Sentence, SubToken, Token, Span, Entity
 from .language_utils import (
     LANGUAGE_FIELD_ISO,
@@ -820,6 +821,7 @@ class SpacyBackend(BackendManager):
             disable: List of pipeline components to disable
             gpu: Whether to use GPU (requires spacy[gpu])
         """
+        ensure_extra_installed("spacy", module_name="spacy", friendly_name="SpaCy")
         try:
             import spacy
             from spacy.language import Language
@@ -834,11 +836,10 @@ class SpacyBackend(BackendManager):
                     "Or: pip install 'pydantic<2' if you need pydantic v1 compatibility.\n"
                     f"Original error: {e}"
                 ) from e
-            else:
-                raise ImportError(
-                    "SpaCy is not installed. Install it with: pip install spacy\n"
-                    f"Original error: {e}"
-                ) from e
+            raise ImportError(
+                "SpaCy is not installed or failed to import. Install it with: pip install \"flexipipe[spacy]\"\n"
+                f"Original error: {e}"
+            ) from e
         
         self.spacy = spacy
         self._nlp: Optional[Language] = None

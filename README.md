@@ -71,18 +71,37 @@ available integrations, models, example texts, and supported tasks.
    python -m pip install -r requirements.txt
    ```
    Note: `torch>=2.6.0` is required for security (CVE-2025-32434). The transformers backend will check this at runtime.
-3. For neural backends install their optional extras on demand:
+3. Install backend extras when needed (keeps the default install small):
    ```bash
-   # SpaCy
-   python -m pip install "spacy[transformers]"
-   # Stanza + Flair
-   python -m pip install stanza flair
-   # REST backends use requests / urllib (already required)
+   pip install "flexipipe[spacy]"         # SpaCy backend
+   pip install "flexipipe[stanza]"        # Stanza backend
+   pip install "flexipipe[classla]"       # Classla backend
+   pip install "flexipipe[flair]"         # Flair backend
+   pip install "flexipipe[transformers]"  # Transformers backend (installs torch, datasets, etc.)
+   pip install "flexipipe[all]"           # Everything
+   ```
+   Additional upstream options (only when needed):
+   ```bash
+   python -m pip install "spacy[transformers]"  # Enables SpaCy's transformer components
    ```
 4. Build the native flexitag modules (`flexitag`, `viterbi_cpp`) if needed via CMake
    (see `README_CPP.md` for details).
    
    **Note**: C++ dependencies (pugixml, rapidjson) are automatically fetched via CMake FetchContent during build. No manual installation needed.
+
+### Optional Extras Behaviour
+
+Flexipipe can install extras automatically the first time you use a backend:
+
+```bash
+python -m flexipipe config --set-auto-install-extras true
+```
+
+By default, flexipipe will prompt before installing extras in interactive shells. Disable prompts (for batch environments) with:
+
+```bash
+python -m flexipipe config --set-prompt-install-extras false
+```
 
 ---
 

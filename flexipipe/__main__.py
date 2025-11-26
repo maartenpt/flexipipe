@@ -41,6 +41,15 @@ def _natural_sort_key(s: Any) -> Tuple[Any, ...]:
     # Ensure we always have at least one element
     return tuple(result) if result else ("",)
 
+
+def _str_to_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"true", "1", "yes", "on"}:
+        return True
+    if lowered in {"false", "0", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected true/false, got '{value}'")
+
 from . import (
     Document,
     apply_nlpform,
@@ -1671,15 +1680,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     config_parser.add_argument(
         "--set-default-create-implicit-mwt",
-        type=lambda x: x.lower() in ("true", "1", "yes", "on"),
+        type=_str_to_bool,
         metavar="true|false",
         help="Set whether to create implicit MWTs by default (true or false)",
     )
     config_parser.add_argument(
         "--set-default-writeback",
-        type=lambda x: x.lower() in ("true", "1", "yes", "on"),
+        type=_str_to_bool,
         metavar="true|false",
         help="Set whether to enable writeback by default (true or false)",
+    )
+    config_parser.add_argument(
+        "--set-auto-install-extras",
+        type=_str_to_bool,
+        metavar="true|false",
+        help="Automatically install missing optional extras when possible (true or false)",
+    )
+    config_parser.add_argument(
+        "--set-prompt-install-extras",
+        type=_str_to_bool,
+        metavar="true|false",
+        help="Prompt before installing optional extras when auto-install is disabled (true or false)",
     )
     config_parser.add_argument(
         "--show",
@@ -2330,7 +2351,7 @@ def _require_spacy_module():
         import spacy  # type: ignore
     except ImportError as exc:  # pragma: no cover - handled at runtime
         raise SystemExit(
-            "SpaCy backend requires the 'spacy' package. Install it with: pip install spacy"
+            "SpaCy backend requires the optional 'spacy' extra. Install it with: pip install \"flexipipe[spacy]\""
         ) from exc
     return spacy
 
@@ -4172,6 +4193,10 @@ def run_config(args: argparse.Namespace) -> int:
         get_default_create_implicit_mwt,
         set_default_writeback,
         get_default_writeback,
+        set_auto_install_extras,
+        get_auto_install_extras,
+        set_prompt_install_extras,
+        get_prompt_install_extras,
     )
     import os
     
@@ -4262,6 +4287,20 @@ def run_config(args: argparse.Namespace) -> int:
         print(f"[flexipipe] Default writeback set to: {status}")
         print(f"[flexipipe] Configuration saved to: {get_config_file()}")
         return 0
+
+    if args.set_auto_install_extras is not None:
+        set_auto_install_extras(args.set_auto_install_extras)
+        status = "enabled" if args.set_auto_install_extras else "disabled"
+        print(f"[flexipipe] Automatic installation of optional extras set to: {status}")
+        print(f"[flexipipe] Configuration saved to: {get_config_file()}")
+        return 0
+
+    if args.set_prompt_install_extras is not None:
+        set_prompt_install_extras(args.set_prompt_install_extras)
+        status = "enabled" if args.set_prompt_install_extras else "disabled"
+        print(f"[flexipipe] Prompting before installing extras set to: {status}")
+        print(f"[flexipipe] Configuration saved to: {get_config_file()}")
+        return 0
     
     if args.show:
         # Show current configuration
@@ -4284,6 +4323,8 @@ def run_config(args: argparse.Namespace) -> int:
         default_output_format = get_default_output_format()
         default_create_implicit_mwt = get_default_create_implicit_mwt()
         default_writeback = get_default_writeback()
+        auto_install_extras = get_auto_install_extras()
+        prompt_install_extras = get_prompt_install_extras()
         
         if default_backend:
             print(f"  Default backend: {default_backend}")
@@ -4297,6 +4338,8 @@ def run_config(args: argparse.Namespace) -> int:
         
         print(f"  Default create-implicit-mwt: {'enabled' if default_create_implicit_mwt else 'disabled'}")
         print(f"  Default writeback: {'enabled' if default_writeback else 'disabled'}")
+        print(f"  Auto-install extras: {'enabled' if auto_install_extras else 'disabled'}")
+        print(f"  Prompt before installing extras: {'enabled' if prompt_install_extras else 'disabled'}")
         
         # Show model registry configuration
         from .model_registry import get_registry_url, DEFAULT_REGISTRY_BASE_URL

@@ -43,7 +43,7 @@ def _ensure_spacy_model_available(model_name: str) -> None:
         from spacy.cli import download as spacy_download
     except ImportError as exc:  # pragma: no cover - import guard
         raise ValueError(
-            "SpaCy is not installed. Install it with: pip install spacy"
+            "SpaCy is not installed. Install it with: pip install \"flexipipe[spacy]\""
         ) from exc
 
     # Already a path on disk

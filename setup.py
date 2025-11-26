@@ -24,6 +24,46 @@ if init_file.exists():
             version = line.split('=')[1].strip().strip('"').strip("'")
             break
 
+BASE_REQUIREMENTS = [
+    "pybind11>=2.10",
+    "langcodes>=3.3.0",
+    "language-data>=1.1.0",
+    "pycountry>=23.12.0",
+    "fasttext>=0.9.2",
+    "requests>=2.31.0",
+    "tabulate>=0.9.0",
+]
+
+EXTRAS = {
+    "spacy": ["spacy>=3.7.0"],
+    "stanza": ["stanza>=1.8.0"],
+    "classla": ["classla>=2.1.0"],
+    "flair": ["flair>=0.13.0", "torch>=2.6.0"],
+    "transformers": [
+        "torch>=2.6.0",
+        "transformers>=4.20.0",
+        "datasets>=2.0.0",
+        "scikit-learn>=1.0.0",
+        "accelerate>=0.20.0",
+    ],
+    "nametag": ["requests>=2.31.0"],
+    "udpipe": ["requests>=2.31.0"],
+    "udmorph": ["requests>=2.31.0"],
+}
+
+all_extras = sorted({dep for deps in EXTRAS.values() for dep in deps})
+EXTRAS["all"] = all_extras
+EXTRAS["dev"] = sorted(
+    set(
+        all_extras
+        + [
+            "pytest>=7.0.0",
+            "black>=22.0.0",
+            "flake8>=4.0.0",
+        ]
+    )
+)
+
 setup(
     name="flexipipe",
     version=version,
@@ -35,21 +75,8 @@ setup(
     url="https://github.com/yourusername/flexipipe",
     packages=find_packages(),
     python_requires=">=3.8",
-    install_requires=[
-        "torch>=2.6.0",
-        "transformers>=4.20.0",
-        "datasets>=2.0.0",
-        "scikit-learn>=1.0.0",
-        "accelerate>=0.20.0",
-        "pybind11>=2.10",
-    ],
-    extras_require={
-        "dev": [
-            "pytest>=7.0.0",
-            "black>=22.0.0",
-            "flake8>=4.0.0",
-        ],
-    },
+    install_requires=BASE_REQUIREMENTS,
+    extras_require=EXTRAS,
     entry_points={
         "console_scripts": [
             "flexipipe=flexipipe.__main__:main",

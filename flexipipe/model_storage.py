@@ -216,6 +216,28 @@ def set_default_writeback(enabled: bool) -> None:
     write_config({"default_writeback": enabled})
 
 
+def get_auto_install_extras() -> bool:
+    """Return whether optional extras should be installed automatically."""
+    config = read_config()
+    return config.get("auto_install_extras", False)
+
+
+def set_auto_install_extras(enabled: bool) -> None:
+    """Set automatic installation of extras."""
+    write_config({"auto_install_extras": bool(enabled)})
+
+
+def get_prompt_install_extras() -> bool:
+    """Return whether the CLI should prompt before installing extras."""
+    config = read_config()
+    return config.get("prompt_install_extras", True)
+
+
+def set_prompt_install_extras(enabled: bool) -> None:
+    """Set prompting behaviour for optional extras."""
+    write_config({"prompt_install_extras": bool(enabled)})
+
+
 def set_default_create_implicit_mwt(enabled: bool) -> None:
     """
     Set the default create_implicit_mwt setting in the configuration file.
