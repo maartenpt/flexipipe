@@ -1703,6 +1703,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt before installing optional extras when auto-install is disabled (true or false)",
     )
     config_parser.add_argument(
+        "--wizard",
+        action="store_true",
+        help="Run interactive configuration wizard",
+    )
+    config_parser.add_argument(
         "--show",
         action="store_true",
         help="Show current configuration",
@@ -4200,6 +4205,9 @@ def run_config(args: argparse.Namespace) -> int:
     )
     import os
     
+    if args.wizard:
+        return _run_config_wizard()
+
     if args.refresh_all_caches:
         # Refresh all caches at once
         from .cache_manager import refresh_all_caches
@@ -4388,6 +4396,100 @@ def run_config(args: argparse.Namespace) -> int:
     print(f"Example: python -m flexipipe config --refresh-all-caches")
     print(f"Example: python -m flexipipe config --set-default-backend spacy")
     print(f"Example: python -m flexipipe config --set-default-output-format conllu")
+    return 0
+
+
+def _prompt_with_default(prompt: str, default: Optional[str] = None) -> str:
+    suffix = f" [{default}]" if default else ""
+    value = input(f"{prompt}{suffix}: ").strip()
+    return value or (default or "")
+
+
+def _prompt_bool(prompt: str, default: bool) -> bool:
+    default_text = "Y/n" if default else "y/N"
+    while True:
+        response = input(f"{prompt} ({default_text}): ").strip().lower()
+        if not response:
+            return default
+        if response in {"y", "yes"}:
+            return True
+        if response in {"n", "no"}:
+            return False
+        print("Please answer 'y' or 'n'.")
+
+
+def _prompt_choice(prompt: str, choices: List[str], default: Optional[str] = None) -> str:
+    options = "/".join(choices)
+    default_suffix = f" [{default}]" if default else ""
+    while True:
+        response = input(f"{prompt} ({options}){default_suffix}: ").strip().lower()
+        if not response and default:
+            return default
+        if response in choices:
+            return response
+        print(f"Please choose one of: {options}")
+
+
+def _run_config_wizard() -> int:
+    from .model_storage import (
+        get_flexipipe_models_dir,
+        set_models_dir,
+        get_default_backend,
+        set_default_backend,
+        get_default_output_format,
+        set_default_output_format,
+        get_default_create_implicit_mwt,
+        set_default_create_implicit_mwt,
+        get_default_writeback,
+        set_default_writeback,
+        get_auto_install_extras,
+        set_auto_install_extras,
+        get_prompt_install_extras,
+        set_prompt_install_extras,
+    )
+
+    print("\n=== Flexipipe Configuration Wizard ===\n")
+    current_models_dir = str(get_flexipipe_models_dir(create=False))
+    new_dir = _prompt_with_default("Models directory", current_models_dir)
+    if new_dir and new_dir != current_models_dir:
+        set_models_dir(new_dir)
+        print(f"[flexipipe] Models directory set to {new_dir}")
+
+    backend_choices = ["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "nametag", "ctext"]
+    current_backend = get_default_backend() or "flexitag"
+    backend = _prompt_choice("Default backend", backend_choices, default=current_backend)
+    set_default_backend(backend)
+
+    output_choices = ["teitok", "conllu", "conllu-ne", "json"]
+    current_output = get_default_output_format() or "teitok"
+    output_format = _prompt_choice("Default output format", output_choices, default=current_output)
+    set_default_output_format(output_format)
+
+    create_mwt = _prompt_bool(
+        "Create implicit multi-word tokens by default?",
+        get_default_create_implicit_mwt(),
+    )
+    set_default_create_implicit_mwt(create_mwt)
+
+    writeback = _prompt_bool(
+        "Enable writeback mode by default?",
+        get_default_writeback(),
+    )
+    set_default_writeback(writeback)
+
+    auto_install = _prompt_bool(
+        "Automatically install missing optional extras?",
+        get_auto_install_extras(),
+    )
+    set_auto_install_extras(auto_install)
+
+    prompt_install = _prompt_bool(
+        "Prompt before installing extras (when auto-install is disabled)?",
+        get_prompt_install_extras(),
+    )
+    set_prompt_install_extras(prompt_install)
+
+    print("\n[flexipipe] Wizard complete. Run 'python -m flexipipe config --show' to review settings.\n")
     return 0
 
 
