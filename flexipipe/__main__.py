@@ -1156,8 +1156,8 @@ def _run_detect_language_standalone(argv: list[str]) -> int:
             error_msg = str(exc)
             if "Unable to avoid copy" in error_msg or "copy keyword" in error_msg:
                 print(
-                    "[flexipipe] Error: fastText failed due to NumPy 2.x incompatibility.\n"
-                    "Install fasttext-numpy2 or pin numpy<2.",
+                    "[flexipipe] Error: fastText failed due to the old wheel being incompatible with NumPy 2.x.\n"
+                    "Install the compatibility build with: pip install --upgrade fasttext-numpy2",
                     file=sys.stderr,
                 )
             else:
@@ -2622,6 +2622,7 @@ def run_tag(args: argparse.Namespace) -> int:
         if default_backend:
             args.backend = default_backend
             backend_type = default_backend
+            setattr(args, "_backend_explicit", True)
     
     auto_selected = False
 

@@ -354,14 +354,14 @@ def _ensure_fasttext_model(model_path: Optional[Path] = None):
         return _FASTTEXT_MODEL
     if _FASTTEXT_IMPORT_ERROR:
         raise RuntimeError(
-            "fasttext library failed to import previously. Install it with 'pip install fasttext'."
+            "fasttext library failed to import previously. Install it with 'pip install fasttext-numpy2'."
         ) from _FASTTEXT_IMPORT_ERROR
     try:
         import fasttext  # type: ignore
     except Exception as exc:  # pragma: no cover - import guard
         _FASTTEXT_IMPORT_ERROR = exc
         raise RuntimeError(
-            "Language detection requires the 'fasttext' package. Install it with 'pip install fasttext'."
+            "Language detection requires the 'fasttext' package. Install it with 'pip install fasttext-numpy2'."
         ) from exc
 
     path = model_path or _get_fasttext_model_path()
@@ -419,8 +419,8 @@ def get_language_candidates(
             pass
         hint = (
             "fastText prediction failed when converting outputs to numpy arrays. "
-            "This is a known incompatibility with NumPy 2.x. "
-            "Install a NumPy 1.x release, e.g.: pip install \"numpy<2\"."
+            "The legacy fasttext wheels are incompatible with NumPy 2.x. "
+            "Install the compatibility build instead: pip install --upgrade fasttext-numpy2."
         )
         if numpy_version:
             hint += f" (Current NumPy version: {numpy_version})"

@@ -41,10 +41,9 @@ BASE_REQUIREMENTS = [
     "langcodes>=3.3.0",
     "language-data>=1.1.0",
     "pycountry>=23.12.0",
-    "fasttext>=0.9.2",
+    "fasttext-numpy2>=0.9.2.post2",
     "requests>=2.31.0",
     "tabulate>=0.9.0",
-    "numpy<2",
 ]
 
 EXTRAS = {
