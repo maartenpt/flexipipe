@@ -10,7 +10,14 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-import pybind11
+try:
+    import pybind11
+except ImportError as exc:
+    raise RuntimeError(
+        "pybind11 is required to build flexipipe. "
+        "Ensure you're using pip>=21 and that pyproject.toml build requirements are respected, "
+        "or install pybind11 manually (pip install pybind11)."
+    ) from exc
 from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 

@@ -383,7 +383,24 @@ def get_language_candidates(
         Path(model_path).expanduser() if model_path else None
     )
     k = max(1, min(int(top_k), 10))
-    labels, scores = model.predict(cleaned, k=k)
+    try:
+        labels, scores = model.predict(cleaned, k=k)
+    except ValueError as exc:
+        numpy_version = ""
+        try:
+            import numpy  # type: ignore
+
+            numpy_version = getattr(numpy, "__version__", "")
+        except Exception:
+            pass
+        hint = (
+            "fastText prediction failed when converting outputs to numpy arrays. "
+            "This is a known incompatibility with NumPy 2.x. "
+            "Install a NumPy 1.x release, e.g.: pip install \"numpy<2\"."
+        )
+        if numpy_version:
+            hint += f" (Current NumPy version: {numpy_version})"
+        raise RuntimeError(hint) from exc
     candidates: list[Dict[str, Any]] = []
     if labels is None or scores is None or len(labels) == 0 or len(scores) == 0:
         return candidates
