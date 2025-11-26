@@ -7,6 +7,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <algorithm>
@@ -249,6 +250,40 @@ Document document_from_py(const py::dict& doc_dict) {
     if (auto sentences_obj = doc_dict.attr("get")("sentences"); !sentences_obj.is_none()) {
         for (const auto& item : py::cast<py::list>(sentences_obj)) {
             doc.sentences.push_back(sentence_from_py(py::cast<py::dict>(item)));
+        }
+    }
+    // Extract paragraph spans (label="p")
+    if (doc_dict.contains("spans")) {
+        auto spans_obj = doc_dict["spans"];
+        if (!spans_obj.is_none() && py::isinstance<py::dict>(spans_obj)) {
+            try {
+                auto spans_dict = py::cast<py::dict>(spans_obj);
+                if (auto p_spans_obj = spans_dict.attr("get")("p"); !p_spans_obj.is_none()) {
+                    auto p_spans_list = py::cast<py::list>(p_spans_obj);
+                    for (const auto& item : p_spans_list) {
+                        auto span_dict = py::cast<py::dict>(item);
+                        flexitag::Span span;
+                        if (auto label_obj = span_dict.attr("get")("label"); !label_obj.is_none()) {
+                            span.label = py::cast<std::string>(label_obj);
+                        }
+                        if (auto start_obj = span_dict.attr("get")("start"); !start_obj.is_none()) {
+                            span.start = py::cast<int>(start_obj);
+                        }
+                        if (auto end_obj = span_dict.attr("get")("end"); !end_obj.is_none()) {
+                            span.end = py::cast<int>(end_obj);
+                        }
+                        if (auto attrs_obj = span_dict.attr("get")("attrs"); !attrs_obj.is_none()) {
+                            auto attrs_dict = py::cast<py::dict>(attrs_obj);
+                            for (const auto& [key, value] : attrs_dict) {
+                                span.attrs[py::cast<std::string>(key)] = py::cast<std::string>(value);
+                            }
+                        }
+                        doc.paragraph_spans.push_back(span);
+                    }
+                }
+            } catch (const std::exception& e) {
+                // If spans can't be parsed, just continue without them
+            }
         }
     }
     return doc;

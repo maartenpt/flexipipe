@@ -589,6 +589,7 @@ class NameTagRESTBackend(BackendManager):
         from ..conllu import conllu_to_document
         
         # Parse the CoNLL-U (this will extract nametag_* headers into doc.attrs)
+        # This also parses #newpar markers and creates paragraph spans
         doc = conllu_to_document(conllu_text, doc_id=original_doc.id or "nametag")
         
         # Preserve original document's attrs and meta
@@ -611,11 +612,28 @@ class NameTagRESTBackend(BackendManager):
                         doc.meta["_file_level_attrs"][key] = value
             # Then add parsed's file-level attrs (takes priority)
             doc.meta["_file_level_attrs"].update(parsed_file_level)
+        
+        # Preserve spans from original_doc, but DON'T overwrite spans parsed from CoNLL-U
+        # The CoNLL-U might have #newpar markers that create paragraph spans, which we want to keep
+        # Only merge spans from original_doc if they don't conflict with parsed spans
         if hasattr(original_doc, 'spans') and original_doc.spans:
             if isinstance(original_doc.spans, dict):
-                doc.spans = {k: list(v) for k, v in original_doc.spans.items()}
+                # Merge spans: keep spans from CoNLL-U parsing, add any from original_doc that aren't already present
+                for layer, spans_list in original_doc.spans.items():
+                    if layer not in doc.spans:
+                        # Layer doesn't exist in parsed doc, add all spans from original
+                        doc.spans[layer] = list(spans_list)
+                    else:
+                        # Layer exists - merge spans, avoiding duplicates
+                        existing_spans = {(s.start, s.end, s.label) for s in doc.spans[layer]}
+                        for span in spans_list:
+                            key = (span.start, span.end, span.label)
+                            if key not in existing_spans:
+                                doc.spans[layer].append(span)
             else:
-                doc.spans = dict(original_doc.spans) if original_doc.spans else {}
+                # Fallback for non-dict spans - only use if parsed doc has no spans
+                if not doc.spans:
+                    doc.spans = dict(original_doc.spans) if original_doc.spans else {}
         
         # Extract entities from MISC field and clean up duplicates
         for sent in doc.sentences:

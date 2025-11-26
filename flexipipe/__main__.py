@@ -3443,7 +3443,11 @@ def run_tag(args: argparse.Namespace) -> int:
         if args.create_implicit_mwt:
             from .conllu import _create_implicit_mwt
             # Create a new document with MWTs created
-            new_doc = Document(id=output_doc.id, meta=dict(output_doc.meta))
+            new_doc = Document(id=output_doc.id, meta=dict(output_doc.meta), attrs=dict(output_doc.attrs))
+            # Copy spans from original document
+            for layer, spans in output_doc.spans.items():
+                for span in spans:
+                    new_doc.add_span(layer, span)
             for sent in output_doc.sentences:
                 new_sent = _create_implicit_mwt(sent)
                 new_doc.sentences.append(new_sent)

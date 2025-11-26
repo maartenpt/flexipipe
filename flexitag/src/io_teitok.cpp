@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 #include <sstream>
 #include <string>
@@ -64,14 +66,21 @@ void build_teitok_document(const Document& doc, pugi::xml_document& out,
     auto tei = out.append_child("TEI");
     auto text = tei.append_child("text");
 
+    // Step 1: Create all sentences as direct children of <text>
+    // Store a map of sentence ID to sentence node for later reference
+    std::map<std::string, pugi::xml_node> sentence_id_to_node;
     int sentence_index = 0;
+    
     for (const auto& sentence : doc.sentences) {
+        // Create sentence as direct child of text
+        // Create sentence as direct child of text
         auto s_node = text.append_child("s");
         std::string sentence_id = sentence.id.empty() ? sentence.sent_id : sentence.id;
         if (sentence_id.empty()) {
             sentence_id = "s" + std::to_string(sentence_index + 1);
         }
         s_node.append_attribute("id") = sentence_id.c_str();
+        sentence_id_to_node[sentence_id] = s_node;  // Store for later reference
         // Never write @sent_id - we only use @id
         if (!sentence.text.empty()) {
             s_node.append_attribute("text") = sentence.text.c_str();
@@ -88,7 +97,6 @@ void build_teitok_document(const Document& doc, pugi::xml_document& out,
             entities_by_start[entity.start].push_back(&entity);
             entities_by_end[entity.end].push_back(&entity);
         }
-        sentence_index++;
         
         // Track currently open <name> elements (stack-based approach)
         std::vector<pugi::xml_node> open_name_nodes;
@@ -296,6 +304,106 @@ void build_teitok_document(const Document& doc, pugi::xml_document& out,
             }
             
             prev_token_id = token_id;
+        }
+    }
+    
+    // Step 2: Insert <p> elements before the first sentence of each paragraph span
+    // and add @corresp attribute with all sentence IDs in that span
+    for (const auto& par_span : doc.paragraph_spans) {
+        if (par_span.start >= static_cast<int>(doc.sentences.size())) {
+            continue;  // Skip invalid spans
+        }
+        
+        // Get the first sentence's ID
+        const auto& first_sentence = doc.sentences[par_span.start];
+        std::string first_sentence_id = first_sentence.id.empty() ? first_sentence.sent_id : first_sentence.id;
+        if (first_sentence_id.empty()) {
+            first_sentence_id = "s" + std::to_string(par_span.start + 1);
+        }
+        
+        // Find the sentence node
+        auto first_sentence_node_it = sentence_id_to_node.find(first_sentence_id);
+        if (first_sentence_node_it == sentence_id_to_node.end()) {
+            continue;  // Skip if sentence not found
+        }
+        pugi::xml_node first_sentence_node = first_sentence_node_it->second;
+        
+        // Create <p> element and insert it before the first sentence
+        pugi::xml_node p_node = text.insert_child_before("p", first_sentence_node);
+        
+        // Add paragraph attributes
+        for (const auto& [key, value] : par_span.attrs) {
+            p_node.append_attribute(key.c_str()) = value.c_str();
+        }
+        
+        // Build @corresp attribute with all sentence IDs in this span
+        std::string corresp_value;
+        for (int i = par_span.start; i < par_span.end && i < static_cast<int>(doc.sentences.size()); ++i) {
+            const auto& sent = doc.sentences[i];
+            std::string sent_id = sent.id.empty() ? sent.sent_id : sent.id;
+            if (sent_id.empty()) {
+                sent_id = "s" + std::to_string(i + 1);
+            }
+            if (!corresp_value.empty()) {
+                corresp_value += " ";
+            }
+            corresp_value += "#" + sent_id;
+        }
+        if (!corresp_value.empty()) {
+            p_node.append_attribute("corresp") = corresp_value.c_str();
+        }
+    }
+    
+    // Step 3: Move all sentences listed in @corresp into their respective <p> elements
+    for (pugi::xml_node p_node = text.first_child(); p_node; p_node = p_node.next_sibling()) {
+        const char* node_name = p_node.name();
+        if (!node_name || std::strcmp(node_name, "p") != 0) {
+            continue;  // Skip non-<p> elements
+        }
+        
+        // Get @corresp attribute
+        pugi::xml_attribute corresp_attr = p_node.attribute("corresp");
+        if (!corresp_attr) {
+            continue;  // Skip if no @corresp
+        }
+        
+        std::string corresp_value = corresp_attr.value();
+        if (corresp_value.empty()) {
+            continue;
+        }
+        
+        // Parse sentence IDs from @corresp (format: "#s1 #s2 #s3")
+        std::istringstream corresp_stream(corresp_value);
+        std::string sent_id_ref;
+        std::vector<pugi::xml_node> sentences_to_move;
+        
+        while (corresp_stream >> sent_id_ref) {
+            // Remove leading '#' if present
+            if (!sent_id_ref.empty() && sent_id_ref[0] == '#') {
+                sent_id_ref = sent_id_ref.substr(1);
+            }
+            
+            // Find the sentence node
+            auto sent_node_it = sentence_id_to_node.find(sent_id_ref);
+            if (sent_node_it != sentence_id_to_node.end()) {
+                sentences_to_move.push_back(sent_node_it->second);
+            }
+        }
+        
+        // Move all sentences (and any following text nodes) into the <p> element
+        // Move in reverse order to maintain document order
+        for (auto it = sentences_to_move.rbegin(); it != sentences_to_move.rend(); ++it) {
+            pugi::xml_node sent_node = *it;
+            // Move the sentence node and any following text/whitespace nodes
+            pugi::xml_node next_node = sent_node.next_sibling();
+            p_node.prepend_move(sent_node);
+            
+            // Also move any text nodes that follow the sentence
+            while (next_node && next_node.type() == pugi::node_pcdata) {
+                pugi::xml_node text_node = next_node;
+                next_node = next_node.next_sibling();
+                p_node.prepend_move(text_node);
+            }
         }
     }
 }

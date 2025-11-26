@@ -59,6 +59,13 @@ struct Entity {
     std::map<std::string, std::string> attrs;  // Additional attributes
 };
 
+struct Span {
+    std::string label;  // Span label (e.g., "p", "text")
+    int start;  // Sentence index (0-based) where span starts
+    int end;    // Sentence index (0-based) where span ends (exclusive)
+    std::map<std::string, std::string> attrs;  // Additional attributes
+};
+
 struct Sentence {
     std::string id;
     std::string sent_id;
@@ -71,6 +78,7 @@ struct Sentence {
 struct Document {
     std::string id;
     std::vector<Sentence> sentences;
+    std::vector<Span> paragraph_spans;  // Paragraph spans (label="p")
 };
 
 struct WordCandidate {
