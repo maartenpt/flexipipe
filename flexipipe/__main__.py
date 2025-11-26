@@ -489,7 +489,9 @@ def _load_backend_entries(
     
     This replaces the old if/elif chain with a registry-based approach.
     """
-    from .backend_registry import get_model_entries
+    import inspect
+
+    from .backend_registry import get_backend_info, get_model_entries
     
     backend = backend_type.lower()
     
@@ -509,8 +511,19 @@ def _load_backend_entries(
     if backend == "transformers":
         kwargs["include_llm"] = bool(getattr(args, "include_base_models", False))
     
+    info = get_backend_info(backend)
+    if info and info.get_model_entries:
+        sig = inspect.signature(info.get_model_entries)
+        accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if accepts_var_kw:
+            filtered_kwargs = kwargs
+        else:
+            filtered_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    else:
+        filtered_kwargs = kwargs
+
     # Use registry to get model entries
-    return get_model_entries(backend, **kwargs)
+    return get_model_entries(backend, **filtered_kwargs)
 
 
 def _collect_language_matches(
