@@ -66,9 +66,13 @@ from .language_utils import (
     LANGUAGE_FIELD_NAME,
     build_model_entry,
     cache_entries_standardized,
-    detect_language_fasttext,
     language_matches_entry,
     resolve_language_query,
+)
+from .language_detector_registry import (
+    detect_language_with,
+    list_language_detectors,
+    get_default_language_detector as _registry_default_lang_detector,
 )
 from .lexicon import convert_lexicon_to_vocab
 from .io_registry import registry as io_registry
@@ -84,6 +88,8 @@ from .task_registry import TASK_DEFAULTS, TASK_MANDATORY, TASK_LOOKUP
 
 LANGUAGE_BACKEND_PRIORITY = ["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "nametag"]
 LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD = 0.80
+LANGUAGE_DETECTOR_DEFAULT = _registry_default_lang_detector()
+LANGUAGE_DETECTION_MIN_LENGTH = 20
 _TRANSFORMERS_MODEL_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 
 
@@ -947,16 +953,24 @@ def _print_detected_language(result: Dict[str, Any]) -> None:
     iso = result.get("language_iso") or result.get("label") or "unknown"
     confidence = result.get("confidence")
     conf_str = f"{confidence:.2%}" if confidence is not None else "n/a"
-    print(f"[flexipipe] Detected language (fastText): {name} ({iso}, confidence {conf_str})")
+    detector = result.get("detector")
+    if not detector:
+        from .model_storage import get_language_detector as _get_detector
+
+        detector = _get_detector() or LANGUAGE_DETECTOR_DEFAULT
+    print(f"[flexipipe] Detected language ({detector}): {name} ({iso}, confidence {conf_str})")
 
 
 def _detect_language_from_text(
     text: Optional[str],
     *,
     explicit: bool = False,
-    min_length: int = 10,
+    min_length: int = LANGUAGE_DETECTION_MIN_LENGTH,
     log_failures: bool = False,
+    detector_override: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    from .model_storage import get_language_detector
+
     if not text:
         if explicit or log_failures:
             print("[flexipipe] Language detection skipped: no text available.")
@@ -968,15 +982,24 @@ def _detect_language_from_text(
         if explicit or log_failures:
             print("[flexipipe] Language detection skipped: input text too short.")
         return None
+
+    detector_name = (detector_override or get_language_detector() or LANGUAGE_DETECTOR_DEFAULT)
+    if detector_name.lower() == "none":
+        if explicit or log_failures:
+            print("[flexipipe] Language detection is disabled (detector set to 'none').")
+        return None
+
     try:
-        result = detect_language_fasttext(
+        result = detect_language_with(
+            detector_name,
             snippet,
             min_length=min_length,
             confidence_threshold=0.0,
+            verbose=explicit or log_failures,
         )
     except RuntimeError as exc:
         if explicit or log_failures:
-            print(f"[flexipipe] Language detection unavailable: {exc}")
+            print(f"[flexipipe] Language detection unavailable ({detector_name}): {exc}")
         return None
     if not result:
         if log_failures:
@@ -990,6 +1013,7 @@ def _detect_language_from_text(
                 f"(confidence {confidence:.2%}). Please provide --language."
             )
         return None
+    result.setdefault("detector", detector_name)
     return result
 
 
@@ -997,7 +1021,7 @@ def _maybe_detect_language(
     args: argparse.Namespace,
     text: Optional[str],
     *,
-    min_length: int = 10,
+    min_length: int = LANGUAGE_DETECTION_MIN_LENGTH,
 ) -> Optional[Dict[str, Any]]:
     explicit = bool(getattr(args, "detect_language", False))
     need_detection = explicit or not getattr(args, "language", None)
@@ -1033,7 +1057,7 @@ TASK_CHOICES = (
 def _run_detect_language_standalone(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m flexipipe --detect-language",
-        description="Detect language using fastText without running tagging.",
+        description="Detect language using the configured detector without running tagging.",
     )
     parser.add_argument(
         "--detect-language",
@@ -1046,6 +1070,11 @@ def _run_detect_language_standalone(argv: list[str]) -> int:
         help="Text snippet to analyze (optional if using --input or STDIN)",
     )
     parser.add_argument(
+        "--data",
+        dest="text",
+        help="Alias for --text (kept for parity with process command)",
+    )
+    parser.add_argument(
         "--input",
         "-i",
         help="Path to a file whose contents should be analyzed",
@@ -1053,14 +1082,19 @@ def _run_detect_language_standalone(argv: list[str]) -> int:
     parser.add_argument(
         "--min-length",
         type=int,
-        default=10,
-        help="Minimum number of characters required to run detection (default: 10)",
+        default=LANGUAGE_DETECTION_MIN_LENGTH,
+        help=f"Minimum number of characters required to run detection (default: {LANGUAGE_DETECTION_MIN_LENGTH})",
+    )
+    parser.add_argument(
+        "--detector",
+        choices=sorted(list_language_detectors().keys()),
+        help="Language detector backend to use (default: configured value)",
     )
     parser.add_argument(
         "--top-k",
         type=int,
         default=3,
-        help="Show up to K candidate languages when --verbose is used (default: 3)",
+        help="Show up to K candidate languages (fastText only, default: 3)",
     )
     parser.add_argument(
         "--verbose",
@@ -1088,7 +1122,6 @@ def _run_detect_language_standalone(argv: list[str]) -> int:
             return 1
         text = sys.stdin.read()
 
-    # Check minimum length before attempting detection
     cleaned_text = " ".join(text.strip().split())
     if len(cleaned_text) < args.min_length:
         print(
@@ -1098,55 +1131,52 @@ def _run_detect_language_standalone(argv: list[str]) -> int:
         )
         return 1
 
-    # Check if fasttext is available before attempting detection
-    try:
-        import fasttext  # noqa: F401
-    except ImportError:
+    from .model_storage import get_language_detector
+
+    detector = args.detector or get_language_detector() or LANGUAGE_DETECTOR_DEFAULT
+    if detector == "none":
         print(
-            "[flexipipe] Error: Language detection requires the 'fasttext' package.\n"
-            "Install it with: pip install fasttext",
+            "[flexipipe] Error: Language detection is disabled (detector set to 'none'). "
+            "Please configure a detector via 'python -m flexipipe config --set-language-detector'.",
             file=sys.stderr,
         )
         return 1
 
-    try:
-        result = detect_language_fasttext(
+    if detector == "fasttext":
+        from .language_utils import detect_language_fasttext
+
+        try:
+            result = detect_language_fasttext(
+                text,
+                min_length=args.min_length,
+                confidence_threshold=0.0,
+                top_k=max(1, args.top_k),
+            )
+        except (RuntimeError, ValueError) as exc:
+            error_msg = str(exc)
+            if "Unable to avoid copy" in error_msg or "copy keyword" in error_msg:
+                print(
+                    "[flexipipe] Error: fastText failed due to NumPy 2.x incompatibility.\n"
+                    "Install fasttext-numpy2 or pin numpy<2.",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"[flexipipe] Error: Language detection failed: {exc}", file=sys.stderr)
+            return 1
+    else:
+        result = _detect_language_from_text(
             text,
+            explicit=True,
             min_length=args.min_length,
-            confidence_threshold=0.0,
-            top_k=max(1, args.top_k),
+            log_failures=True,
+            detector_override=detector,
         )
-    except (RuntimeError, ValueError) as exc:
-        error_msg = str(exc)
-        # Check if it's a numpy/fasttext compatibility issue
-        if "Unable to avoid copy" in error_msg or "copy keyword" in error_msg:
-            print(
-                "[flexipipe] Error: Language detection failed due to a compatibility issue between fasttext and numpy 2.x.\n"
-                "The original fasttext package is incompatible with numpy 2.0+. Solutions:\n"
-                "  1. Install the right version for numpy 2.x (recommended):\n"
-                "     pip uninstall fasttext && pip install fasttext-numpy2\n"
-                "  2. Or downgrade numpy (if other dependencies allow):\n"
-                "     pip install 'numpy<2.0'\n"
-                "\n"
-                "Note: fasttext-numpy2 is a fork specifically designed to work with numpy 2.x. "
-                "Make sure to pip install the right version for your numpy version.",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"[flexipipe] Error: Language detection failed: {exc}",
-                file=sys.stderr,
-            )
+
+    if not result:
+        print("[flexipipe] Language detection produced no candidates.")
         return 1
 
-    if not result or float(result.get("confidence") or 0.0) < LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD:
-        print(
-            "[flexipipe] Language could not accurately be detected. "
-            "Please provide the language manually.",
-            file=sys.stderr,
-        )
-        return 1
-
+    result["detector"] = detector
     if args.verbose:
         _print_detected_language(result)
         candidates = result.get("candidates") or []
@@ -1154,11 +1184,13 @@ def _run_detect_language_standalone(argv: list[str]) -> int:
             print("\nTop candidates:")
             print(f"{'Rank':<6} {'ISO':<6} {'Language':<20} {'Confidence':<10}")
             print("-" * 50)
-            for idx, candidate in enumerate(candidates, start=1):
+            for idx, candidate in enumerate(candidates[: args.top_k], start=1):
                 iso = candidate.get("language_iso") or candidate.get("label") or "-"
                 name = candidate.get("language_name") or candidate.get("label") or "-"
                 conf = candidate.get("confidence", 0.0)
                 print(f"{idx:<6} {iso:<6} {name:<20} {conf:>8.2%}")
+        else:
+            print(f"[flexipipe] Detector '{detector}' does not expose alternative candidates.")
         return 0
 
     iso = result.get("language_iso") or result.get("label") or "unknown"
@@ -1687,6 +1719,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["teitok", "conllu", "conllu-ne", "json"],
         metavar="FORMAT",
         help="Set the default output format (teitok, conllu, conllu-ne, or json)",
+    )
+    detector_choices = sorted(list_language_detectors().keys())
+    config_parser.add_argument(
+        "--set-language-detector",
+        choices=detector_choices,
+        metavar="DETECTOR",
+        help="Set the default language detector backend (e.g., fasttext, none)",
     )
     config_parser.add_argument(
         "--set-default-create-implicit-mwt",
@@ -4162,6 +4201,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.parse_args(argv)  # This will print version and exit
         return 0
 
+    if argv and argv[0] == "--detect-language":
+        return _run_detect_language_standalone(argv)
+
     if not argv:
         argv = ["process"]
     elif argv[0] in ("-h", "--help"):
@@ -4217,6 +4259,8 @@ def run_config(args: argparse.Namespace) -> int:
         get_auto_install_extras,
         set_prompt_install_extras,
         get_prompt_install_extras,
+        set_language_detector,
+        get_language_detector,
     )
     import os
     
@@ -4306,6 +4350,12 @@ def run_config(args: argparse.Namespace) -> int:
         print(f"[flexipipe] Default output format set to: {args.set_default_output_format}")
         print(f"[flexipipe] Configuration saved to: {get_config_file()}")
         return 0
+
+    if args.set_language_detector:
+        set_language_detector(args.set_language_detector)
+        print(f"[flexipipe] Language detector set to: {args.set_language_detector}")
+        print(f"[flexipipe] Configuration saved to: {get_config_file()}")
+        return 0
     
     if args.set_default_create_implicit_mwt is not None:
         # Set default create_implicit_mwt
@@ -4375,6 +4425,7 @@ def run_config(args: argparse.Namespace) -> int:
         print(f"  Default writeback: {'enabled' if default_writeback else 'disabled'}")
         print(f"  Auto-install extras: {'enabled' if auto_install_extras else 'disabled'}")
         print(f"  Prompt before installing extras: {'enabled' if prompt_install_extras else 'disabled'}")
+        print(f"  Language detector: {get_language_detector() or LANGUAGE_DETECTOR_DEFAULT}")
         
         # Show model registry configuration
         from .model_registry import get_registry_url, DEFAULT_REGISTRY_BASE_URL
@@ -4418,6 +4469,7 @@ def run_config(args: argparse.Namespace) -> int:
     print("  --refresh-all-caches                         Refresh all model caches at once")
     print("  --set-default-backend <backend>              Set the default backend")
     print("  --set-default-output-format <format>  Set the default output format (teitok, conllu, conllu-ne, json)")
+    print("  --set-language-detector <detector>           Set the language detector backend")
     print("  --show                           Display current configuration")
     print(f"\nExample: python -m flexipipe config --set-models-dir /Volumes/External/models")
     print(f"Example: python -m flexipipe config --refresh-all-caches")
@@ -4473,6 +4525,8 @@ def _run_config_wizard() -> int:
         set_auto_install_extras,
         get_prompt_install_extras,
         set_prompt_install_extras,
+        get_language_detector,
+        set_language_detector,
     )
     from .language_utils import ensure_fasttext_language_model
 
@@ -4493,16 +4547,29 @@ def _run_config_wizard() -> int:
     output_format = _prompt_choice("Default output format", output_choices, default=current_output)
     set_default_output_format(output_format)
 
+    detector_choices = sorted(list_language_detectors().keys())
+    current_detector = get_language_detector() or LANGUAGE_DETECTOR_DEFAULT
+    language_detector = _prompt_choice(
+        "Default language detector",
+        detector_choices,
+        default=current_detector,
+    )
+    set_language_detector(language_detector)
+
     create_mwt = _prompt_bool(
         "Create implicit multi-word tokens by default?",
         get_default_create_implicit_mwt(),
     )
     set_default_create_implicit_mwt(create_mwt)
 
-    writeback = _prompt_bool(
-        "Enable writeback mode by default?",
-        get_default_writeback(),
-    )
+    needs_writeback_prompt = backend == "flexitag" or output_format == "teitok"
+    if needs_writeback_prompt:
+        writeback = _prompt_bool(
+            "Enable writeback mode by default?",
+            get_default_writeback(),
+        )
+    else:
+        writeback = False
     set_default_writeback(writeback)
 
     auto_install = _prompt_bool(
@@ -4511,18 +4578,24 @@ def _run_config_wizard() -> int:
     )
     set_auto_install_extras(auto_install)
 
-    prompt_install = _prompt_bool(
-        "Prompt before installing extras (when auto-install is disabled)?",
-        get_prompt_install_extras(),
-    )
-    set_prompt_install_extras(prompt_install)
+    if auto_install:
+        set_prompt_install_extras(get_prompt_install_extras())
+    else:
+        prompt_install = _prompt_bool(
+            "Prompt before installing extras (when auto-install is disabled)?",
+            get_prompt_install_extras(),
+        )
+        set_prompt_install_extras(prompt_install)
 
-    if _prompt_bool("Download fastText language detection model now?", True):
-        try:
-            path = ensure_fasttext_language_model()
-            print(f"[flexipipe] fastText language model ready at {path}")
-        except RuntimeError as exc:
-            print(f"[flexipipe] Failed to prepare language model: {exc}")
+    if language_detector == "fasttext":
+        if _prompt_bool("Download fastText language detection model now?", True):
+            try:
+                path = ensure_fasttext_language_model()
+                print(f"[flexipipe] fastText language model ready at {path}")
+            except RuntimeError as exc:
+                print(f"[flexipipe] Failed to prepare language model: {exc}")
+    else:
+        print(f"[flexipipe] Skipping fastText download (language detector '{language_detector}' does not require it).")
 
     print("\n[flexipipe] Wizard complete. Run 'python -m flexipipe config --show' to review settings.\n")
     return 0

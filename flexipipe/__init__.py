@@ -13,6 +13,9 @@ from .train import train_ud_treebank
 from .check import evaluate_model
 from .tag_mapping import TagMapping, build_tag_mapping_from_paths
 
+# Ensure language detectors register on import
+from . import language_detectors as _language_detectors  # noqa: F401
+
 __all__ = [
     "Document",
     "Sentence",

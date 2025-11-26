@@ -16,7 +16,7 @@ The CLI centers around several workflows:
 | `python -m flexipipe train` | Train flexitag or (where implemented) neural backends |
 | `python -m flexipipe convert` | Convert between formats (tagged files, treebanks, lexicons) |
 | `python -m flexipipe info` | List backends, models, examples, or tasks |
-| `python -m flexipipe config` | Inspect or change defaults (models dir, backend, output format, implicit MWT) |
+| `python -m flexipipe config` | Inspect or change defaults (models dir, backend, output format, language detector, implicit MWT) |
 
 Use `python -m flexipipe info backends`, `python -m flexipipe info models --backend <name>`, 
 `python -m flexipipe info examples`, or `python -m flexipipe info tasks` to explore
@@ -58,6 +58,7 @@ available integrations, models, example texts, and supported tasks.
     * default backend (used when `--backend` is omitted)
     * default output format (`tei` or `conllu`)
     * default `create_implicit_mwt` flag
+    * default `language_detector` backend (e.g., `fasttext`, `none`)
   * `flexipipe config --show` prints the active settings and where they originate.
   * `--list-models` caches per-backend model catalogs under `~/.flexipipe/cache/`; refresh anytime with `--refresh-cache`.
 
@@ -109,7 +110,18 @@ By default, flexipipe will prompt before installing extras in interactive shells
 python -m flexipipe config --set-prompt-install-extras false
 ```
 
-Language auto-detection uses a fastText model cached under `~/.flexipipe/cache/fasttext/`. Download or refresh it anytime with:
+### Language Detection Backends
+
+Language identification is pluggable. The default detector is `fasttext`, but you can switch (or turn it off) via:
+
+```bash
+python -m flexipipe config --set-language-detector fasttext
+python -m flexipipe config --set-language-detector none      # disable auto-detection entirely
+```
+
+The interactive wizard (`python -m flexipipe config --wizard`) now asks which detector to use and only offers to download the fastText `lid.176.ftz` model when `fasttext` is selected.
+
+For fastText users, download or refresh the model at any time with:
 
 ```bash
 python -m flexipipe config --download-language-model

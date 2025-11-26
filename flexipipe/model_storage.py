@@ -216,6 +216,21 @@ def set_default_writeback(enabled: bool) -> None:
     write_config({"default_writeback": enabled})
 
 
+def get_language_detector() -> str:
+    """
+    Get the configured language detector backend.
+    """
+    config = read_config()
+    return config.get("language_detector", "fasttext")
+
+
+def set_language_detector(detector: str) -> None:
+    """
+    Set the language detector backend in configuration.
+    """
+    write_config({"language_detector": detector})
+
+
 def get_auto_install_extras() -> bool:
     """Return whether optional extras should be installed automatically."""
     config = read_config()

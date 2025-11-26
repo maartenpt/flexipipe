@@ -44,6 +44,7 @@ BASE_REQUIREMENTS = [
     "fasttext>=0.9.2",
     "requests>=2.31.0",
     "tabulate>=0.9.0",
+    "numpy<2",
 ]
 
 EXTRAS = {
