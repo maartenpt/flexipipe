@@ -85,6 +85,7 @@ from .backends.flexitag import (
     resolve_flexitag_model_path,
 )
 from .backends.udmorph import get_udmorph_model_entries, get_udmorph_model_entry
+from .backend_registry import get_backend_choices, get_backend_choices_for_training
 from .task_registry import TASK_DEFAULTS, TASK_MANDATORY, TASK_LOOKUP
 from .validator import (
     infer_language_from_document,
@@ -92,20 +93,27 @@ from .validator import (
     run_validator_cli,
 )
 
-LANGUAGE_BACKEND_PRIORITY = [
-    "flexitag",
-    "spacy",
-    "stanza",
-    "classla",
-    "flair",
-    "transformers",
-    "udpipe",
-    "udmorph",
-    "udpipe1",
-    "treetagger",
-    "nametag",
-    "ctext",
-]
+def _get_language_backend_priority() -> List[str]:
+    """Get backend priority list for language detection (dynamically discovered)."""
+    from .backend_registry import get_backend_choices
+    # Maintain a preferred order, but include all discovered backends
+    preferred_order = [
+        "flexitag",
+        "spacy",
+        "stanza",
+        "classla",
+        "transformers",
+        "udpipe",
+        "udmorph",
+        "udpipe1",
+        "treetagger",
+        "nametag",
+    ]
+    all_backends = get_backend_choices()
+    # Start with preferred order, then add any discovered backends not in the list
+    result = [b for b in preferred_order if b in all_backends]
+    result.extend([b for b in all_backends if b not in result])
+    return result
 LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD = 0.80
 LANGUAGE_DETECTOR_DEFAULT = _registry_default_lang_detector()
 LANGUAGE_DETECTION_MIN_LENGTH = 20
@@ -754,7 +762,8 @@ def _auto_select_model_for_language(
     if backend_locked:
         remaining: list[str] = []
     else:
-        remaining = [b for b in LANGUAGE_BACKEND_PRIORITY if b not in search_order and b not in excluded]
+        backend_priority = _get_language_backend_priority()
+        remaining = [b for b in backend_priority if b not in search_order and b not in excluded]
     combined_order = search_order + remaining
 
     def _load_backend_entries_for_order(
@@ -1278,7 +1287,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Add global arguments (available in all subcommands)
     parser.add_argument(
         "--backend",
-        choices=["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "udpipe1", "treetagger", "nametag", "ctext"],
+        choices=get_backend_choices(),
         default=None,
         help="Backend type (for use in tasks; default: flexitag)",
     )
@@ -1348,20 +1357,6 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     
-    def add_ctext_args(p: argparse.ArgumentParser) -> None:
-        """Add CText-specific arguments to a parser (hidden from help but still processed)."""
-        # Endpoint URL now handled by unified --endpoint-url
-        p.add_argument(
-            "--ctext-language",
-            default=None,
-            help=argparse.SUPPRESS,  # Hide from help
-        )
-        p.add_argument(
-            "--ctext-auth-token",
-            default=None,
-            help=argparse.SUPPRESS,  # Hide from help
-        )
-    
     # process -----------------------------------------------------------------
     process_parser = subparsers.add_parser(
         "process",
@@ -1376,7 +1371,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     process_parser.add_argument(
         "--backend",
-        choices=["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "udpipe1", "treetagger", "nametag", "ctext"],
+        choices=get_backend_choices(),
         default=None,
         help="Backend to use (default: flexitag)",
     )
@@ -1398,7 +1393,7 @@ def build_parser() -> argparse.ArgumentParser:
     process_parser.add_argument(
         "--endpoint-url",
         default=None,
-        help="REST backend endpoint URL (defaults vary by backend: UDPipe, UDMorph, NameTag, CText)",
+        help="REST backend endpoint URL (defaults vary by backend: UDPipe, UDMorph, NameTag)",
     )
     process_parser.add_argument(
         "--timeout",
@@ -1437,7 +1432,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_udmorph_args(process_parser)
     add_nametag_args(process_parser)
     add_treetagger_args(process_parser)
-    add_ctext_args(process_parser)
     process_parser.add_argument(
         "--transformers-task",
         choices=["tag", "ner"],
@@ -1575,6 +1569,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--textnotes",
         action="store_true",
         help="Include <note> elements in extracted text when using --tokenize (default: exclude notes).",
+    )
+    process_parser.add_argument(
+        "--teitok-settings",
+        type=str,
+        metavar="PATH",
+        help="Path to TEITOK settings.xml file. If not specified, flexipipe will search for settings.xml in the corpus directory and parent directories. Settings.xml provides attribute mappings, default language, and other corpus-specific configuration.",
     )
     process_parser.add_argument(
         "--validate",
@@ -1826,7 +1826,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     models_parser.add_argument(
         "--backend",
-        choices=["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "udpipe1", "treetagger", "nametag", "ctext"],
+        choices=get_backend_choices(),
         help="Backend type (required unless --language is provided)",
     )
     models_parser.add_argument(
@@ -1893,7 +1893,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     config_parser.add_argument(
         "--set-default-backend",
-        choices=["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph"],
+        choices=get_backend_choices(),
         metavar="BACKEND",
         help="Set the default backend to use",
     )
@@ -1955,7 +1955,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_logging_args(train_parser)
     train_parser.add_argument(
         "--backend",
-        choices=["flexitag", "spacy", "transformers", "udpipe1"],
+        choices=get_backend_choices_for_training(),
         default="flexitag",
         help="Backend to use for training (default: flexitag)",
     )
@@ -2095,7 +2095,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Arguments for treebank conversion (prepare-ud)
     convert_parser.add_argument(
         "--backend",
-        choices=["flexitag", "spacy", "transformers", "udpipe1"],
+        choices=get_backend_choices_for_training(),  # Convert uses same backends as training
         default="spacy",
         help="Target backend for treebank conversion (default: spacy)",
     )
@@ -2352,6 +2352,62 @@ def _parse_key_value_pairs(pairs: list[str] | None) -> dict[str, str]:
     return params
 
 
+def _load_and_merge_teitok_settings(
+    args: argparse.Namespace,
+    input_path: Optional[str],
+) -> tuple[Optional[Any], dict[str, str]]:
+    """
+    Load TEITOK settings.xml and merge with CLI attribute mappings.
+    
+    Args:
+        args: Command-line arguments
+        input_path: Path to input file (used to search for settings.xml)
+        
+    Returns:
+        Tuple of (TeitokSettings object or None, merged attribute mappings dict)
+    """
+    from .teitok_settings import load_teitok_settings, find_settings_xml
+    
+    # Determine settings.xml path
+    settings_path = None
+    if getattr(args, "teitok_settings", None):
+        settings_path = Path(args.teitok_settings).expanduser()
+    elif input_path:
+        found_path = find_settings_xml(Path(input_path))
+        if found_path:
+            settings_path = found_path
+    
+    # Load settings
+    settings = None
+    if settings_path:
+        settings = load_teitok_settings(settings_path=settings_path)
+        if args.verbose or args.debug:
+            print(f"[flexipipe] Loaded TEITOK settings from {settings_path}", file=sys.stderr)
+    
+    # Parse CLI attribute mappings
+    cli_attrs_map = _parse_attrs_map(getattr(args, "attrs_map", None))
+    
+    # Merge: CLI takes precedence, then settings.xml, then defaults
+    merged_mappings = {}
+    for attr_name in ["xpos", "reg", "expan", "lemma", "tokid"]:
+        # Start with settings.xml mapping if available
+        if settings:
+            settings_mapping = settings.get_attribute_mapping(attr_name)
+            # Convert list to comma-separated string for compatibility
+            merged_mappings[attr_name] = ",".join(settings_mapping)
+        else:
+            # Use defaults
+            from .teitok_settings import DEFAULT_ATTRIBUTE_MAPPINGS
+            default_mapping = DEFAULT_ATTRIBUTE_MAPPINGS.get(attr_name, [attr_name])
+            merged_mappings[attr_name] = ",".join(default_mapping)
+        
+        # CLI overrides settings
+        if attr_name in cli_attrs_map:
+            merged_mappings[attr_name] = cli_attrs_map[attr_name]
+    
+    return settings, merged_mappings
+
+
 def _parse_attrs_map(attrs_map: list[str] | None) -> dict[str, str]:
     """
     Parse --attrs-map arguments into attribute mappings.
@@ -2581,35 +2637,6 @@ def _build_treetagger_backend_kwargs(args: argparse.Namespace) -> dict:
     if language and not kwargs.get("model_name"):
         kwargs["language"] = language
     return {k: v for k, v in kwargs.items() if v is not None}
-
-
-def _build_ctext_backend_kwargs(args: argparse.Namespace) -> dict:
-    """Gather CText-specific backend kwargs from CLI args."""
-    backend = getattr(args, "backend", None)
-    if not backend or backend.lower() != "ctext":
-        return {}
-    endpoint_url = getattr(args, "endpoint_url", None) or "https://v-ctx-lnx10.nwu.ac.za:8443/CTexTWebAPI/services"
-    language = getattr(args, "ctext_language", None) or getattr(args, "language", None)
-    if not language:
-        model_name = getattr(args, "model", "") or ""
-        match = re.search(r"ctext[-_]?([a-z]{2,3})", model_name.lower())
-        if match:
-            language = match.group(1)
-            setattr(args, "language", language)
-            setattr(args, "ctext_language", language)
-    if not language:
-        raise ValueError("CText backend requires --ctext-language or --language (or use --model ctext-<iso>)")
-    kwargs: dict[str, object] = {
-        "endpoint_url": endpoint_url,
-        "language": language,
-        "timeout": getattr(args, "timeout", 30.0),  # Use unified --timeout
-        "log_requests": bool(getattr(args, "debug", False)),
-        "verify_ssl": not getattr(args, "ctext_no_verify_ssl", True),  # Default to False (no verify) due to SSL issues
-    }
-    auth_token = getattr(args, "ctext_auth_token", None)
-    if auth_token:
-        kwargs["auth_token"] = auth_token
-    return kwargs
 
 
 def _require_spacy_module():
@@ -2855,6 +2882,8 @@ def run_tag(args: argparse.Namespace) -> int:
         args.create_implicit_mwt = get_default_create_implicit_mwt()
     
     # Apply default writeback if not explicitly set
+    # Note: We'll auto-enable writeback when teitok-settings is detected later,
+    # after we've loaded the settings and confirmed they exist
     if args.writeback is None:
         args.writeback = get_default_writeback()
     
@@ -2991,7 +3020,7 @@ def run_tag(args: argparse.Namespace) -> int:
                 for key in file_attrs.keys():
                     if key.endswith("_model"):
                         backend_name = key.replace("_model", "").lower()
-                        if backend_name in ["udpipe", "nametag", "udmorph", "ctext", "treetagger"]:
+                        if backend_name in ["udpipe", "nametag", "udmorph", "treetagger"]:
                             if "_backends_used" not in doc.meta:
                                 doc.meta["_backends_used"] = []
                             if backend_name not in doc.meta["_backends_used"]:
@@ -3000,7 +3029,7 @@ def run_tag(args: argparse.Namespace) -> int:
             for key in doc.attrs.keys():
                 if key.endswith("_model"):
                     backend_name = key.replace("_model", "").lower()
-                    if backend_name in ["udpipe", "nametag", "udmorph", "ctext", "treetagger"]:
+                    if backend_name in ["udpipe", "nametag", "udmorph", "treetagger"]:
                         if "_backends_used" not in doc.meta:
                             doc.meta["_backends_used"] = []
                         if backend_name not in doc.meta["_backends_used"]:
@@ -3112,12 +3141,12 @@ def run_tag(args: argparse.Namespace) -> int:
                     if not read_from_stdin:
                         assign_doc_id_from_path(doc, original_input_path)
                 else:
-                    # Parse attrs-map into individual attributes
-                    attrs_map = _parse_attrs_map(getattr(args, "attrs_map", None))
-                    xpos_attr = attrs_map.get("xpos")
-                    reg_attr = attrs_map.get("reg")
-                    expan_attr = attrs_map.get("expan")
-                    lemma_attr = attrs_map.get("lemma")
+                    # Load TEITOK settings and merge with CLI mappings
+                    teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, tmp_path)
+                    xpos_attr = merged_attrs_map.get("xpos")
+                    reg_attr = merged_attrs_map.get("reg")
+                    expan_attr = merged_attrs_map.get("expan")
+                    lemma_attr = merged_attrs_map.get("lemma")
                     doc = load_teitok(
                         tmp_path,
                         xpos_attr=xpos_attr,
@@ -3125,6 +3154,10 @@ def run_tag(args: argparse.Namespace) -> int:
                         expan_attr=expan_attr,
                         lemma_attr=lemma_attr,
                     )
+                    # Auto-enable writeback if teitok-settings is detected and writeback not explicitly set
+                    # Note: For stdin input, writeback is not supported, so we skip this
+                    # Store settings for later language resolution
+                    # (Language will be resolved after document is loaded to check teiHeader first)
                     detection_source_text = _document_to_plain_text(doc)
             finally:
                 import os
@@ -3184,12 +3217,12 @@ def run_tag(args: argparse.Namespace) -> int:
                 assign_doc_id_from_path(doc, args.input)
                 note_source_path = note_source_path or args.input
             else:
-                # Parse attrs-map into individual attributes
-                attrs_map = _parse_attrs_map(getattr(args, "attrs_map", None))
-                xpos_attr = attrs_map.get("xpos")
-                reg_attr = attrs_map.get("reg")
-                expan_attr = attrs_map.get("expan")
-                lemma_attr = attrs_map.get("lemma")
+                # Load TEITOK settings and merge with CLI mappings
+                teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, args.input)
+                xpos_attr = merged_attrs_map.get("xpos")
+                reg_attr = merged_attrs_map.get("reg")
+                expan_attr = merged_attrs_map.get("expan")
+                lemma_attr = merged_attrs_map.get("lemma")
                 doc = load_teitok(
                     args.input,
                     xpos_attr=xpos_attr,
@@ -3197,6 +3230,13 @@ def run_tag(args: argparse.Namespace) -> int:
                     expan_attr=expan_attr,
                     lemma_attr=lemma_attr,
                 )
+                # Auto-enable writeback if teitok-settings is detected and writeback not explicitly set
+                if args.writeback is None and teitok_settings and teitok_settings.settings_path:
+                    args.writeback = True
+                    if args.verbose or args.debug:
+                        print("[flexipipe] Auto-enabled writeback mode (--teitok-settings detected)", file=sys.stderr)
+                # Store settings for later language resolution
+                # (Language will be resolved after document is loaded to check teiHeader first)
         detection_source_text = _document_to_plain_text(doc)
     if args.debug:
         sent_count = len(doc.sentences)
@@ -3204,12 +3244,50 @@ def run_tag(args: argparse.Namespace) -> int:
         print(f"[flexipipe] loaded document: sentences={sent_count} tokens={tok_count}")
 
     if not detection_attempted:
-        detection_result = _maybe_detect_language(args, detection_source_text)
-        detection_attempted = True
-        # Store detected language in document.meta
-        if detection_result and isinstance(detection_result, dict) and detection_result.get("language"):
-            doc.meta["language"] = detection_result["language"]
-        elif getattr(args, "language", None):
+        # Language resolution priority:
+        # 1. CLI --language (already checked)
+        # 2. Document metadata (from teiHeader)
+        # 3. TEITOK settings.xml (if available)
+        # 4. Language detection
+        
+        # Check document metadata first (from teiHeader)
+        doc_lang = None
+        if hasattr(doc, "attrs") and doc.attrs:
+            doc_lang = doc.attrs.get("language") or doc.attrs.get("lang")
+        if not doc_lang and hasattr(doc, "meta") and doc.meta:
+            doc_lang = doc.meta.get("language") or doc.meta.get("lang")
+        
+        # If we have a language from document, use it
+        if doc_lang and not getattr(args, "language", None):
+            args.language = doc_lang
+            if args.verbose or args.debug:
+                print(f"[flexipipe] Using language from document metadata (teiHeader): {doc_lang}", file=sys.stderr)
+        
+        # Check TEITOK settings.xml if still no language
+        if not getattr(args, "language", None) and input_format == "teitok":
+            # Try to load settings if we haven't already
+            if args.input and args.input not in ("-", "<inline-data>"):
+                teitok_settings, _ = _load_and_merge_teitok_settings(args, args.input)
+                if teitok_settings:
+                    settings_lang = teitok_settings.get_language()
+                    if settings_lang:
+                        args.language = settings_lang
+                        if args.verbose or args.debug:
+                            print(f"[flexipipe] Using language from settings.xml: {settings_lang}", file=sys.stderr)
+        
+        # Try language detection if still no language
+        if not getattr(args, "language", None):
+            detection_result = _maybe_detect_language(args, detection_source_text)
+            detection_attempted = True
+            # Store detected language in document.meta
+            if detection_result and isinstance(detection_result, dict) and detection_result.get("language"):
+                doc.meta["language"] = detection_result["language"]
+                args.language = detection_result.get("language") or detection_result.get("language_iso")
+        else:
+            detection_attempted = True
+        
+        # Store final language in document.meta
+        if getattr(args, "language", None):
             doc.meta["language"] = args.language
 
     if not auto_selected:
@@ -3314,15 +3392,6 @@ def run_tag(args: argparse.Namespace) -> int:
                 # Add TreeTagger-specific kwargs
                 if backend_type_lower == "treetagger":
                     backend_kwargs.update(_build_treetagger_backend_kwargs(args))
-                # Add CText-specific kwargs
-                if backend_type_lower == "ctext":
-                    if not getattr(args, "ctext_language", None) and getattr(args, "language", None):
-                        setattr(args, "ctext_language", args.language)
-                    try:
-                        backend_kwargs.update(_build_ctext_backend_kwargs(args))
-                    except ValueError as exc:
-                        print(f"[flexipipe] {exc}", file=sys.stderr)
-                        return 1
 
             try:
                 _prepare_spacy_model_if_needed(args)
@@ -3388,9 +3457,7 @@ def run_tag(args: argparse.Namespace) -> int:
                     create_kwargs.pop("model_path", None)
                 else:
                     create_kwargs["model_name"] = model_name
-                    if backend_type_lower == "ctext":
-                        create_kwargs["language"] = getattr(args, "ctext_language", None) or language
-                    elif backend_type_lower == "flair":
+                    if backend_type_lower == "flair":
                         create_kwargs["language"] = language or "en"
                     else:
                         create_kwargs["language"] = language if not model_name else None
@@ -3709,6 +3776,27 @@ def run_tag(args: argparse.Namespace) -> int:
                             is_extracted_text = True
         
         if use_writeback and original_input_path:
+            # Create backup before writeback (TEITOK-style once-a-day backup)
+            from .teitok_backup import create_teitok_backup
+            backup_path = create_teitok_backup(str(original_input_path))
+            if backup_path:
+                if args.verbose or args.debug:
+                    print(f"[flexipipe] Created backup: {backup_path}", file=sys.stderr)
+            elif args.verbose or args.debug:
+                # Backup already exists for today
+                from datetime import date
+                today = date.today().strftime("%Y%m%d")
+                filename = Path(original_input_path).name
+                if "." in filename:
+                    name_part, ext_part = filename.rsplit(".", 1)
+                    backup_name = f"{name_part}-{today}.{ext_part}"
+                else:
+                    backup_name = f"{filename}-{today}"
+                backups_dir = Path.cwd() / "backups"
+                existing_backup = backups_dir / backup_name
+                if existing_backup.exists():
+                    print(f"[flexipipe] Backup already exists for today: {existing_backup}", file=sys.stderr)
+            
             # Update original file in-place
             from .teitok import update_teitok
             from .insert_tokens import insert_tokens_into_teitok
@@ -5015,7 +5103,7 @@ def _run_config_wizard() -> int:
         set_models_dir(new_dir)
         print(f"[flexipipe] Models directory set to {new_dir}")
 
-    backend_choices = ["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "udpipe1", "treetagger", "nametag", "ctext"]
+    backend_choices = get_backend_choices()
     current_backend = get_default_backend() or "flexitag"
     backend = _prompt_choice("Default backend", backend_choices, default=current_backend)
     set_default_backend(backend)
@@ -5076,7 +5164,7 @@ def _run_config_wizard() -> int:
         print(f"[flexipipe] Skipping fastText download (language detector '{language_detector}' does not require it).")
 
     print("\n[flexipipe] Prefetching model registries for installed backends (this may take a moment)...")
-    _prefetch_backend_registries(LANGUAGE_BACKEND_PRIORITY, verbose=True)
+    _prefetch_backend_registries(_get_language_backend_priority(), verbose=True)
 
     print("\n[flexipipe] Wizard complete. Run 'python -m flexipipe config --show' to review settings.\n")
     return 0

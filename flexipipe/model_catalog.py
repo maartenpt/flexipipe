@@ -80,12 +80,12 @@ def build_unified_catalog(
         print("[flexipipe] Building unified model catalog...")
     
     from .backend_registry import get_backend_info, get_model_entries
-    from .__main__ import LANGUAGE_BACKEND_PRIORITY
+    from .__main__ import _get_language_backend_priority
     
     catalog: Dict[str, Dict[str, Any]] = {}
     
     # Load entries from all backends using cached data directly (very fast)
-    for backend in LANGUAGE_BACKEND_PRIORITY:
+    for backend in _get_language_backend_priority():
         if backend is None:
             continue
         try:
@@ -103,8 +103,6 @@ def build_unified_catalog(
                     cache_key = "udmorph:https://lindat.mff.cuni.cz/services/teitok-live/udmorph/index.php?action=tag&act=list"
                 elif backend == "nametag":
                     cache_key = "nametag:https://lindat.mff.cuni.cz/services/nametag/api/models"
-                elif backend == "ctext":
-                    cache_key = "ctext:https://v-ctx-lnx10.nwu.ac.za:8443/CTexTWebAPI/services"
                 else:
                     cache_key = f"{backend}:default"
             else:
@@ -227,7 +225,7 @@ def _apply_preference_rules(catalog: Dict[str, Dict[str, Any]]) -> None:
        - Smaller models (sm > md > lg) for speed
     3. Backend priority: flexitag > spacy > stanza > others
     """
-    from .__main__ import LANGUAGE_BACKEND_PRIORITY
+    from .__main__ import _get_language_backend_priority
     
     # Group by language
     by_language: Dict[str, List[tuple[str, Dict[str, Any]]]] = {}
@@ -239,7 +237,8 @@ def _apply_preference_rules(catalog: Dict[str, Dict[str, Any]]) -> None:
             by_language[lang_iso] = []
         by_language[lang_iso].append((key, entry))
     
-    backend_priority = {name: idx for idx, name in enumerate(LANGUAGE_BACKEND_PRIORITY) if name}
+    backend_priority_list = _get_language_backend_priority()
+    backend_priority = {name: idx for idx, name in enumerate(backend_priority_list) if name}
     
     for lang_iso, models in by_language.items():
         existing_preferred = [entry for _, entry in models if entry.get("preferred")]
@@ -335,8 +334,9 @@ def get_preferred_model_for_language(
         return None
     
     # Sort by: preferred flag, then available, then backend priority
-    from .__main__ import LANGUAGE_BACKEND_PRIORITY
-    backend_priority = {name: idx for idx, name in enumerate(LANGUAGE_BACKEND_PRIORITY) if name}
+    from .__main__ import _get_language_backend_priority
+    backend_priority_list = _get_language_backend_priority()
+    backend_priority = {name: idx for idx, name in enumerate(backend_priority_list) if name}
     
     def sort_key(entry: Dict[str, Any]) -> tuple[int, int, int]:
         preferred = 0 if entry.get("preferred", False) else 1

@@ -292,7 +292,7 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
     
     # API-specific attributes that can appear at file or document level
     API_ATTRIBUTES = {"nametag_model", "nametag_model_licence", "udmorph_model", "udmorph_model_licence", 
-                      "ctext_model", "ctext_model_licence", "udpipe_model", "udpipe_model_licence",
+                      "udpipe_model", "udpipe_model_licence",
                       "generator", "model"}
     
     for raw_line in conllu_text.splitlines():

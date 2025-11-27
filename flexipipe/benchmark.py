@@ -390,10 +390,9 @@ class BenchmarkRunner:
                 create_kwargs: dict = {}
                 if job.model:
                     # REST backends (UDPipe, UDMorph, NameTag) use "model" instead of "model_name"
-                    # CText doesn't use model at all
                     if job.backend in ("udpipe", "udmorph", "nametag"):
                         create_kwargs["model"] = job.model
-                    elif job.backend != "ctext":
+                    else:
                         create_kwargs["model_name"] = job.model
                 if job.language:
                     create_kwargs.setdefault("language", job.language)
@@ -417,11 +416,6 @@ class BenchmarkRunner:
                     create_kwargs.setdefault(
                         "endpoint_url",
                         "https://lindat.mff.cuni.cz/services/nametag/api/recognize"
-                    )
-                elif job.backend == "ctext":
-                    create_kwargs.setdefault(
-                        "endpoint_url",
-                        "https://v-ctx-lnx7.nwu.ac.za:8443/CTexTWebAPI/services"
                     )
                 try:
                     # Backend creation (including any downloads) happens BEFORE timing starts

@@ -92,7 +92,7 @@ def refresh_all_caches(
         Dictionary mapping cache keys to success status
     """
     from .backend_registry import get_backend_info, get_model_entries
-    from .__main__ import LANGUAGE_BACKEND_PRIORITY
+    from .__main__ import _get_language_backend_priority
     from .model_catalog import build_unified_catalog
     
     results: Dict[str, bool] = {}
@@ -101,7 +101,7 @@ def refresh_all_caches(
         print("[flexipipe] Refreshing all model caches...")
     
     # Refresh per-backend caches first
-    for backend in LANGUAGE_BACKEND_PRIORITY:
+    for backend in _get_language_backend_priority():
         if backend is None:
             continue
         try:
@@ -121,8 +121,6 @@ def refresh_all_caches(
                     cache_key = "udmorph:https://lindat.mff.cuni.cz/services/teitok-live/udmorph/index.php?action=tag&act=list"
                 elif backend == "nametag":
                     cache_key = "nametag:https://lindat.mff.cuni.cz/services/nametag/api/models"
-                elif backend == "ctext":
-                    cache_key = "ctext:https://v-ctx-lnx10.nwu.ac.za:8443/CTexTWebAPI/services"
                 else:
                     cache_key = f"{backend}:default"
             else:

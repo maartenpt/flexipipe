@@ -113,7 +113,7 @@ def list_tasks(args: argparse.Namespace) -> int:
 def list_models(args: argparse.Namespace) -> int:
     """List available models for the specified backend."""
     import time
-    from .__main__ import _load_backend_entries, _display_language_filtered_models, LANGUAGE_BACKEND_PRIORITY
+    from .__main__ import _load_backend_entries, _display_language_filtered_models, _get_language_backend_priority
     from .language_utils import LANGUAGE_FIELD_ISO, LANGUAGE_FIELD_NAME
     
     start_time = time.time()
@@ -200,7 +200,8 @@ def list_models(args: argparse.Namespace) -> int:
                 fallback_start = time.time()
                 print("[DEBUG] Falling back to per-backend loading...", file=sys.stderr)
             
-            backends_to_check = [backend_type.lower()] if backend_type else LANGUAGE_BACKEND_PRIORITY
+            backend_priority_list = _get_language_backend_priority()
+            backends_to_check = [backend_type.lower()] if backend_type else backend_priority_list
             entries_by_backend: dict[str, dict] = {}
             failed_backends: list[str] = []
             backend_timings: dict[str, float] = {}
@@ -230,8 +231,6 @@ def list_models(args: argparse.Namespace) -> int:
                                 cache_key = f"udmorph:{url or 'https://lindat.mff.cuni.cz/services/teitok-live/udmorph/index.php?action=tag&act=list'}"
                             elif backend == "nametag":
                                 cache_key = f"nametag:{url or 'https://lindat.mff.cuni.cz/services/nametag/api/models'}"
-                            elif backend == "ctext":
-                                cache_key = f"ctext:{url or 'https://v-ctx-lnx10.nwu.ac.za:8443/CTexTWebAPI/services'}"
                             else:
                                 cache_key = f"{backend}:{url or 'default'}"
                         else:
@@ -314,15 +313,17 @@ def list_models(args: argparse.Namespace) -> int:
         # No backend specified - list all models from all backends
         if debug:
             print("[DEBUG] No backend specified - listing models from all backends...", file=sys.stderr)
-            print(f"[DEBUG] Checking backends: {', '.join([b for b in LANGUAGE_BACKEND_PRIORITY if b])}", file=sys.stderr)
+            backend_priority_list = _get_language_backend_priority()
+            print(f"[DEBUG] Checking backends: {', '.join([b for b in backend_priority_list if b])}", file=sys.stderr)
         
         output_format = getattr(args, "output_format", "table")
-        from .__main__ import _load_backend_entries, LANGUAGE_BACKEND_PRIORITY
+        from .__main__ import _load_backend_entries
+        backend_priority_list = _get_language_backend_priority()
         
         entries_by_backend: dict[str, dict] = {}
         backend_timings: dict[str, float] = {}
         
-        for backend in LANGUAGE_BACKEND_PRIORITY:
+        for backend in backend_priority_list:
             if backend is None:
                 continue
             if debug:

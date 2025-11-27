@@ -20,6 +20,7 @@ except ImportError as exc:
     ) from exc
 from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
+from setuptools.command.install import install
 
 # Read README for long description
 readme_file = Path(__file__).parent / "README.md"
@@ -138,6 +139,138 @@ class FlexiBuildExt(build_ext):
         return rapidjson_include, pugixml_src_dir, pugixml_source
 
 
+def install_wrapper_script():
+    """Interactive installation of the flexipipe wrapper script."""
+    import shutil
+    import stat
+    import subprocess
+    
+    print("\n" + "="*70)
+    print("Flexipipe Wrapper Script Installation")
+    print("="*70)
+    print("\nThis will install a wrapper script that allows you to run")
+    print("'flexipipe' directly instead of 'python -m flexipipe'.")
+    print()
+    
+    # Ask about virtual environment
+    use_venv = input("Do you want to use a virtual environment for flexipipe? [y/N]: ").strip().lower()
+    venv_path = None
+    if use_venv in ('y', 'yes'):
+        venv_path = input("Enter the path to your virtual environment (or press Enter to skip): ").strip()
+        if not venv_path:
+            venv_path = None
+        elif not Path(venv_path).exists():
+            print(f"Warning: Virtual environment path does not exist: {venv_path}")
+            use_venv = input("Continue anyway? [y/N]: ").strip().lower()
+            if use_venv not in ('y', 'yes'):
+                venv_path = None
+    
+    # Ask where to install the script
+    print("\nWhere would you like to install the wrapper script?")
+    print("  1. /usr/local/bin (system-wide, requires sudo)")
+    print("  2. ~/bin (user-local, add to PATH)")
+    print("  3. Custom location")
+    print("  4. Skip installation")
+    
+    choice = input("Enter choice [1-4] (default: 4): ").strip() or "4"
+    
+    if choice == "4":
+        print("Skipping wrapper script installation.")
+        print("You can install it manually later by copying scripts/flexipipe to your PATH.")
+        return
+    
+    # Determine installation path
+    script_source = Path(__file__).parent / "scripts" / "flexipipe"
+    if not script_source.exists():
+        print(f"Error: Wrapper script not found at {script_source}")
+        return
+    
+    if choice == "1":
+        install_path = Path("/usr/local/bin/flexipipe")
+        use_sudo = True
+    elif choice == "2":
+        install_path = Path.home() / "bin" / "flexipipe"
+        install_path.parent.mkdir(parents=True, exist_ok=True)
+        use_sudo = False
+    elif choice == "3":
+        custom_path = input("Enter installation path: ").strip()
+        if not custom_path:
+            print("No path provided, skipping installation.")
+            return
+        install_path = Path(custom_path).expanduser().resolve()
+        install_path.parent.mkdir(parents=True, exist_ok=True)
+        use_sudo = False
+    else:
+        print("Invalid choice, skipping installation.")
+        return
+    
+    # Read the script and customize it
+    script_content = script_source.read_text()
+    
+    # Add configuration at the top if venv_path is set
+    if venv_path:
+        venv_line = f'VENV_PATH="{venv_path}"'
+        # Insert after the configuration comments
+        lines = script_content.split('\n')
+        insert_pos = 0
+        for i, line in enumerate(lines):
+            if line.startswith('# FLEXIPIPE_REPO_PATH') or line.startswith('# Optional: Set path'):
+                insert_pos = i
+                break
+        lines.insert(insert_pos, venv_line)
+        script_content = '\n'.join(lines)
+    
+    # Write to installation location
+    try:
+        if use_sudo:
+            # Write to temp file first, then copy with sudo
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.sh') as tmp:
+                tmp.write(script_content)
+                tmp_path = tmp.name
+            result = subprocess.run(
+                ['sudo', 'cp', tmp_path, str(install_path)],
+                capture_output=True,
+                text=True
+            )
+            Path(tmp_path).unlink()
+            if result.returncode != 0:
+                print(f"Error installing script: {result.stderr}")
+                return
+            subprocess.run(['sudo', 'chmod', '+x', str(install_path)])
+        else:
+            install_path.write_text(script_content)
+            install_path.chmod(install_path.stat().st_mode | stat.S_IEXEC)
+        
+        print(f"\n✓ Wrapper script installed to: {install_path}")
+        if choice == "2":
+            print(f"\nNote: Make sure ~/bin is in your PATH.")
+            print("Add this to your ~/.bashrc or ~/.zshrc:")
+            print("  export PATH=\"$HOME/bin:$PATH\"")
+        print()
+    except Exception as e:
+        print(f"Error installing wrapper script: {e}")
+
+
+class FlexiInstall(install):
+    """Custom install command that prompts for wrapper script installation."""
+    
+    def run(self):
+        # Run the standard install
+        install.run(self)
+        
+        # After installation, offer to install wrapper script
+        # Only prompt if running interactively (not in automated builds)
+        if sys.stdin.isatty():
+            try:
+                install_wrapper_script()
+            except KeyboardInterrupt:
+                print("\n\nWrapper script installation cancelled.")
+            except Exception as e:
+                print(f"\nError during wrapper script installation: {e}")
+                print("You can install it manually later.")
+
+
 setup(
     name="flexipipe",
     version=version,
@@ -215,7 +348,10 @@ setup(
             ],
         ),
     ],
-    cmdclass={"build_ext": FlexiBuildExt},
+    cmdclass={
+        "build_ext": FlexiBuildExt,
+        "install": FlexiInstall,
+    },
     zip_safe=False,
 )
 

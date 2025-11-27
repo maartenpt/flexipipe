@@ -12,7 +12,7 @@ import logging
 import pkgutil
 from importlib import metadata
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Protocol, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Type, Union
 
 from .doc import Document
 from .backend_spec import BackendSpec
@@ -174,6 +174,18 @@ def list_backends(include_hidden: bool = False) -> Dict[str, BackendInfo]:
     if include_hidden:
         return _BACKEND_REGISTRY.copy()
     return {name: info for name, info in _BACKEND_REGISTRY.items() if not info.is_hidden}
+
+
+def get_backend_choices() -> List[str]:
+    """Get list of backend names for CLI choices (sorted, excluding hidden backends)."""
+    backends = list_backends(include_hidden=False)
+    return sorted(backends.keys())
+
+
+def get_backend_choices_for_training() -> List[str]:
+    """Get list of backend names that support training."""
+    backends = list_backends(include_hidden=False)
+    return sorted([name for name, info in backends.items() if info.supports_training])
 
 
 def get_model_entries(
@@ -356,41 +368,6 @@ def create_backend(
             log_requests=log_requests,
         )
     
-    elif backend_key == "ctext":
-        # CText REST backend (download_model not applicable for REST services)
-        kwargs.pop("download_model", None)  # Ignore download_model for REST backends
-        endpoint_url = kwargs.pop("endpoint_url", None)
-        if not endpoint_url:
-            endpoint_url = "https://v-ctx-lnx10.nwu.ac.za:8443/CTexTWebAPI/services"
-        ctext_language = kwargs.pop("language", None) or language
-        if not ctext_language:
-            raise ValueError("CText backend requires language. Provide --ctext-language.")
-        auth_token = kwargs.pop("auth_token", None)
-        auth_header = kwargs.pop("auth_header", None)
-        timeout = kwargs.pop("timeout", 30.0)
-        batch_size = kwargs.pop("batch_size", 50)
-        mapping_file = kwargs.pop("mapping_file", None)
-        session = kwargs.pop("session", None)
-        log_requests = kwargs.pop("log_requests", False)
-        verify_ssl = kwargs.pop("verify_ssl", False)  # Default to False due to SSL issues
-        # Remove model_name if present (CText doesn't use it)
-        kwargs.pop("model_name", None)
-        if kwargs:
-            unexpected = ", ".join(kwargs.keys())
-            raise ValueError(f"Unexpected CText backend arguments: {unexpected}")
-        return backend_class(
-            endpoint_url,
-            language=ctext_language,
-            auth_token=auth_token,
-            auth_header=auth_header,
-            timeout=timeout,
-            batch_size=batch_size,
-            mapping_file=mapping_file,
-            session=session,
-            log_requests=log_requests,
-            verify_ssl=verify_ssl,
-        )
-    
     else:
         # Generic fallback: try to instantiate with provided kwargs
         # This allows backends to define their own __init__ signatures
@@ -420,8 +397,6 @@ def _initialize_registry() -> None:
     # NameTag REST backend is registered via BackendSpec in backends/nametag.py
     # No need to register here as it's auto-discovered
     
-    # CText REST backend is registered via BackendSpec in backends/ctext.py
-    # No need to register here as it's auto-discovered
     
     _register_discovered_backends()
 
