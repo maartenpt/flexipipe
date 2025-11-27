@@ -86,6 +86,11 @@ from .backends.flexitag import (
 )
 from .backends.udmorph import get_udmorph_model_entries, get_udmorph_model_entry
 from .task_registry import TASK_DEFAULTS, TASK_MANDATORY, TASK_LOOKUP
+from .validator import (
+    infer_language_from_document,
+    infer_language_from_path,
+    run_validator_cli,
+)
 
 LANGUAGE_BACKEND_PRIORITY = [
     "flexitag",
@@ -1059,6 +1064,7 @@ TASK_CHOICES = (
     "config",
     "info",
     "benchmark",
+    "validate",
 )
 
 
@@ -1570,6 +1576,43 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include <note> elements in extracted text when using --tokenize (default: exclude notes).",
     )
+    process_parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Run the UD validator on the produced CoNLL-U output (requires --output and --output-format conllu or conllu-ne).",
+    )
+    process_parser.add_argument(
+        "--validator-rules",
+        default=None,
+        help="Which validation profile to pass to the UD validator (--validation value, e.g., core, all, experimental). If not set, smart validation filters errors about missing annotations.",
+    )
+    process_parser.add_argument(
+        "--no-smart-validation",
+        action="store_true",
+        help="Disable smart validation that filters errors about missing annotations. Use this to see all validation errors.",
+    )
+    process_parser.add_argument(
+        "--ud-tools-version",
+        default="latest",
+        help="UD tools release to download/use for validation (e.g., 2.17). Use 'latest' (default) to follow the registry.",
+    )
+    process_parser.add_argument(
+        "--ud-tools-url",
+        help="Override download URL for the ud-tools archive (used when the default release URL changes).",
+    )
+    process_parser.add_argument(
+        "--validator-arg",
+        dest="validator_args",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="Additional arguments to forward to the UD validator (repeatable).",
+    )
+    process_parser.add_argument(
+        "--validator-lang",
+        default=None,
+        help="Language code to pass to the UD validator (e.g., en, de). If omitted, flexipipe tries to infer it from the document metadata.",
+    )
     
     # Tag mapping options (for enriching tags from vocabulary)
     process_parser.add_argument(
@@ -1722,6 +1765,51 @@ def build_parser() -> argparse.ArgumentParser:
         "--refresh",
         action="store_true",
         help="Force refresh of example metadata (re-download files if needed)",
+    )
+
+    # validate -----------------------------------------------------------
+    validate_parser = subparsers.add_parser(
+        "validate",
+        help="Run the official UD validator (ud-tools) on one or more CoNLL-U files or treebank directories",
+        parents=[parent_parser],
+    )
+    validate_parser.add_argument(
+        "treebank",
+        nargs="+",
+        help="Path(s) to CoNLL-U file(s) or directories to validate",
+    )
+    validate_parser.add_argument(
+        "--rules",
+        dest="validator_rules",
+        default="core",
+        help="Validation profile to use (passed as --validation to ud-tools).",
+    )
+    validate_parser.add_argument(
+        "--ud-tools-version",
+        default="latest",
+        help="UD tools release to download/use (e.g., 2.17). Use 'latest' (default) to follow the registry.",
+    )
+    validate_parser.add_argument(
+        "--ud-tools-url",
+        help="Override download URL for the ud-tools archive.",
+    )
+    validate_parser.add_argument(
+        "--validator-arg",
+        dest="validator_args",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="Additional arguments passed directly to ud-tools/validate.py (repeatable).",
+    )
+    validate_parser.add_argument(
+        "--validator-lang",
+        default=None,
+        help="Language code to pass to the UD validator (e.g., en, de). Required when flexipipe cannot infer it from the files.",
+    )
+    validate_parser.add_argument(
+        "--no-smart-validation",
+        action="store_true",
+        help="Disable smart validation that filters errors about missing annotations. Use this to see all validation errors.",
     )
 
     # info tasks
@@ -2864,6 +2952,7 @@ def run_tag(args: argparse.Namespace) -> int:
     detection_attempted = False
     detection_result = None
     detection_source_text: Optional[str] = None
+    validator_source_doc: Optional[Document] = None
 
     input_entry = None
     if not inline_data_text:
@@ -3478,6 +3567,8 @@ def run_tag(args: argparse.Namespace) -> int:
             print("Error: Backend required for requested tasks but none specified. Use --backend to specify a backend.", file=sys.stderr)
             return 1
 
+    validator_source_doc = result.document
+
     output_format = args.output_format
     output_path = args.output
 
@@ -3495,12 +3586,27 @@ def run_tag(args: argparse.Namespace) -> int:
 
     _filter_document_by_tasks(result.document, requested_tasks)
 
+    # If validation is requested but no output file is specified, use a temp file
+    validation_temp_file = None
+    if getattr(args, "validate", False) and not output_path and output_format in ("conllu", "conllu-ne"):
+        import tempfile
+        validation_temp_file = tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".conllu",
+            delete=False,
+            encoding="utf-8",
+        )
+        output_path = validation_temp_file.name
+        validation_temp_file.close()
+
     output_entry = io_registry.get_output(output_format)
     if output_entry:
+        # If we're using a temp file for validation, save to it but don't print yet
+        actual_output_path = output_path if not validation_temp_file else output_path
         output_entry.save(
             result.document,
             args=args,
-            output_path=output_path,
+            output_path=actual_output_path,
             model_info=model_str,
         )
     elif output_format == "teitok":
@@ -3518,6 +3624,7 @@ def run_tag(args: argparse.Namespace) -> int:
                 new_sent = _create_implicit_mwt(sent)
                 new_doc.sentences.append(new_sent)
             output_doc = new_doc
+        validator_source_doc = output_doc
         
         # Apply tag mapping if requested
         map_tags_models = getattr(args, "map_tags_models", None)
@@ -3581,6 +3688,8 @@ def run_tag(args: argparse.Namespace) -> int:
                         direction_desc.append("+".join(p for p in parts if p))
                     direction_text = ", ".join(direction_desc) or "nothing"
                     print(f"[flexipipe] tag mapping ({direction_text}) updated {changes} tokens")
+        
+        validator_source_doc = output_doc
         
         # Check if writeback should be used
         use_writeback = False
@@ -3735,9 +3844,92 @@ def run_tag(args: argparse.Namespace) -> int:
     elif args.verbose:
         print(f"[flexipipe] saved to {output_path or 'stdout'}")
 
+    if getattr(args, "validate", False):
+        if output_format not in ("conllu", "conllu-ne"):
+            print(
+                "[flexipipe] --validate currently supports only conllu/conllu-ne output. "
+                "Use --output-format conllu (or conllu-ne) when enabling validation.",
+                file=sys.stderr,
+            )
+            return 1
+        # output_path should be set now (either from user or from temp file)
+        if not output_path:
+            print(
+                "[flexipipe] --validate requires --output <file> so the UD validator can read the saved CoNLL-U.",
+                file=sys.stderr,
+            )
+            return 1
+        
+        validator_lang = getattr(args, "validator_lang", None)
+        if not validator_lang:
+            validator_lang = infer_language_from_document(
+                validator_source_doc,
+                detection_result,
+                getattr(args, "language", None),
+            )
+        # Smart validation is enabled by default, unless user explicitly sets rules or disables it
+        smart_validation = not getattr(args, "no_smart_validation", False) and not getattr(args, "validator_rules", None)
+        
+        # If we used a temp file, print the output to stdout first, then validate
+        if validation_temp_file:
+            try:
+                with open(output_path, "r", encoding="utf-8") as f:
+                    print(f.read(), end="")
+            except OSError:
+                pass
+        
+        validation_rc = run_validator_cli(
+            Path(output_path),
+            version=getattr(args, "ud_tools_version", "latest"),
+            url=getattr(args, "ud_tools_url", None),
+            rules=getattr(args, "validator_rules", None),
+            extra_args=getattr(args, "validator_args", None),
+            lang=validator_lang,
+            verbose=args.verbose or args.debug,
+            smart_validation=smart_validation,
+        )
+        
+        # Clean up temp file after validation
+        if validation_temp_file:
+            try:
+                Path(output_path).unlink()
+            except OSError:
+                pass
+        
+        if validation_rc != 0:
+            return validation_rc
+
     return 0
 
 
+def run_validate(args: argparse.Namespace) -> int:
+    paths = [Path(p).expanduser() for p in args.treebank]
+    verbose = args.verbose or args.debug
+    overall_rc = 0
+    explicit_lang = getattr(args, "validator_lang", None)
+    for path in paths:
+        if not path.exists():
+            print(f"[flexipipe] Cannot validate '{path}': file or directory does not exist.", file=sys.stderr)
+            overall_rc = overall_rc or 1
+            continue
+        if verbose:
+            print(f"[flexipipe] Validating {path}")
+        lang_for_this = explicit_lang or infer_language_from_path(path)
+        # Smart validation is enabled by default, unless user explicitly sets rules or disables it
+        smart_validation = not getattr(args, "no_smart_validation", False) and not getattr(args, "validator_rules", None)
+        rc = run_validator_cli(
+            path,
+            version=getattr(args, "ud_tools_version", "latest"),
+            url=getattr(args, "ud_tools_url", None),
+            rules=getattr(args, "validator_rules", None),
+            extra_args=getattr(args, "validator_args", None),
+            lang=lang_for_this,
+            verbose=verbose,
+            smart_validation=smart_validation,
+        )
+        if rc != 0:
+            overall_rc = rc
+    return overall_rc
 def _required_annotations_for_backend(
     backend_type: str,
     xpos_attr: Optional[str] = None,
@@ -4492,6 +4684,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.task == "info":
         from .info import run_info_cli
         return run_info_cli(args)
+    if args.task == "validate":
+        return run_validate(args)
     if args.task == "benchmark":
         from .benchmark import run_cli as run_benchmark_cli
         run_benchmark_cli(args)

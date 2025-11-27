@@ -798,13 +798,11 @@ def document_to_conllu(
                         # Don't duplicate attributes already in the span, skip empty keys
                         if key and key not in text_span.attrs:
                             lines.append(f"# {key} = {doc_level_attrs[key]}")
-                if lines:  # Add empty line after doc-level attrs
-                    lines.append("")
+                # Don't add empty line here - we'll add it before the sentence
                 current_text_span_idx += 1
         elif sent_idx == 0 and not text_spans:
             # First sentence, no text spans - output single newdoc
-            if lines:  # Add empty line before newdoc if we have file-level attrs
-                lines.append("")
+            # Don't add empty line before newdoc - file-level attrs should be directly followed by newdoc
             newdoc_id = doc_standard_attrs.get("newdoc_id") or document.id or ""
             if newdoc_id:
                 lines.append(f"# newdoc id = {newdoc_id}")
@@ -818,8 +816,7 @@ def document_to_conllu(
             for key in sorted(doc_level_attrs.keys()):
                 if key and key not in doc_standard_attrs:  # Don't duplicate standard attrs, skip empty keys
                     lines.append(f"# {key} = {doc_level_attrs[key]}")
-            if lines:  # Add empty line after doc-level attrs
-                lines.append("")
+            # Don't add empty line here - we'll add it before the sentence (after newdoc/attrs)
         
         # Check if we need to output a newpar marker
         if current_par_span_idx < len(par_spans):
@@ -835,25 +832,47 @@ def document_to_conllu(
                 for key in sorted(par_span.attrs.keys()):
                     if key not in UD_PARAGRAPH_ATTRIBUTES:
                         lines.append(f"# {key} = {par_span.attrs[key]}")
-                if lines:  # Add empty line after par-level attrs
-                    lines.append("")
+                # Don't add empty line here - we'll add it before the sentence if needed
                 current_par_span_idx += 1
         
         # Output sentence
-        if lines and not lines[-1]:  # Don't add extra empty line if we already have one
-            pass
-        elif lines:
-            lines.append("")
+        # Ensure we have exactly one empty line before the sentence (after previous sentence)
+        # But NOT after newdoc/newpar - those should be directly followed by sentence comments
+        # Only add empty line if the last line is from a previous sentence (ends with a token line)
+        if lines and lines[-1]:
+            # Check if last line is a token line (starts with a number)
+            last_line = lines[-1].strip()
+            if last_line and (last_line[0].isdigit() or last_line.startswith("# text") or last_line.startswith("# sent_id")):
+                # Last line is from a previous sentence, add empty line
+                lines.append("")
+            # If last line is newdoc/newpar, don't add empty line - sentence comments follow directly
         # Optionally create implicit MWTs from SpaceAfter=No sequences
         if create_implicit_mwt:
             sentence = _create_implicit_mwt(sentence)
         extra_entities = span_entities.get(sent_idx)
-        lines.extend(_sentence_lines(sentence, extra_entities=extra_entities, entity_format=entity_format, custom_misc_attrs=custom_misc_attrs))
+        sentence_lines = _sentence_lines(sentence, extra_entities=extra_entities, entity_format=entity_format, custom_misc_attrs=custom_misc_attrs)
+        lines.extend(sentence_lines)
+        # Add exactly one empty line after each sentence (required by CoNLL-U format)
+        lines.append("")
 
     if not lines:
         return ""
 
-    return "\n".join(lines) + "\n"
+    # Remove trailing empty lines (we'll add exactly one at the end)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    
+    # Ensure exactly one empty line at the end (required by CoNLL-U format)
+    # The empty line should be the last line, so join and ensure it ends with \n\n
+    lines.append("")  # Add empty line
+    result = "\n".join(lines)
+    # Ensure file ends with exactly two newlines (empty line + EOF)
+    if not result.endswith("\n\n"):
+        if result.endswith("\n"):
+            result += "\n"  # Add one more newline
+        else:
+            result += "\n\n"  # Add two newlines
+    return result
 
 
 def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] = None, entity_format: str = "iob", custom_misc_attrs: Optional[Dict[str, str]] = None) -> List[str]:
