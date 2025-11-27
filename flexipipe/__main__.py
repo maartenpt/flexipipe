@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import shlex
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Collection, Dict, List, Optional, Tuple
@@ -86,7 +87,20 @@ from .backends.flexitag import (
 from .backends.udmorph import get_udmorph_model_entries, get_udmorph_model_entry
 from .task_registry import TASK_DEFAULTS, TASK_MANDATORY, TASK_LOOKUP
 
-LANGUAGE_BACKEND_PRIORITY = ["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "nametag"]
+LANGUAGE_BACKEND_PRIORITY = [
+    "flexitag",
+    "spacy",
+    "stanza",
+    "classla",
+    "flair",
+    "transformers",
+    "udpipe",
+    "udmorph",
+    "udpipe1",
+    "treetagger",
+    "nametag",
+    "ctext",
+]
 LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD = 0.80
 LANGUAGE_DETECTOR_DEFAULT = _registry_default_lang_detector()
 LANGUAGE_DETECTION_MIN_LENGTH = 20
@@ -346,7 +360,7 @@ def _tasks_to_backend_components(tasks: set[str], backend: Optional[str]) -> Opt
 def _filter_document_by_tasks(document: Document, tasks: set[str]) -> None:
     keep_lemma = "lemmatize" in tasks
     keep_upos = ("tag" in tasks) or ("parse" in tasks)
-    keep_xpos = "xpos" in tasks
+    keep_xpos = ("tag" in tasks) or ("parse" in tasks) or ("xpos" in tasks)
     keep_parse = "parse" in tasks
     keep_norm = "normalize" in tasks
     keep_ner = "ner" in tasks
@@ -1258,7 +1272,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Add global arguments (available in all subcommands)
     parser.add_argument(
         "--backend",
-        choices=["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "udpipe1", "nametag", "ctext"],
+        choices=["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "udpipe1", "treetagger", "nametag", "ctext"],
         default=None,
         help="Backend type (for use in tasks; default: flexitag)",
     )
@@ -1303,6 +1317,30 @@ def build_parser() -> argparse.ArgumentParser:
             help=argparse.SUPPRESS,  # Hide from help - older versions don't make much sense
         )
     
+    def add_treetagger_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--treetagger-model",
+            default=None,
+            help="TreeTagger model name from the curated registry (e.g., treetagger-english-20211115).",
+        )
+        p.add_argument(
+            "--treetagger-model-path",
+            default=None,
+            help="Path to a TreeTagger parameter file (.par). Overrides --treetagger-model.",
+        )
+        p.add_argument(
+            "--treetagger-binary",
+            default=None,
+            help="Path to the tree-tagger executable (defaults to resolving 'tree-tagger' on PATH).",
+        )
+        p.add_argument(
+            "--treetagger-extra-args",
+            action="append",
+            default=[],
+            metavar="ARGS",
+            help="Additional command-line arguments to pass to tree-tagger (may be repeated).",
+        )
+
     
     def add_ctext_args(p: argparse.ArgumentParser) -> None:
         """Add CText-specific arguments to a parser (hidden from help but still processed)."""
@@ -1332,7 +1370,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     process_parser.add_argument(
         "--backend",
-        choices=["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "udpipe1", "nametag", "ctext"],
+        choices=["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "udpipe1", "treetagger", "nametag", "ctext"],
         default=None,
         help="Backend to use (default: flexitag)",
     )
@@ -1372,7 +1410,7 @@ def build_parser() -> argparse.ArgumentParser:
     process_parser.add_argument(
         "--download-model",
         action="store_true",
-        help="Automatically download missing spaCy/Stanza/Flair models (otherwise prompt interactively where supported)",
+        help="Automatically download missing spaCy/Stanza/Flair/TreeTagger models (otherwise prompt when possible)",
     )
     process_parser.add_argument(
         "--stanza-wsd",
@@ -1392,6 +1430,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_udpipe_args(process_parser)
     add_udmorph_args(process_parser)
     add_nametag_args(process_parser)
+    add_treetagger_args(process_parser)
     add_ctext_args(process_parser)
     process_parser.add_argument(
         "--transformers-task",
@@ -1699,7 +1738,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     models_parser.add_argument(
         "--backend",
-        choices=["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "udpipe1", "nametag", "ctext"],
+        choices=["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "udpipe1", "treetagger", "nametag", "ctext"],
         help="Backend type (required unless --language is provided)",
     )
     models_parser.add_argument(
@@ -2432,6 +2471,30 @@ def _build_nametag_backend_kwargs(args: argparse.Namespace) -> dict:
     return kwargs
 
 
+def _build_treetagger_backend_kwargs(args: argparse.Namespace) -> dict:
+    """Gather TreeTagger-specific backend kwargs from CLI args."""
+    backend = getattr(args, "backend", None)
+    if not backend or backend.lower() != "treetagger":
+        return {}
+
+    extra_args = []
+    for chunk in getattr(args, "treetagger_extra_args", []) or []:
+        extra_args.extend(shlex.split(chunk))
+
+    kwargs: dict[str, object] = {
+        "model_name": getattr(args, "treetagger_model", None) or getattr(args, "model", None),
+        "model_path": getattr(args, "treetagger_model_path", None),
+        "binary": getattr(args, "treetagger_binary", None),
+        "download_model": bool(getattr(args, "download_model", False)),
+        "treetagger_extra_args": extra_args or None,
+        "verbose": bool(getattr(args, "debug", False)),
+    }
+    language = getattr(args, "language", None)
+    if language and not kwargs.get("model_name"):
+        kwargs["language"] = language
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+
 def _build_ctext_backend_kwargs(args: argparse.Namespace) -> dict:
     """Gather CText-specific backend kwargs from CLI args."""
     backend = getattr(args, "backend", None)
@@ -2839,7 +2902,7 @@ def run_tag(args: argparse.Namespace) -> int:
                 for key in file_attrs.keys():
                     if key.endswith("_model"):
                         backend_name = key.replace("_model", "").lower()
-                        if backend_name in ["udpipe", "nametag", "udmorph", "ctext"]:
+                        if backend_name in ["udpipe", "nametag", "udmorph", "ctext", "treetagger"]:
                             if "_backends_used" not in doc.meta:
                                 doc.meta["_backends_used"] = []
                             if backend_name not in doc.meta["_backends_used"]:
@@ -2848,7 +2911,7 @@ def run_tag(args: argparse.Namespace) -> int:
             for key in doc.attrs.keys():
                 if key.endswith("_model"):
                     backend_name = key.replace("_model", "").lower()
-                    if backend_name in ["udpipe", "nametag", "udmorph", "ctext"]:
+                    if backend_name in ["udpipe", "nametag", "udmorph", "ctext", "treetagger"]:
                         if "_backends_used" not in doc.meta:
                             doc.meta["_backends_used"] = []
                         if backend_name not in doc.meta["_backends_used"]:
@@ -3159,6 +3222,9 @@ def run_tag(args: argparse.Namespace) -> int:
                 # Add NameTag-specific kwargs
                 if backend_type_lower == "nametag":
                     backend_kwargs.update(_build_nametag_backend_kwargs(args))
+                # Add TreeTagger-specific kwargs
+                if backend_type_lower == "treetagger":
+                    backend_kwargs.update(_build_treetagger_backend_kwargs(args))
                 # Add CText-specific kwargs
                 if backend_type_lower == "ctext":
                     if not getattr(args, "ctext_language", None) and getattr(args, "language", None):
@@ -4755,7 +4821,7 @@ def _run_config_wizard() -> int:
         set_models_dir(new_dir)
         print(f"[flexipipe] Models directory set to {new_dir}")
 
-    backend_choices = ["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "nametag", "ctext"]
+    backend_choices = ["flexitag", "spacy", "stanza", "classla", "flair", "transformers", "udpipe", "udmorph", "udpipe1", "treetagger", "nametag", "ctext"]
     current_backend = get_default_backend() or "flexitag"
     backend = _prompt_choice("Default backend", backend_choices, default=current_backend)
     set_default_backend(backend)

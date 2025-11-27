@@ -247,6 +247,7 @@ python -m flexipipe config --show
 | `transformers` | Raw + tokenized | HuggingFace Transformers POS/NER with detailed model metadata (tasks, base model, training data, techniques) | Requires `--model <huggingface_id>` plus optional `--transformers-task`, `--transformers-device`, etc. |
 | `udpipe` | Raw + tokenized | REST integration with batching, curl debug output, token/parse tasks, default Lindat endpoint | Provide `--udpipe-model`, optional `--udpipe-param KEY=VALUE`. |
 | `udmorph` | Tokenized | REST morph-only tagging, curl debug output, language-sorted model listing | Requires `--udmorph-model`. |
+| `treetagger` | Tokenized | Local TreeTagger binary for lemma + XPOS tagging (English, German, French, Old French manifests) | Install TreeTagger separately; use `--treetagger-model` or `--treetagger-model-path`, optional `--treetagger-binary`. |
 | `nametag` | Raw + tokenized | REST NER service, supports 21 languages, NameTag 3 (default), curl debug output | Provide `--nametag-model` or `--language`, optional `--nametag-version` (1/2/3), `--nametag-param KEY=VALUE`. |
 ### HuggingFace Transformers backend
 

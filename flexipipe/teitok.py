@@ -872,7 +872,6 @@ def dump_teitok(
                 if key not in existing_entity_keys:
                     sent.entities.append(ent)
                     existing_entity_keys.add(key)
-    doc_dict = sanitized.to_dict()
     payload = _ensure_serializable(sanitized.to_dict())
     if custom_attributes is None:
         custom_attributes = []
