@@ -116,6 +116,9 @@ def _create_implicit_mwt(sentence: Sentence) -> Sentence:
                     space_after=sequence[-1].space_after,  # Inherit from last token
                     subtokens=[],
                 )
+                # Set ord attribute (CoNLL-U ordinal number)
+                if sequence[0].id:
+                    parent.attrs["ord"] = str(sequence[0].id)
                 
                 # Add subtokens
                 for tok in sequence:
@@ -205,6 +208,9 @@ def _merge_spaceafter_no_contractions(document: Document) -> None:
                     deps=current.deps,
                     misc=current.misc,
                 )
+                # Set ord attribute (CoNLL-U ordinal number)
+                if current.id:
+                    parent.attrs["ord"] = str(current.id)
                 
                 # Create subtokens
                 subtoken1 = SubToken(
@@ -540,6 +546,9 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
                 mwt_end=end_id,
                 tokid=tokid,
             )
+            # Set ord attribute (CoNLL-U ordinal number)
+            if start_id:
+                parent.attrs["ord"] = str(start_id)
             # SpaceAfter on range from MISC
             parent.space_after = not ("SpaceAfter=No" in misc)
             if current_sentence is None:
@@ -607,6 +616,9 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
                 misc=misc if misc not in {"", None} else "_",
                 space_after=not ("SpaceAfter=No" in misc),
             )
+            # Set ord attribute (CoNLL-U ordinal number)
+            if token_id:
+                tok.attrs["ord"] = str(token_id)
             current_sentence.tokens.append(tok)
     
     # Flush any last sentence
@@ -988,7 +1000,7 @@ def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] =
             
             end_id = current_id + len(token.subtokens) - 1
             form = _escape(token.form)
-            misc_range = _format_misc_for_range(space_after_range)
+            misc_range = _format_misc_for_range(space_after_range, token=token)
             # MWT range line
             lines.append(f"{current_id}-{end_id}\t{form}\t_\t_\t_\t_\t_\t_\t_\t{misc_range}")
             # Subtokens: no SpaceAfter in MISC (they are not orthographic)
@@ -1176,10 +1188,34 @@ def _format_misc(
     return "|".join(entries) if entries else "_"
 
 
-def _format_misc_for_range(space_after: Optional[bool]) -> str:
-    if space_after is None:
+def _format_misc_for_range(space_after: Optional[bool], token: Optional[Token] = None) -> str:
+    """
+    Format MISC field for MWT range line.
+    
+    Args:
+        space_after: Whether there's a space after the range
+        token: Optional token to extract TokId from
+    """
+    entries: List[str] = []
+    
+    # Add SpaceAfter if needed
+    if space_after is not None and not space_after:
+        entries.append("SpaceAfter=No")
+    
+    # Add TokId if token has one (and it's not auto-generated)
+    if token:
+        tokid = getattr(token, "tokid", "")
+        if tokid and tokid != "_":
+            # Check if tokid matches the auto-generated pattern s{num}-t{num}
+            import re
+            is_auto_generated = bool(re.match(r'^s\d+-t\d+$', tokid))
+            # Include if it's not auto-generated (came from input)
+            if not is_auto_generated:
+                entries.append(f"TokId={tokid}")
+    
+    if not entries:
         return "_"
-    return "_" if space_after else "SpaceAfter=No"
+    return "|".join(entries)
 
 
 def _reconstruct_sentence_text(tokens: Iterable[Token]) -> str:

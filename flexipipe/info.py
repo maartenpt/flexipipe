@@ -7,8 +7,9 @@ import json
 import sys
 from typing import Any, Dict
 
-from .backend_registry import get_backend_info, list_models_display
+from .backend_registry import get_backend_info, list_models_display, get_model_entries
 from .task_registry import TASK_ALIASES, TASK_DEFAULTS, TASK_DESCRIPTIONS, TASK_MANDATORY
+from .language_utils import resolve_language_query, language_matches_entry
 
 
 def list_backends(args: argparse.Namespace) -> int:
@@ -708,6 +709,257 @@ def list_ud_tags(args: argparse.Namespace) -> int:
     return 0
 
 
+def list_teitok_settings(args: argparse.Namespace) -> int:
+    """Display TEITOK settings.xml configuration."""
+    from pathlib import Path
+    from .teitok_settings import load_teitok_settings, find_settings_xml, DEFAULT_ATTRIBUTE_MAPPINGS
+    
+    output_format = getattr(args, "output_format", "table")
+    
+    # Determine settings.xml path
+    settings_path = None
+    teitok_mode = getattr(args, "teitok", False)
+    
+    if getattr(args, "teitok_settings", None):
+        # Explicit path provided
+        settings_path = Path(args.teitok_settings).expanduser()
+    elif teitok_mode:
+        # --teitok flag: search from current directory
+        # find_settings_xml will prioritize tmp/cqpsettings.xml (merged settings)
+        # over Resources/settings.xml
+        found_path = find_settings_xml(Path.cwd())
+        if found_path:
+            settings_path = found_path
+    elif getattr(args, "corpus", None):
+        found_path = find_settings_xml(Path(args.corpus))
+        if found_path:
+            settings_path = found_path
+    else:
+        # Try to find in current directory
+        found_path = find_settings_xml(Path.cwd())
+        if found_path:
+            settings_path = found_path
+    
+    if not settings_path or not settings_path.exists():
+        print("Error: Could not find settings.xml file.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Options:", file=sys.stderr)
+        print("  --teitok            Enable TEITOK mode (looks for tmp/cqpsettings.xml or ./Resources/settings.xml)", file=sys.stderr)
+        print("  --settings PATH     Specify path to settings.xml", file=sys.stderr)
+        print("  --corpus PATH       Specify corpus directory (will search for settings.xml)", file=sys.stderr)
+        print("  Run from a TEITOK corpus directory (searches Resources/settings.xml)", file=sys.stderr)
+        return 1
+    
+    # Load settings
+    settings = load_teitok_settings(settings_path=settings_path)
+    
+    # Prepare output data
+    output_data = {
+        "settings_path": str(settings_path),
+        "attribute_mappings": settings.attribute_mappings,
+        "default_language": settings.default_language,
+        "cqp_pattributes": settings.cqp_pattributes,
+        "cqp_sattributes": settings.cqp_sattributes,
+        "cqp_sattributes_by_region": settings.cqp_sattributes_by_region,
+        "cqp_sattributes_by_level": settings.cqp_sattributes_by_level,
+        "explicit_flexipipe_mappings": settings.explicit_flexipipe_mappings,
+        "flexipipe_preferences": settings.flexipipe_preferences,
+        "known_tags_only": settings.known_tags_only,
+        "use_raw_text": settings.use_raw_text,
+        "xmlfile_defaults": settings.xmlfile_defaults,
+        "teiheader_defaults": settings.teiheader_defaults,
+    }
+    
+    if output_format == "json":
+        print(json.dumps(output_data, indent=2, ensure_ascii=False), flush=True)
+        return 0
+    
+    # Table format
+    print(f"TEITOK Settings: {settings_path}")
+    # Note if Resources/settings.xml is also being used
+    if settings_path and settings_path.name == "cqpsettings.xml" and "tmp" in settings_path.parts:
+        resources_settings = settings_path.parent.parent / "Resources" / "settings.xml"
+        if resources_settings.exists():
+            print(f"(Also using: {resources_settings})")
+    print("=" * 80)
+    
+    # Attribute mappings (only show with --verbose)
+    verbose = getattr(args, "verbose", False) or getattr(args, "debug", False)
+    if verbose:
+        print("\nAttribute Mappings:")
+        print(f"{'Internal':<15} {'XML Attributes (priority order)':<50}")
+        print("-" * 80)
+        for internal_attr in sorted(settings.attribute_mappings.keys()):
+            xml_attrs = settings.attribute_mappings[internal_attr]
+            print(f"{internal_attr:<15} {', '.join(xml_attrs):<50}")
+    
+    # Show which CQP attributes are recognized and mapped
+    from .teitok_settings import CQP_ATTRIBUTE_MAPPINGS
+    recognized_pattrs = []
+    for pattr in settings.cqp_pattributes:
+        # Skip 'form' - it's the basic surface form attribute, always present
+        if pattr.lower() == "form":
+            recognized_pattrs.append(f"{pattr} (surface form)")
+            continue
+        # Check for explicit flexipipe mapping first (highest priority)
+        if pattr in settings.explicit_flexipipe_mappings:
+            mapped_to = settings.explicit_flexipipe_mappings[pattr]
+            recognized_pattrs.append(f"{pattr} → {mapped_to} (explicit flexipipe mapping)")
+        else:
+            # Check if this pattribute maps to an internal attribute via standard mappings
+            mapped_to = None
+            for cqp_name, internal_name in CQP_ATTRIBUTE_MAPPINGS.items():
+                if pattr.lower() == cqp_name.lower():
+                    mapped_to = internal_name
+                    break
+            if mapped_to:
+                recognized_pattrs.append(f"{pattr} → {mapped_to}")
+            else:
+                # Only show unmapped if verbose
+                if verbose:
+                    recognized_pattrs.append(f"{pattr} (unmapped)")
+    
+    if recognized_pattrs:
+        print("\nRecognized CQP Positional Attributes (mapped to Document attributes):")
+        for mapping in recognized_pattrs:
+            print(f"  {mapping}")
+    
+    # For sattributes, show which ones are recognized and mapped to CoNLL-U standard attributes
+    from .doc import UD_DOCUMENT_ATTRIBUTES, UD_PARAGRAPH_ATTRIBUTES, UD_SENTENCE_ATTRIBUTES
+    
+    # Map TEITOK sattributes to CoNLL-U standard attributes
+    # Common mappings (case-insensitive)
+    CONLLU_MAPPINGS = {
+        "text": {  # document level
+            "title": "title",
+            "author": "author",
+            "date": "date",
+            "genre": "genre",
+            "publisher": "publisher",
+            "url": "url",
+            "license": "license",
+            "source": "source",
+        },
+        "p": {  # paragraph level
+            "section": "section",
+            "align": "align",
+        },
+        "s": {  # sentence level
+            "sent_id": "sent_id",
+            "text": "text",
+            "lang": "lang",
+            "date": "date",
+            "speaker": "speaker",
+            "participant": "participant",
+            "annotator": "annotator",
+            "translation": "translation",
+            "align": "align",
+        },
+    }
+    
+    if settings.cqp_sattributes_by_level:
+        print("\nCQP Structural Attributes (mapped to CoNLL-U standard attributes):")
+        for level in ["text", "p", "s"]:
+            if level in settings.cqp_sattributes_by_level:
+                level_name = {"text": "Document (text)", "p": "Paragraph (p)", "s": "Sentence (s)"}[level]
+                level_mappings = CONLLU_MAPPINGS.get(level, {})
+                print(f"  {level_name} level:")
+                for region_name, attrs in sorted(settings.cqp_sattributes_by_level[level].items()):
+                    mapped_attrs = []
+                    for attr in attrs:
+                        # Check if this maps to a CoNLL-U standard attribute
+                        mapped_to = level_mappings.get(attr.lower())
+                        if mapped_to:
+                            mapped_attrs.append(f"{attr} → {mapped_to}")
+                        else:
+                            mapped_attrs.append(attr)
+                    print(f"    {region_name} - attributes: {', '.join(mapped_attrs)}")
+    elif settings.cqp_sattributes_by_region:
+        print("\nCQP Structural Attributes (document/sentence-level metadata):")
+        for region_name, attrs in sorted(settings.cqp_sattributes_by_region.items()):
+            print(f"  {region_name} - attributes: {', '.join(attrs)}")
+    elif settings.cqp_sattributes:
+        print("\nCQP Structural Attributes (document/sentence-level metadata):")
+        print(f"  {', '.join(settings.cqp_sattributes)}")
+    
+    # Display flexipipe flags
+    flexipipe_flags = []
+    if settings.known_tags_only:
+        flexipipe_flags.append("known-tags-only")
+    if settings.use_raw_text:
+        flexipipe_flags.append("use-raw-text")
+    if flexipipe_flags:
+        print("\nFlexipipe Options:")
+        for flag in flexipipe_flags:
+            print(f"  {flag}: enabled")
+    
+    if settings.flexipipe_preferences:
+        print("\nFlexipipe Preferred Models per Language:")
+        registry_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for lang_key in sorted(settings.flexipipe_preferences.keys()):
+            pref = settings.flexipipe_preferences[lang_key]
+            backend_pref = pref.get("backend")
+            model_pref = pref.get("model")
+            parts = []
+            if backend_pref:
+                parts.append(f"backend={backend_pref}")
+            if model_pref:
+                parts.append(f"model={model_pref}")
+            summary = ", ".join(parts) if parts else "no backend/model specified"
+            registry_note = ""
+            mismatch_note = ""
+            if backend_pref and model_pref:
+                try:
+                    backend_lower = backend_pref.lower()
+                    if backend_lower not in registry_cache:
+                        registry_cache[backend_lower] = get_model_entries(
+                            backend_lower,
+                            use_cache=True,
+                            refresh_cache=False,
+                            verbose=verbose,
+                        )
+                    entry = registry_cache[backend_lower].get(model_pref)
+                    if entry:
+                        query = resolve_language_query(lang_key)
+                        if not language_matches_entry(entry, query, allow_fuzzy=True):
+                            entry_lang = entry.get("language_name") or entry.get("language_iso") or "unknown"
+                            mismatch_note = f" (warning: model language {entry_lang})"
+                    else:
+                        registry_note = " (model not found in registry)"
+                except Exception as exc:
+                    registry_note = f" (registry unavailable: {exc})"
+            elif backend_pref and not model_pref:
+                registry_note = " (missing model)"
+            elif model_pref and not backend_pref:
+                registry_note = " (missing backend)"
+            print(f"  {lang_key}: {summary}{registry_note}{mismatch_note}")
+    
+    # Default language
+    if settings.default_language:
+        print(f"\nDefault Language: {settings.default_language}")
+    else:
+        print("\nDefault Language: (not set)")
+    
+    
+    # XML file defaults
+    if settings.xmlfile_defaults:
+        print("\nXML File Defaults:")
+        for key, value in sorted(settings.xmlfile_defaults.items()):
+            print(f"  {key}: {value}")
+    
+    # TEI header defaults
+    if settings.teiheader_defaults:
+        print("\nTEI Header Defaults:")
+        for key, value in sorted(settings.teiheader_defaults.items()):
+            print(f"  {key}: {value}")
+    
+    # Show note if no CQP attributes found (but mappings may still be built from defaults)
+    if not settings.cqp_pattributes and not settings.cqp_sattributes:
+        print("\nNote: No CQP attributes found in settings.xml. Using default attribute mappings.")
+    
+    return 0
+
+
 def run_info_cli(args: argparse.Namespace) -> int:
     """Run the info subcommand."""
     # Handle --detect-language if provided
@@ -734,7 +986,7 @@ def run_info_cli(args: argparse.Namespace) -> int:
     # Require an action if detect-language not used
     if not hasattr(args, "info_action") or not args.info_action:
         print(
-            "Error: No action specified. Use one of: backends, models, languages, ud-tags, examples, tasks, or --detect-language"
+            "Error: No action specified. Use one of: backends, models, languages, ud-tags, examples, tasks, teitok, or --detect-language"
         )
         return 1
     
@@ -750,6 +1002,8 @@ def run_info_cli(args: argparse.Namespace) -> int:
         return list_examples(args)
     elif args.info_action == "tasks":
         return list_tasks(args)
+    elif args.info_action == "teitok":
+        return list_teitok_settings(args)
     else:
         print(f"Error: Unknown info action '{args.info_action}'")
         return 1

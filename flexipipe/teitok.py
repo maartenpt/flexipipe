@@ -3,7 +3,10 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .teitok_settings import TeitokSettings
 
 from .doc import Document, Sentence, SubToken, Token, Entity
 from .doc_utils import collect_span_entities_by_sentence
@@ -367,10 +370,20 @@ def _load_teitok_with_mappings(
         content = f.read()
         xml_start = content.find("<")
         if xml_start < 0:
-            raise ET.ParseError("No XML content found in file")
+            raise ValueError(f"Invalid XML file {path}: No XML content found")
         # Parse from the XML start
         from io import StringIO
-        tree = ET.parse(StringIO(content[xml_start:]))
+        try:
+            tree = ET.parse(StringIO(content[xml_start:]))
+        except ET.ParseError as e:
+            # Provide helpful error message with file path and line number if available
+            error_msg = f"Invalid XML in file {path}"
+            if hasattr(e, 'position') and e.position:
+                line_num = content[:xml_start + e.position[0]].count('\n') + 1
+                col_num = e.position[1] if len(e.position) > 1 else 0
+                error_msg += f" at line {line_num}, column {col_num}"
+            error_msg += f": {str(e)}"
+            raise ValueError(error_msg) from e
     root = tree.getroot()
     
     # Parse comma-separated attribute lists
@@ -599,17 +612,38 @@ def _load_teitok_with_mappings(
             mod = _get_attr_value_with_fallback(tok_elem, ["mod"])
             trslit = _get_attr_value_with_fallback(tok_elem, ["trslit"])
             ltrslit = _get_attr_value_with_fallback(tok_elem, ["ltrslit"])
-            tokid = _get_attr_value_with_fallback(tok_elem, ["id", "xml:id"])
+            # Prefer id over xml:id (unless source has xml:id)
+            tokid = tok_elem.get("id")
+            if not tokid:
+                tokid = tok_elem.get("{http://www.w3.org/XML/1998/namespace}id") or tok_elem.get("xml:id")
             
-            # Get head, deprel, deps, misc if present
+            # Store all attributes from <tok> element in attrs (except those we use directly)
+            # Initialize early so it's available for head_tokid storage
+            tok_attrs: Dict[str, str] = {}
+            known_attrs = {"form", "lemma", "xpos", "upos", "feats", "reg", "expan", "mod", 
+                          "trslit", "ltrslit", "id", "xml:id", "head", "deprel", "deps", "misc", "tokid"}
+            # Also add all attribute names from the mapping lists
+            known_attrs.update(xpos_attrs)
+            known_attrs.update(reg_attrs)
+            known_attrs.update(expan_attrs)
+            known_attrs.update(lemma_attrs)
+            
+            # Get head, deprel, deps, misc, ord if present
+            # Head in TEITOK is a tokid, not an ord - we'll convert it later if needed
             head_str = tok_elem.get("head", "")
-            head = int(head_str) if head_str and head_str.isdigit() else 0
+            # Try to parse as integer (ord) first, but if it's not a digit, it's a tokid
+            if head_str and head_str.isdigit():
+                head = int(head_str)
+            else:
+                # Head is a tokid - store it in attrs and set head to 0 for now
+                # We'll need to convert tokid to ord after all tokens are loaded
+                head = 0
+                if head_str:
+                    tok_attrs["head_tokid"] = head_str  # Store original tokid for later conversion
             deprel = tok_elem.get("deprel", "")
             deps = tok_elem.get("deps", "")
             misc = tok_elem.get("misc", "")
-            
-            # Store all attributes from <tok> element in attrs (except those we use directly)
-            tok_attrs: Dict[str, str] = {}
+            ord_val = tok_elem.get("ord", "")
             known_attrs = {"form", "lemma", "xpos", "upos", "feats", "reg", "expan", "mod", 
                           "trslit", "ltrslit", "id", "xml:id", "head", "deprel", "deps", "misc", "tokid"}
             # Also add all attribute names from the mapping lists
@@ -620,6 +654,9 @@ def _load_teitok_with_mappings(
             for key, value in tok_elem.attrib.items():
                 if key not in known_attrs:
                     tok_attrs[key] = value
+            # Store ord in attrs if present
+            if ord_val:
+                tok_attrs["ord"] = ord_val
             
             # Parse subtokens (dtok elements)
             subtokens: List[SubToken] = []
@@ -790,6 +827,26 @@ def _load_teitok_with_mappings(
         
         document.sentences.append(sentence)
         sentence_counter += 1
+    
+    # Post-process: convert head from tokid to ord if needed
+    # Build tokid -> ord mapping for all tokens
+    tokid_to_ord: Dict[str, int] = {}
+    for sentence in document.sentences:
+        for token in sentence.tokens:
+            if token.tokid and token.id:
+                tokid_to_ord[token.tokid] = token.id
+    
+    # Convert head from tokid to ord for tokens that have head_tokid in attrs
+    for sentence in document.sentences:
+        for token in sentence.tokens:
+            if "head_tokid" in token.attrs:
+                head_tokid = token.attrs["head_tokid"]
+                head_ord = tokid_to_ord.get(head_tokid, 0)
+                if head_ord > 0:
+                    token.head = head_ord
+                # Remove the temporary head_tokid from attrs
+                del token.attrs["head_tokid"]
+    
     assign_doc_id_from_path(document, path)
     _apply_sentence_correspondence(document)
     return _sanitize_document(document)
@@ -803,6 +860,7 @@ def save_teitok(
     *,
     spaceafter_handling: str = "preserve",
     skip_spaceafter_for_breaking_elements: bool = True,
+    settings: Optional["TeitokSettings"] = None,
 ) -> None:
     """
     Save a Document to a TEITOK XML file.
@@ -828,6 +886,7 @@ def save_teitok(
         pretty_print=pretty_print,
         spaceafter_handling=spaceafter_handling,
         skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking_elements,
+        settings=settings,
     )
     Path(path).write_text(xml_str, encoding="utf-8")
 
@@ -839,6 +898,7 @@ def dump_teitok(
     *,
     spaceafter_handling: str = "preserve",
     skip_spaceafter_for_breaking_elements: bool = True,
+    settings: Optional["TeitokSettings"] = None,
 ) -> str:
     """
     Convert a Document to a TEITOK XML string.
@@ -876,6 +936,8 @@ def dump_teitok(
     if custom_attributes is None:
         custom_attributes = []
     xml_str = _dump_teitok(payload, custom_attributes, pretty_print=False)  # type: ignore
+    if settings:
+        xml_str = _remap_teitok_attributes(xml_str, settings)
     if pretty_print:
         xml_str = pretty_print_teitok_xml(
             xml_str,
@@ -883,6 +945,61 @@ def dump_teitok(
             skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking_elements,
         )
     return xml_str
+
+
+def _remap_teitok_attributes(xml_str: str, settings: "TeitokSettings") -> str:
+    """Rename or drop token attributes according to TEITOK settings."""
+    attr_map = settings.build_output_attribute_map()
+    rename_map = {src: dst for src, dst in attr_map.items() if dst and dst != src}
+    remove_set = {src for src, dst in attr_map.items() if dst is None}
+    if not rename_map and not remove_set:
+        return xml_str
+    
+    use_lxml = False
+    parser = None
+    try:
+        from lxml import etree as etree_mod
+        parser = etree_mod.XMLParser(remove_blank_text=False)
+        root = etree_mod.fromstring(xml_str.encode("utf-8"), parser)
+        use_lxml = True
+        etree = etree_mod
+    except ImportError:
+        import xml.etree.ElementTree as etree_mod
+        etree = etree_mod
+        try:
+            root = etree.fromstring(xml_str)
+        except etree.ParseError:
+            return xml_str
+    except Exception:
+        return xml_str
+    
+    target_tags = {"tok", "dtok"}
+    for elem in root.iter():
+        tag = elem.tag.split("}")[-1]
+        if tag not in target_tags:
+            continue
+        for attr_name in list(elem.attrib.keys()):
+            if attr_name in remove_set:
+                elem.attrib.pop(attr_name, None)
+                continue
+            target = rename_map.get(attr_name)
+            if target:
+                if target == attr_name:
+                    continue
+                value = elem.attrib.pop(attr_name)
+                elem.set(target, value)
+    
+    updated = etree.tostring(
+        root,
+        encoding="unicode",
+        pretty_print=False if use_lxml else None,
+    )
+    
+    if xml_str.startswith("<?xml"):
+        prefix, _, remainder = xml_str.partition("?>")
+        newline = "\n" if remainder.startswith("\n") else ""
+        return f"{prefix}?>{newline}{updated.lstrip()}"
+    return updated
 
 
 def pretty_print_teitok_xml(
@@ -1002,7 +1119,13 @@ def pretty_print_teitok_xml(
     return updated
 
 
-def update_teitok(document: Document, original_path: str, output_path: Optional[str] = None) -> None:
+def update_teitok(
+    document: Document,
+    original_path: str,
+    output_path: Optional[str] = None,
+    *,
+    settings: Optional["TeitokSettings"] = None,
+) -> None:
     """
     Update a TEITOK XML file in-place by matching nodes by ID and updating annotation attributes.
     
@@ -1014,6 +1137,7 @@ def update_teitok(document: Document, original_path: str, output_path: Optional[
         document: Tagged Document with updated annotations
         original_path: Path to the original TEITOK XML file
         output_path: Optional output path (defaults to original_path for in-place update)
+        settings: Optional TeitokSettings object to control attribute mappings
     """
     try:
         from lxml import etree as ET
@@ -1055,6 +1179,22 @@ def update_teitok(document: Document, original_path: str, output_path: Optional[
             return node.getparent()
         return parent_map.get(node)
     
+    def _attribute_aliases(internal_attr: str) -> List[str]:
+        if settings:
+            aliases = settings.get_attribute_mapping(internal_attr)
+        else:
+            aliases = [internal_attr]
+        ordered: List[str] = []
+        for alias in aliases + [internal_attr]:
+            if alias and alias not in ordered:
+                ordered.append(alias)
+        return ordered
+    
+    def _resolve_attr_name(internal_attr: str) -> Optional[str]:
+        if settings:
+            return settings.resolve_xml_attribute(internal_attr, default=internal_attr)
+        return internal_attr
+    
     # Find all <s>, <tok>, and <dtok> nodes
     # Handle both namespaced and non-namespaced elements
     for s_node in root.iter():
@@ -1074,20 +1214,32 @@ def update_teitok(document: Document, original_path: str, output_path: Optional[
                         s_node.set("id", sent_id)
                         sentid_to_node[sent_id] = s_node
     
+    # First pass: collect all tokens in document order for continuous numbering
+    all_tok_nodes: List[ET.Element] = []
     for tok_node in root.iter():
         if tok_node.tag.endswith("}tok") or tok_node.tag == "tok":
-            tokid = tok_node.get("{http://www.w3.org/XML/1998/namespace}id") or tok_node.get("id")
-            if not tokid:
-                # Generate ID if missing
-                parent = get_parent(tok_node)
-                if parent is not None:
-                    siblings = [c for c in parent if (c.tag.endswith("}tok") or c.tag == "tok")]
-                    if tok_node in siblings:
-                        idx = siblings.index(tok_node) + 1
-                        tokid = f"w-{idx}"
-                        tok_node.set("{http://www.w3.org/XML/1998/namespace}id", tokid)
-            if tokid:
-                tokid_to_node[tokid] = tok_node
+            all_tok_nodes.append(tok_node)
+    
+    # Second pass: assign IDs and build mapping
+    # Preserve existing IDs, only generate new ones if missing
+    # Prefer id over xml:id when reading
+    global_token_counter = 1
+    for tok_node in all_tok_nodes:
+        tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
+        if not tokid:
+            # Generate ID with continuous numbering across all sentences
+            # Prefer id over xml:id when writing
+            tokid = f"w-{global_token_counter}"
+            tok_node.set("id", tokid)
+        elif tok_node.get("{http://www.w3.org/XML/1998/namespace}id") and not tok_node.get("id"):
+            # Has xml:id but not id - move to id (prefer id over xml:id)
+            xml_id = tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
+            tok_node.set("id", xml_id)
+            del tok_node.attrib["{http://www.w3.org/XML/1998/namespace}id"]
+            tokid = xml_id
+        if tokid:
+            tokid_to_node[tokid] = tok_node
+        global_token_counter += 1
     
     for dtok_node in root.iter():
         if dtok_node.tag.endswith("}dtok") or dtok_node.tag == "dtok":
@@ -1110,15 +1262,144 @@ def update_teitok(document: Document, original_path: str, output_path: Optional[
     
     # Update nodes from tagged Document
     sanitized = _sanitize_document(document)
+    matched_tokens = 0
+    skipped_tokens = 0
+    matched_sentences = 0
+    skipped_sentences = 0
+    
+    # Build list of sentence nodes in order for position-based matching
+    sentence_nodes_ordered = []
+    for s_node in root.iter():
+        if s_node.tag.endswith("}s") or s_node.tag == "s":
+            sentence_nodes_ordered.append(s_node)
+    
+    # Build global ord_to_tokid mapping by matching all tokens to XML nodes
+    # This is needed to convert head from ord to tokid (head can point across sentences)
+    # First, ensure ALL tokens have tokids assigned (even if no XML node yet)
+    global_ord_to_tokid: Dict[int, str] = {}
+    # Use (sent_idx, token_idx) as key instead of Token object (Token is not hashable)
+    global_token_to_tok_node: Dict[Tuple[int, int], ET.Element] = {}
+    global_tokid_counter = 1  # For continuous numbering when generating new tokids
+    
+    # First, count existing tokids to get the starting counter
+    for existing_tokid in tokid_to_node.keys():
+        if existing_tokid.startswith("w-"):
+            try:
+                num = int(existing_tokid[2:])
+                global_tokid_counter = max(global_tokid_counter, num + 1)
+            except ValueError:
+                pass
+    
+    # Pre-assign tokids to all tokens that don't have them yet
     for sent in sanitized.sentences:
-        sent_id = sent.sent_id or sent.id
-        if not sent_id:
-            continue
+        for token in sent.tokens:
+            if token.id and not token.tokid:
+                # Generate tokid for token that doesn't have one yet
+                token.tokid = f"w-{global_tokid_counter}"
+                global_tokid_counter += 1
+            # Build initial mapping
+            if token.id and token.tokid:
+                global_ord_to_tokid[token.id] = token.tokid
+    
+    for sent_idx, sent in enumerate(sanitized.sentences):
+        sent_id = sent.sent_id or sent.id or sent.source_id
+        s_node = None
         
-        s_node = sentid_to_node.get(sent_id)
+        # Try exact match first
+        if sent_id:
+            s_node = sentid_to_node.get(sent_id)
+        
+        # If exact match failed, try position-based matching
+        if s_node is None and sent_idx < len(sentence_nodes_ordered):
+            s_node = sentence_nodes_ordered[sent_idx]
+        
+        if s_node is None:
+            continue  # Skip for now, will handle in main loop
+        
+        # Match tokens to XML nodes and build mapping
+        # Only get direct <tok> children, not all descendants (performance optimization)
+        sent_tok_nodes = [n for n in s_node if (n.tag.endswith("}tok") or n.tag == "tok")]
+        for token_idx, token in enumerate(sent.tokens):
+            if not token.id:
+                continue
+            
+            # Try to find matching XML node
+            tok_node = None
+            if token.tokid:
+                tok_node = tokid_to_node.get(token.tokid)
+            
+            # If not found, try position-based matching
+            if tok_node is None and token_idx < len(sent_tok_nodes):
+                tok_node = sent_tok_nodes[token_idx]
+            
+            if tok_node is not None:
+                global_token_to_tok_node[(sent_idx, token_idx)] = tok_node
+                # Get tokid from XML node (prefer id over xml:id)
+                node_tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
+                if node_tokid:
+                    # Update token's tokid to match XML
+                    token.tokid = node_tokid
+                    global_ord_to_tokid[token.id] = node_tokid
+                elif token.tokid:
+                    # Token has tokid but XML doesn't - assign it to XML
+                    tok_node.set("id", token.tokid)
+                    tokid_to_node[token.tokid] = tok_node
+                    global_ord_to_tokid[token.id] = token.tokid
+                elif token.id:
+                    # Generate tokid using continuous numbering
+                    new_tokid = f"w-{global_tokid_counter}"
+                    global_tokid_counter += 1
+                    token.tokid = new_tokid
+                    tok_node.set("id", new_tokid)
+                    tokid_to_node[new_tokid] = tok_node
+                    global_ord_to_tokid[token.id] = new_tokid
+            elif token.id:
+                # Token has no matching XML node yet - still assign tokid for mapping
+                if not token.tokid:
+                    new_tokid = f"w-{global_tokid_counter}"
+                    global_tokid_counter += 1
+                    token.tokid = new_tokid
+                global_ord_to_tokid[token.id] = token.tokid
+    
+    # Final pass: ensure ALL tokens are in the mapping (even if they weren't matched to XML nodes)
+    # Also build reverse mapping (ord -> token) for efficient head lookup
+    ord_to_token: Dict[int, Token] = {}
+    for sent in sanitized.sentences:
+        for token in sent.tokens:
+            if token.id:
+                ord_to_token[token.id] = token
+                if token.id not in global_ord_to_tokid:
+                    # Token not in mapping - ensure it has a tokid and add it
+                    if not token.tokid:
+                        token.tokid = f"w-{global_tokid_counter}"
+                        global_tokid_counter += 1
+                    global_ord_to_tokid[token.id] = token.tokid
+    
+    # Now process sentences for updates
+    for sent_idx, sent in enumerate(sanitized.sentences):
+        sent_id = sent.sent_id or sent.id or sent.source_id
+        s_node = None
+        
+        # Try exact match first
+        if sent_id:
+            s_node = sentid_to_node.get(sent_id)
+        
+        # If exact match failed, try position-based matching
+        if s_node is None and sent_idx < len(sentence_nodes_ordered):
+            s_node = sentence_nodes_ordered[sent_idx]
+        
         if s_node is None:
             # Sentence not found - skip
+            skipped_sentences += 1
             continue
+        matched_sentences += 1
+        
+        # Ensure sentence has an ID - assign one if missing
+        if not s_node.get("id") and not s_node.get("{http://www.w3.org/XML/1998/namespace}id"):
+            # Generate sentence ID
+            sent_id = f"s{sent_idx + 1}"
+            s_node.set("id", sent_id)
+            sentid_to_node[sent_id] = s_node
         
         # Update sentence-level attributes if needed
         if sent.text and not s_node.get("text"):
@@ -1126,31 +1407,85 @@ def update_teitok(document: Document, original_path: str, output_path: Optional[
         if sent.corr and not s_node.get("corr"):
             s_node.set("corr", sent.corr)
         
-        # Update tokens
-        for token in sent.tokens:
-            tokid = token.tokid
-            if not tokid:
-                # Try to generate tokid from token.id
-                tokid = f"w-{token.id}"
-            
-            tok_node = tokid_to_node.get(tokid)
+        # Update tokens using pre-built mapping
+        for token_idx, token in enumerate(sent.tokens):
+            tok_node = global_token_to_tok_node.get((sent_idx, token_idx))
             if tok_node is None:
-                # Token not found - skip
+                skipped_tokens += 1
+                # Debug output for mismatched tokens
+                import sys
+                sent_id_str = sent.sent_id or sent.id or sent.source_id or f"s{sent_idx+1}"
+                print(f"[flexipipe] update_teitok: Token mismatch - sent {sent_idx+1} (id={sent_id_str}), token {token_idx+1} (ord={token.id}, tokid={token.tokid}, form='{token.form}') has no matching XML node", file=sys.stderr)
                 continue
+            matched_tokens += 1
             
             # Update token attributes
-            def _set_attr(node: ET.Element, attr: str, value: str, default_empty: bool = False) -> None:
-                """Set attribute if value is non-empty or default_empty is True."""
+            def _set_attr(node: ET.Element, internal_attr: str, value: str, default_empty: bool = False) -> None:
+                """Set attribute respecting TEITOK mappings."""
+                target_attr = _resolve_attr_name(internal_attr)
+                aliases = _attribute_aliases(internal_attr)
+                
+                if target_attr is None:
+                    for alias in aliases:
+                        node.attrib.pop(alias, None)
+                    return
                 if value and value != "_":
-                    node.set(attr, value)
-                elif default_empty and not value:
-                    # Remove attribute if it exists and we're setting to empty
-                    if attr in node.attrib:
-                        del node.attrib[attr]
+                    node.set(target_attr, value)
+                    for alias in aliases:
+                        if alias != target_attr:
+                            node.attrib.pop(alias, None)
+                elif default_empty:
+                    for alias in aliases:
+                        node.attrib.pop(alias, None)
+                elif target_attr != internal_attr:
+                    for alias in aliases:
+                        if alias != target_attr:
+                            node.attrib.pop(alias, None)
             
-            # Update form if it changed (shouldn't normally, but handle it)
-            if token.form and token.form != tok_node.get("form"):
-                tok_node.set("form", token.form)
+            # Update form - only write @form if it differs from inner XML text
+            # This avoids redundancy when form matches the element content
+            inner_text = (tok_node.text or "").strip()
+            # Check if element has children (if so, form might differ from inner text)
+            has_children = len(tok_node) > 0
+            # Only write @form if it's different from inner text or if there are children
+            if token.form:
+                if has_children or token.form != inner_text:
+                    tok_node.set("form", token.form)
+                elif tok_node.get("form") and token.form == inner_text:
+                    # Remove @form if it matches inner text and there are no children
+                    tok_node.attrib.pop("form", None)
+            
+            # Set ord attribute (CoNLL-U ordinal number) - use _set_attr to respect known_tags_only
+            ord_val = token.attrs.get("ord") or (str(token.id) if token.id else "")
+            if ord_val:
+                _set_attr(tok_node, "ord", ord_val)
+            
+            # Ensure tokid is preserved in the XML
+            # Prefer id over xml:id when writing (unless source explicitly had xml:id and not id)
+            if token.tokid:
+                current_tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
+                # Check if original XML had xml:id but not id (preserve that preference)
+                has_xml_id = "{http://www.w3.org/XML/1998/namespace}id" in tok_node.attrib
+                has_id = "id" in tok_node.attrib
+                original_had_xml_id_only = has_xml_id and not has_id
+                
+                if current_tokid != token.tokid or (has_xml_id and not has_id and not original_had_xml_id_only):
+                    # Update XML ID to match token's tokid
+                    # Prefer id over xml:id, unless original had xml:id only
+                    if original_had_xml_id_only:
+                        # Original had xml:id only, preserve that
+                        tok_node.set("{http://www.w3.org/XML/1998/namespace}id", token.tokid)
+                        if "id" in tok_node.attrib:
+                            del tok_node.attrib["id"]
+                    else:
+                        # Prefer id over xml:id
+                        tok_node.set("id", token.tokid)
+                        if "{http://www.w3.org/XML/1998/namespace}id" in tok_node.attrib:
+                            del tok_node.attrib["{http://www.w3.org/XML/1998/namespace}id"]
+                    # Update mapping if tokid changed
+                    if current_tokid and current_tokid in tokid_to_node and current_tokid != token.tokid:
+                        del tokid_to_node[current_tokid]
+                    tokid_to_node[token.tokid] = tok_node
             
             # For MWT tokens, update the <tok> element but annotations go on <dtok>
             if token.is_mwt and token.subtokens:
@@ -1162,46 +1497,195 @@ def update_teitok(document: Document, original_path: str, output_path: Optional[
                 _set_attr(tok_node, "ltrslit", token.ltrslit)
                 _set_attr(tok_node, "feats", token.feats)
                 
-                # Update <dtok> children
+                # Get the actual XML node's ID to use as base for dtok IDs (not token.tokid)
+                parent_tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
+                if not parent_tokid:
+                    # Fallback to token.tokid if XML node has no ID
+                    parent_tokid = token.tokid or f"w-{token.id}"
+                    # Set it on the XML node
+                    tok_node.set("id", parent_tokid)
+                
+                # Extract base tokid (remove any existing -dtok or . suffix)
+                base_tokid = parent_tokid
+                if "-dtok" in base_tokid:
+                    # Old format like w-30-dtok2, extract just w-30
+                    base_tokid = base_tokid.split("-dtok")[0]
+                elif "." in base_tokid:
+                    # Already has a dot, extract base (e.g., w-30.1 -> w-30)
+                    base_tokid = base_tokid.split(".")[0]
+                
+                # Update <dtok> children - create new ones if needed
                 dtok_nodes = [c for c in tok_node if (c.tag.endswith("}dtok") or c.tag == "dtok")]
                 for idx, subtoken in enumerate(token.subtokens):
+                    # Create dtok node if it doesn't exist
                     if idx < len(dtok_nodes):
                         dtok_node = dtok_nodes[idx]
-                        dtok_tokid = subtoken.tokid or f"{tokid}-dtok{idx+1}"
-                        if dtok_tokid not in tokid_to_node:
-                            # Ensure dtok has ID
+                    else:
+                        # Create new dtok element
+                        dtok_node = ET.Element("dtok")
+                        tok_node.append(dtok_node)
+                    
+                    # Generate dtok ID in format w-30.1, w-30.2 (always from parent XML node's ID)
+                    dtok_tokid = f"{base_tokid}.{idx+1}"
+                    
+                    # Check for duplicate IDs and resolve them
+                    if dtok_tokid in tokid_to_node and tokid_to_node[dtok_tokid] is not dtok_node:
+                        # Duplicate ID found - modify this one
+                        # Try appending a suffix until we find a unique ID
+                        suffix = 1
+                        while f"{base_tokid}.{idx+1}.{suffix}" in tokid_to_node:
+                            suffix += 1
+                        dtok_tokid = f"{base_tokid}.{idx+1}.{suffix}"
+                    
+                    # Always ensure dtok has the correct ID (prefer id over xml:id)
+                    # Remove old ID from mapping if it exists (even if it's the old format)
+                    current_dtok_id = dtok_node.get("id") or dtok_node.get("{http://www.w3.org/XML/1998/namespace}id")
+                    if current_dtok_id and current_dtok_id != dtok_tokid:
+                        if current_dtok_id in tokid_to_node and tokid_to_node[current_dtok_id] is dtok_node:
+                            del tokid_to_node[current_dtok_id]
+                        # Set new ID (prefer id over xml:id)
+                        if dtok_node.get("{http://www.w3.org/XML/1998/namespace}id") and not dtok_node.get("id"):
                             dtok_node.set("{http://www.w3.org/XML/1998/namespace}id", dtok_tokid)
-                            tokid_to_node[dtok_tokid] = dtok_node
+                        else:
+                            dtok_node.set("id", dtok_tokid)
+                    elif not current_dtok_id:
+                        # No existing ID, set it
+                        dtok_node.set("id", dtok_tokid)
+                    # Always update mapping with new format
+                    tokid_to_node[dtok_tokid] = dtok_node
+                    
+                    # Check both direct fields and attrs dict (backends may store in either)
+                    dtok_lemma = subtoken.lemma or subtoken.attrs.get("lemma", "")
+                    dtok_xpos = subtoken.xpos or subtoken.attrs.get("xpos", "")
+                    dtok_upos = subtoken.upos or subtoken.attrs.get("upos", "")
+                    dtok_feats = subtoken.feats or subtoken.attrs.get("feats", "")
+                    # SubToken doesn't have deprel/deps directly, only in attrs
+                    dtok_deprel = subtoken.attrs.get("deprel", "")
+                    dtok_deps = subtoken.attrs.get("deps", "")
+                    
+                    # Always set form (required for dtok)
+                    _set_attr(dtok_node, "form", subtoken.form)
+                    _set_attr(dtok_node, "lemma", dtok_lemma, default_empty=True)
+                    _set_attr(dtok_node, "xpos", dtok_xpos)
+                    _set_attr(dtok_node, "upos", dtok_upos)
+                    _set_attr(dtok_node, "feats", dtok_feats)
+                    _set_attr(dtok_node, "reg", subtoken.reg)
+                    _set_attr(dtok_node, "expan", subtoken.expan)
+                    _set_attr(dtok_node, "mod", subtoken.mod)
+                    _set_attr(dtok_node, "trslit", subtoken.trslit)
+                    _set_attr(dtok_node, "ltrslit", subtoken.ltrslit)
+                    
+                    # Set head and deprel on dtok (convert head from ord to tokid)
+                    # SubToken doesn't have head directly, check attrs
+                    dtok_head_int = 0
+                    if "head" in subtoken.attrs:
+                        head_attr = subtoken.attrs["head"]
+                        if isinstance(head_attr, int):
+                            dtok_head_int = head_attr
+                        elif isinstance(head_attr, str):
+                            try:
+                                dtok_head_int = int(head_attr)
+                            except (ValueError, TypeError):
+                                dtok_head_int = 0
+                    
+                    if dtok_head_int > 0:
+                        # Convert from ord to tokid using global mapping
+                        dtok_head_tokid = global_ord_to_tokid.get(dtok_head_int)
+                        if not dtok_head_tokid:
+                            # Fallback: use reverse mapping for efficient lookup
+                            dtok_head_token = ord_to_token.get(dtok_head_int)
+                            if dtok_head_token and dtok_head_token.tokid:
+                                dtok_head_tokid = dtok_head_token.tokid
+                                global_ord_to_tokid[dtok_head_int] = dtok_head_tokid
                         
-                        _set_attr(dtok_node, "form", subtoken.form)
-                        _set_attr(dtok_node, "lemma", subtoken.lemma, default_empty=True)
-                        _set_attr(dtok_node, "xpos", subtoken.xpos)
-                        _set_attr(dtok_node, "upos", subtoken.upos)
-                        _set_attr(dtok_node, "feats", subtoken.feats)
-                        _set_attr(dtok_node, "reg", subtoken.reg)
-                        _set_attr(dtok_node, "expan", subtoken.expan)
-                        _set_attr(dtok_node, "mod", subtoken.mod)
-                        _set_attr(dtok_node, "trslit", subtoken.trslit)
-                        _set_attr(dtok_node, "ltrslit", subtoken.ltrslit)
+                        if dtok_head_tokid:
+                            _set_attr(dtok_node, "head", dtok_head_tokid)
+                        else:
+                            # Last resort: use ord if tokid not found (shouldn't happen)
+                            _set_attr(dtok_node, "head", str(dtok_head_int))
+                    
+                    if dtok_deprel:
+                        _set_attr(dtok_node, "deprel", dtok_deprel)
+                    if dtok_deps:
+                        _set_attr(dtok_node, "deps", dtok_deps)
             else:
                 # Non-MWT token - update all attributes on <tok>
-                _set_attr(tok_node, "lemma", token.lemma, default_empty=True)
-                _set_attr(tok_node, "xpos", token.xpos)
-                _set_attr(tok_node, "upos", token.upos)
-                _set_attr(tok_node, "feats", token.feats)
+                # Check both direct fields and attrs dict (backends may store in either)
+                lemma_val = token.lemma or token.attrs.get("lemma", "")
+                xpos_val = token.xpos or token.attrs.get("xpos", "")
+                upos_val = token.upos or token.attrs.get("upos", "")
+                feats_val = token.feats or token.attrs.get("feats", "")
+                deprel_val = token.deprel or token.attrs.get("deprel", "")
+                deps_val = token.deps or token.attrs.get("deps", "")
+                misc_val = token.misc or token.attrs.get("misc", "")
+                
+                _set_attr(tok_node, "lemma", lemma_val, default_empty=True)
+                _set_attr(tok_node, "xpos", xpos_val)
+                _set_attr(tok_node, "upos", upos_val)
+                _set_attr(tok_node, "feats", feats_val)
                 _set_attr(tok_node, "reg", token.reg)
                 _set_attr(tok_node, "expan", token.expan)
                 _set_attr(tok_node, "mod", token.mod)
                 _set_attr(tok_node, "trslit", token.trslit)
                 _set_attr(tok_node, "ltrslit", token.ltrslit)
-            
-            # Update dependency attributes if present
-            if token.head > 0:
-                tok_node.set("head", str(token.head))
-            if token.deprel:
-                tok_node.set("deprel", token.deprel)
-            if token.deps:
-                tok_node.set("deps", token.deps)
+                
+                # Update dependency attributes if present
+                # Handle head value - convert from ord (CoNLL-U) to tokid (TEITOK)
+                # CoNLL-U head refers to ord (token.id), but TEITOK @head should be tokid
+                head_int = token.head
+                if head_int == 0 and "head" in token.attrs:
+                    head_attr = token.attrs["head"]
+                    if isinstance(head_attr, int):
+                        head_int = head_attr
+                    elif isinstance(head_attr, str):
+                        try:
+                            head_int = int(head_attr)
+                        except (ValueError, TypeError):
+                            head_int = 0
+                
+                if head_int > 0:
+                    # Convert from ord to tokid using global mapping
+                    head_tokid = global_ord_to_tokid.get(head_int)
+                    if not head_tokid:
+                        # Fallback: use reverse mapping for efficient lookup
+                        head_token = ord_to_token.get(head_int)
+                        if head_token and head_token.tokid:
+                            head_tokid = head_token.tokid
+                            # Update mapping for future use
+                            global_ord_to_tokid[head_int] = head_tokid
+                    
+                    if head_tokid:
+                        _set_attr(tok_node, "head", head_tokid)
+                    else:
+                        # Last resort: use ord if tokid not found (shouldn't happen)
+                        _set_attr(tok_node, "head", str(head_int))
+                else:
+                    _set_attr(tok_node, "head", "", default_empty=True)
+                if deprel_val:
+                    _set_attr(tok_node, "deprel", deprel_val)
+                else:
+                    _set_attr(tok_node, "deprel", "", default_empty=True)
+                if deps_val:
+                    _set_attr(tok_node, "deps", deps_val)
+                else:
+                    _set_attr(tok_node, "deps", "", default_empty=True)
+                if misc_val:
+                    _set_attr(tok_node, "misc", misc_val)
+    
+    # Debug: print summary if there were issues
+    if skipped_tokens > 0 or skipped_sentences > 0:
+        import sys
+        total_sentences = matched_sentences + skipped_sentences
+        total_tokens = matched_tokens + skipped_tokens
+        if skipped_sentences > 0:
+            # Show what IDs we have vs what we're looking for
+            doc_sent_ids = [f"{s.sent_id or s.id or s.source_id or 'NO_ID'}" for s in sanitized.sentences]
+            xml_sent_ids = list(sentid_to_node.keys())
+            print(f"[flexipipe] update_teitok: matched {matched_sentences}/{total_sentences} sentences, {skipped_sentences} skipped", file=sys.stderr)
+            print(f"[flexipipe] Document sentence IDs: {doc_sent_ids}", file=sys.stderr)
+            print(f"[flexipipe] XML sentence IDs: {xml_sent_ids}", file=sys.stderr)
+        if skipped_tokens > 0:
+            print(f"[flexipipe] update_teitok: matched {matched_tokens}/{total_tokens} tokens, {skipped_tokens} skipped (ID mismatch)", file=sys.stderr)
     
     # Write updated XML
     if preserve_comments:

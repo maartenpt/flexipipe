@@ -78,6 +78,7 @@ from .language_detector_registry import (
 from .lexicon import convert_lexicon_to_vocab
 from .io_registry import registry as io_registry
 from .doc_utils import document_to_json_payload
+from .teitok_settings import TeitokSettings
 from .backends.flexitag import (
     build_flexitag_options_from_args,
     get_flexitag_model_entries,
@@ -148,6 +149,49 @@ def _propagate_sentence_metadata(target: Document, source: Document) -> None:
             tgt_sent.source_id = src_source_id
         if src_sent.sent_id:
             tgt_sent.sent_id = src_sent.sent_id
+
+
+def _propagate_token_ids(target: Document, source: Document) -> None:
+    """Copy original token IDs (tokid) into the tagged document when possible.
+    
+    This is crucial for TEITOK writeback, as the tokid is used to match tokens
+    in the XML. Tokens are matched by position and form similarity.
+    """
+    if not source.sentences or not target.sentences:
+        return
+    if len(target.sentences) != len(source.sentences):
+        return
+    
+    propagated_count = 0
+    for tgt_sent, src_sent in zip(target.sentences, source.sentences):
+        if not src_sent.tokens or not tgt_sent.tokens:
+            continue
+        
+        # Simple 1:1 alignment by position (most backends preserve token order)
+        # For most cases, tokens align directly
+        min_len = min(len(src_sent.tokens), len(tgt_sent.tokens))
+        for i in range(min_len):
+            src_tok = src_sent.tokens[i]
+            tgt_tok = tgt_sent.tokens[i]
+            
+            # If source token has a tokid, propagate it (even if target already has one)
+            # This ensures we preserve the original XML IDs
+            if src_tok.tokid:
+                # For regular tokens, propagate directly
+                if not src_tok.is_mwt and not tgt_tok.is_mwt:
+                    if not tgt_tok.tokid or tgt_tok.tokid != src_tok.tokid:
+                        tgt_tok.tokid = src_tok.tokid
+                        propagated_count += 1
+                # For MWTs, propagate parent tokid and subtoken tokids
+                elif src_tok.is_mwt and tgt_tok.is_mwt:
+                    if not tgt_tok.tokid or tgt_tok.tokid != src_tok.tokid:
+                        tgt_tok.tokid = src_tok.tokid
+                        propagated_count += 1
+                    if src_tok.subtokens and tgt_tok.subtokens:
+                        for src_sub, tgt_sub in zip(src_tok.subtokens, tgt_tok.subtokens):
+                            if src_sub.tokid and (not tgt_sub.tokid or tgt_sub.tokid != src_sub.tokid):
+                                tgt_sub.tokid = src_sub.tokid
+                                propagated_count += 1
 
 
 def _detect_performed_tasks(document: Document) -> set[str]:
@@ -1277,6 +1321,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m flexipipe",
         description="Flexipipe pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        allow_abbrev=False,  # Disable prefix matching to prevent --teitok from matching --teitok-settings
     )
     parser.add_argument(
         "--version",
@@ -1304,7 +1349,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="task", required=False)
     
     # Create a parent parser with common arguments that all subcommands inherit
-    parent_parser = argparse.ArgumentParser(add_help=False)
+    parent_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parent_parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging and show execution timing")
     parent_parser.add_argument("--verbose", action="store_true", help="Print high-level progress messages")
     
@@ -1389,6 +1434,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--pretokenize",
         action="store_true",
         help="Segment and tokenize raw input locally before sending to the backend",
+    )
+    process_parser.add_argument(
+        "--use-raw-text",
+        action="store_true",
+        help="Force backend to process raw text instead of pre-tokenized input (useful for UDPipe to retokenize)",
     )
     process_parser.add_argument(
         "--endpoint-url",
@@ -1571,10 +1621,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include <note> elements in extracted text when using --tokenize (default: exclude notes).",
     )
     process_parser.add_argument(
+        "--teitok",
+        action="store_true",
+        help="Enable TEITOK mode: automatically load settings from tmp/cqpsettings.xml (merged shared+local) or ./Resources/settings.xml. Auto-enables writeback if settings.xml is found. Use --teitok-settings to specify a custom path.",
+    )
+    process_parser.add_argument(
         "--teitok-settings",
         type=str,
         metavar="PATH",
-        help="Path to TEITOK settings.xml file. If not specified, flexipipe will search for settings.xml in the corpus directory and parent directories. Settings.xml provides attribute mappings, default language, and other corpus-specific configuration.",
+        help="Path to TEITOK settings.xml file. If not specified and --teitok is used, flexipipe will look for tmp/cqpsettings.xml (merged shared+local) or ./Resources/settings.xml. Otherwise, it will search for settings.xml in the corpus directory and parent directories. Settings.xml provides attribute mappings, default language, and other corpus-specific configuration.",
+    )
+    process_parser.add_argument(
+        "--known-tags-only",
+        action="store_true",
+        help="When writing TEITOK XML, only write attributes that are explicitly defined in the TEITOK settings. Attributes not in the settings will be omitted.",
+    )
+    process_parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Test writeback mode: render TEITOK XML using writeback logic but emit to stdout without modifying files.",
+    )
+    process_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Alias for --test (dry-run writeback without modifying files).",
     )
     process_parser.add_argument(
         "--validate",
@@ -1819,6 +1889,37 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[parent_parser],
     )
     tasks_parser.add_argument(
+        "--output-format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table). Use 'json' for machine-readable output.",
+    )
+    
+    # info teitok
+    teitok_parser = info_subparsers.add_parser(
+        "teitok",
+        help="Display TEITOK settings.xml configuration (attribute mappings, language, etc.)",
+        parents=[parent_parser],
+    )
+    teitok_parser.add_argument(
+        "--teitok",
+        action="store_true",
+        help="Enable TEITOK mode: automatically load settings from ./Resources/settings.xml (or search for settings.xml). Use --settings to specify a custom path.",
+    )
+    teitok_parser.add_argument(
+        "--settings",
+        dest="teitok_settings",
+        type=str,
+        metavar="PATH",
+        help="Path to settings.xml file. If not specified and --teitok is used, looks for tmp/cqpsettings.xml (merged shared+local) or ./Resources/settings.xml. Otherwise, searches for settings.xml in the current directory and parent directories.",
+    )
+    teitok_parser.add_argument(
+        "--corpus",
+        type=str,
+        metavar="PATH",
+        help="Path to TEITOK corpus directory or XML file (used to search for settings.xml)",
+    )
+    teitok_parser.add_argument(
         "--output-format",
         choices=["table", "json"],
         default="table",
@@ -2370,9 +2471,20 @@ def _load_and_merge_teitok_settings(
     
     # Determine settings.xml path
     settings_path = None
+    teitok_mode = getattr(args, "teitok", False)
+    
     if getattr(args, "teitok_settings", None):
+        # Explicit path provided
         settings_path = Path(args.teitok_settings).expanduser()
+    elif teitok_mode:
+        # --teitok flag: search from current directory
+        # find_settings_xml will prioritize tmp/cqpsettings.xml (merged settings)
+        # over Resources/settings.xml
+        found_path = find_settings_xml(Path.cwd())
+        if found_path:
+            settings_path = found_path
     elif input_path:
+        # Search from input file location
         found_path = find_settings_xml(Path(input_path))
         if found_path:
             settings_path = found_path
@@ -2381,8 +2493,17 @@ def _load_and_merge_teitok_settings(
     settings = None
     if settings_path:
         settings = load_teitok_settings(settings_path=settings_path)
-        if args.verbose or args.debug:
-            print(f"[flexipipe] Loaded TEITOK settings from {settings_path}", file=sys.stderr)
+        # Apply --known-tags-only flag if specified (overrides settings.xml)
+        if getattr(args, "known_tags_only", False):
+            settings.known_tags_only = True
+        # Only report success if settings.xml actually exists and was loaded
+        if settings.settings_path and settings.settings_path.exists():
+            if args.verbose or args.debug:
+                print(f"[flexipipe] Loaded TEITOK settings from {settings.settings_path}", file=sys.stderr)
+        elif teitok_mode:
+            # --teitok was used but settings.xml not found
+            if args.verbose or args.debug:
+                print(f"[flexipipe] --teitok flag used but settings.xml not found at {settings_path}", file=sys.stderr)
     
     # Parse CLI attribute mappings
     cli_attrs_map = _parse_attrs_map(getattr(args, "attrs_map", None))
@@ -2856,9 +2977,9 @@ def run_tag(args: argparse.Namespace) -> int:
         if default_backend:
             args.backend = default_backend
             backend_type = default_backend
-            setattr(args, "_backend_explicit", True)
     
     auto_selected = False
+    teitok_settings_obj: Optional[TeitokSettings] = None
 
     try:
         requested_tasks = _parse_tasks_argument(getattr(args, "tasks", None))
@@ -2872,6 +2993,13 @@ def run_tag(args: argparse.Namespace) -> int:
             print(f"[flexipipe] Always including mandatory tasks: {missing_list}")
         requested_tasks.update(mandatory_missing)
     
+    test_requested = bool(getattr(args, "test", False) or getattr(args, "dry_run", False))
+    args.test = test_requested
+    language_arg = getattr(args, "language", None)
+    if isinstance(language_arg, str) and language_arg.strip().lower() == "auto":
+        args.language = None
+    output_explicit = args.output_format is not None
+    writeback_explicit = args.writeback is not None
     if args.output_format is None:
         default_output_format = get_default_output_format()
         args.output_format = default_output_format if default_output_format else "teitok"
@@ -2986,6 +3114,14 @@ def run_tag(args: argparse.Namespace) -> int:
     input_entry = None
     if not inline_data_text:
         input_entry = io_registry.get_input(input_format)
+
+    if (not output_explicit) and (input_format == "teitok" or getattr(args, "test", False)):
+        args.output_format = "teitok"
+
+    if args.test and input_format != "teitok":
+        if args.verbose or args.debug:
+            print("[flexipipe] --test is currently supported for TEITOK writeback only; ignoring for this input format.", file=sys.stderr)
+        args.test = False
 
     if inline_data_text:
         input_format = "raw"
@@ -3143,6 +3279,11 @@ def run_tag(args: argparse.Namespace) -> int:
                 else:
                     # Load TEITOK settings and merge with CLI mappings
                     teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, tmp_path)
+                    if teitok_settings:
+                        if not teitok_settings_obj:
+                            teitok_settings_obj = teitok_settings
+                        if not writeback_explicit:
+                            args.writeback = True
                     xpos_attr = merged_attrs_map.get("xpos")
                     reg_attr = merged_attrs_map.get("reg")
                     expan_attr = merged_attrs_map.get("expan")
@@ -3160,12 +3301,12 @@ def run_tag(args: argparse.Namespace) -> int:
                     # (Language will be resolved after document is loaded to check teiHeader first)
                     detection_source_text = _document_to_plain_text(doc)
             finally:
-                import os
                 # Always clean up temp file (stdin doesn't support writeback anyway)
                 os.unlink(tmp_path)
         else:
             # Check if file has tokens
-            from .engine import teitok_has_tokens, extract_teitok_plain_text
+            from .teitok import teitok_has_tokens, extract_teitok_plain_text
+            from .teitok import teitok_has_tokens, extract_teitok_plain_text
             has_tokens = teitok_has_tokens(args.input)
             
             if not has_tokens:
@@ -3219,6 +3360,11 @@ def run_tag(args: argparse.Namespace) -> int:
             else:
                 # Load TEITOK settings and merge with CLI mappings
                 teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, args.input)
+                if teitok_settings:
+                    if not teitok_settings_obj:
+                        teitok_settings_obj = teitok_settings
+                    if not writeback_explicit:
+                        args.writeback = True
                 xpos_attr = merged_attrs_map.get("xpos")
                 reg_attr = merged_attrs_map.get("reg")
                 expan_attr = merged_attrs_map.get("expan")
@@ -3231,10 +3377,11 @@ def run_tag(args: argparse.Namespace) -> int:
                     lemma_attr=lemma_attr,
                 )
                 # Auto-enable writeback if teitok-settings is detected and writeback not explicitly set
-                if args.writeback is None and teitok_settings and teitok_settings.settings_path:
+                # Only enable if settings.xml actually exists (we're in a TEITOK project)
+                if args.writeback is None and teitok_settings and teitok_settings.settings_path and teitok_settings.settings_path.exists():
                     args.writeback = True
                     if args.verbose or args.debug:
-                        print("[flexipipe] Auto-enabled writeback mode (--teitok-settings detected)", file=sys.stderr)
+                        print("[flexipipe] Auto-enabled writeback mode (TEITOK settings.xml found)", file=sys.stderr)
                 # Store settings for later language resolution
                 # (Language will be resolved after document is loaded to check teiHeader first)
         detection_source_text = _document_to_plain_text(doc)
@@ -3267,7 +3414,9 @@ def run_tag(args: argparse.Namespace) -> int:
         if not getattr(args, "language", None) and input_format == "teitok":
             # Try to load settings if we haven't already
             if args.input and args.input not in ("-", "<inline-data>"):
-                teitok_settings, _ = _load_and_merge_teitok_settings(args, args.input)
+                if not teitok_settings_obj:
+                    teitok_settings_obj, _ = _load_and_merge_teitok_settings(args, args.input)
+                teitok_settings = teitok_settings_obj
                 if teitok_settings:
                     settings_lang = teitok_settings.get_language()
                     if settings_lang:
@@ -3290,6 +3439,25 @@ def run_tag(args: argparse.Namespace) -> int:
         if getattr(args, "language", None):
             doc.meta["language"] = args.language
 
+    if teitok_settings_obj and getattr(args, "language", None):
+        pref = teitok_settings_obj.get_flexipipe_preference(args.language)
+        if pref:
+            pref_backend = pref.get("backend")
+            pref_model = pref.get("model")
+            if pref_backend and not getattr(args, "_backend_explicit", False):
+                args.backend = pref_backend
+                backend_type = pref_backend
+                setattr(args, "_backend_explicit", True)
+                if args.verbose or args.debug:
+                    print(f"[flexipipe] Using preferred backend '{pref_backend}' for language '{args.language}'", file=sys.stderr)
+            if pref_model and not getattr(args, "model", None):
+                args.model = pref_model
+                if args.verbose or args.debug:
+                    print(f"[flexipipe] Using preferred model '{pref_model}' for language '{args.language}'", file=sys.stderr)
+
+    if args.test:
+        args.writeback = True
+
     if not auto_selected:
         backend_type = _auto_select_model_for_language(args, backend_type)
         args.backend = backend_type
@@ -3306,6 +3474,21 @@ def run_tag(args: argparse.Namespace) -> int:
     # we can skip backend processing and just do format conversion
     tasks_requiring_backend = requested_tasks - TASK_MANDATORY
     needs_backend = len(tasks_requiring_backend) > 0
+    if args.writeback and input_format == "teitok":
+        # Always ensure default tasks are requested for writeback to guarantee tagging happens
+        # This ensures the document gets properly annotated even if user didn't specify --tasks
+        if not needs_backend:
+            requested_tasks = set(TASK_DEFAULTS)
+            tasks_requiring_backend = requested_tasks - TASK_MANDATORY
+            needs_backend = True
+            if args.verbose or args.debug:
+                tasks_str = ", ".join(sorted(requested_tasks))
+                print(f"[flexipipe] writeback requested; running default tagging tasks: {tasks_str}", file=sys.stderr)
+        else:
+            needs_backend = True
+            if args.verbose or args.debug:
+                tasks_str = ", ".join(sorted(requested_tasks))
+                print(f"[flexipipe] writeback requested; forcing backend execution with tasks: {tasks_str}", file=sys.stderr)
     
     # If no backend is needed, skip all backend processing
     if not needs_backend:
@@ -3490,25 +3673,37 @@ def run_tag(args: argparse.Namespace) -> int:
                 # For raw text input, use raw text mode to let backend do its own tokenization
                 # For other formats (conllu, teitok), use tokenized mode to preserve existing tokenization
                 # Exception: if text was extracted from TEITOK XML with --tokenize, treat as raw text
+                # Or if --use-raw-text is explicitly set (CLI flag), force raw text mode
+                # Or if use_raw_text is set in TEITOK settings.xml, use that (unless CLI flag overrides)
                 is_extracted_text = doc.meta.get("original_input_path") is not None
                 use_raw_text = (
+                    getattr(args, "use_raw_text", False) or  # CLI flag (highest priority)
+                    (teitok_settings_obj and teitok_settings_obj.use_raw_text) or  # Settings.xml
                     (input_format == "raw" and not getattr(args, "pretokenize", False)) or
                     (is_extracted_text and not getattr(args, "pretokenize", False))
                 )
                 if backend_type_lower == "udmorph":
                     use_raw_text = True
                 try:
+                    if args.verbose or args.debug:
+                        components_str = ", ".join(sorted(neural_components)) if neural_components else "none"
+                        print(f"[flexipipe] Running backend '{backend_type}' with components: {components_str}", file=sys.stderr)
                     neural_result = neural_backend.tag(
                         doc,
                         use_raw_text=use_raw_text,
                         components=neural_components,
                     )
+                    if args.verbose or args.debug:
+                        sent_count = len(neural_result.document.sentences)
+                        tok_count = sum(len(sent.tokens) for sent in neural_result.document.sentences)
+                        print(f"[flexipipe] Backend completed: {sent_count} sentences, {tok_count} tokens", file=sys.stderr)
                 except (ValueError, FileNotFoundError, RuntimeError) as e:
                     print(f"[flexipipe] {e}", file=sys.stderr)
                     return 1
                 from .engine import FlexitagResult
                 result = FlexitagResult(document=neural_result.document, stats=neural_result.stats)
                 _propagate_sentence_metadata(result.document, doc)
+                _propagate_token_ids(result.document, doc)
                 
                 # Track backend used
                 if "_backends_used" not in result.document.meta:
@@ -3579,6 +3774,7 @@ def run_tag(args: argparse.Namespace) -> int:
                 pipeline = FlexiPipeline(config)
                 result = pipeline.process(doc)
                 _propagate_sentence_metadata(result.document, doc)
+                _propagate_token_ids(result.document, doc)
                 
                 # Determine model string for hybrid pipeline
                 backend_type_lower = backend_type.lower()
@@ -3623,6 +3819,7 @@ def run_tag(args: argparse.Namespace) -> int:
             neural_result = flexitag_backend.tag(doc)
             result = neural_result  # FlexitagBackend returns NeuralResult
             _propagate_sentence_metadata(result.document, doc)
+            _propagate_token_ids(result.document, doc)
             
             # Model string for flexitag only
             if args.model:
@@ -3771,141 +3968,179 @@ def run_tag(args: argparse.Namespace) -> int:
                     if not output_path or str(original_input_path.resolve()) == str(Path(output_path).resolve()):
                         use_writeback = True
                         # Check if this came from extracted text (non-tokenized TEITOK with --tokenize)
-                        from .engine import teitok_has_tokens
+                        from .teitok import teitok_has_tokens
                         if output_doc.meta.get("original_input_path") and not teitok_has_tokens(output_doc.meta["original_input_path"]):
                             is_extracted_text = True
         
         if use_writeback and original_input_path:
+            target_writeback_path = original_input_path
+            temp_writeback_path: Optional[Path] = None
+            if args.test:
+                import tempfile
+                import shutil
+                suffix = original_input_path.suffix or ".xml"
+                fd, temp_name = tempfile.mkstemp(prefix="flexipipe-test-", suffix=suffix)
+                os.close(fd)
+                shutil.copy2(original_input_path, temp_name)
+                target_writeback_path = Path(temp_name)
+                temp_writeback_path = target_writeback_path
             # Create backup before writeback (TEITOK-style once-a-day backup)
+            # Only create backup if we're in a TEITOK project (settings.xml exists)
             from .teitok_backup import create_teitok_backup
-            backup_path = create_teitok_backup(str(original_input_path))
-            if backup_path:
-                if args.verbose or args.debug:
-                    print(f"[flexipipe] Created backup: {backup_path}", file=sys.stderr)
-            elif args.verbose or args.debug:
-                # Backup already exists for today
-                from datetime import date
-                today = date.today().strftime("%Y%m%d")
-                filename = Path(original_input_path).name
-                if "." in filename:
-                    name_part, ext_part = filename.rsplit(".", 1)
-                    backup_name = f"{name_part}-{today}.{ext_part}"
-                else:
-                    backup_name = f"{filename}-{today}"
-                backups_dir = Path.cwd() / "backups"
-                existing_backup = backups_dir / backup_name
-                if existing_backup.exists():
-                    print(f"[flexipipe] Backup already exists for today: {existing_backup}", file=sys.stderr)
+            from .teitok_settings import find_settings_xml
             
-            # Update original file in-place
+            backup_path = None
+            settings_path = find_settings_xml(original_input_path)
+            if args.test:
+                if args.verbose or args.debug:
+                    print("[flexipipe] Skipping backup (--test dry-run)", file=sys.stderr)
+            elif settings_path and settings_path.exists():
+                backup_path = create_teitok_backup(str(original_input_path))
+                if backup_path:
+                    if args.verbose or args.debug:
+                        print(f"[flexipipe] Created backup: {backup_path}", file=sys.stderr)
+                elif args.verbose or args.debug:
+                    from datetime import date
+                    today = date.today().strftime("%Y%m%d")
+                    filename = Path(original_input_path).name
+                    if "." in filename:
+                        name_part, ext_part = filename.rsplit(".", 1)
+                        backup_name = f"{name_part}-{today}.{ext_part}"
+                    else:
+                        backup_name = f"{filename}-{today}"
+                    backups_dir = Path.cwd() / "backups"
+                    existing_backup = backups_dir / backup_name
+                    if existing_backup.exists():
+                        print(f"[flexipipe] Backup already exists for today: {existing_backup}", file=sys.stderr)
+            elif args.verbose or args.debug:
+                print("[flexipipe] Skipping backup (not in a TEITOK project - settings.xml not found)", file=sys.stderr)
+            
             from .teitok import update_teitok
             from .insert_tokens import insert_tokens_into_teitok
             try:
                 if is_extracted_text:
-                    # Insert tokens into non-tokenized XML
                     textnode_xpath = output_doc.meta.get("original_input_xpath", ".//text")
                     include_notes = getattr(args, "textnotes", False)
                     insert_tokens_into_teitok(
                         output_doc,
-                        str(original_input_path),
+                        str(target_writeback_path),
                         output_path if output_path else None,
                         textnode_xpath=textnode_xpath,
                         include_notes=include_notes,
                     )
                     if args.verbose or args.debug:
-                        target = str(original_input_path) if not output_path else output_path
+                        target = str(target_writeback_path) if not output_path else output_path
                         print(f"[flexipipe] Inserted tokens into TEITOK file: {target}")
                 else:
-                    # Update existing tokenized XML
-                    update_teitok(output_doc, str(original_input_path), output_path if output_path else None)
+                    update_teitok(
+                        output_doc,
+                        str(target_writeback_path),
+                        output_path if output_path else None,
+                        settings=teitok_settings_obj,
+                    )
                     if args.verbose or args.debug:
-                        target = str(original_input_path) if not output_path else output_path
+                        target = str(target_writeback_path) if not output_path else output_path
                         print(f"[flexipipe] Updated TEITOK file in-place: {target}")
             except Exception as e:
-                # Fall back to regular save if writeback fails
-                if args.verbose or args.debug:
-                    print(f"[flexipipe] Writeback failed: {e}, falling back to regular save", file=sys.stderr)
-        tei_tasks = _detect_performed_tasks(output_doc)
-        tasks_summary_str = ",".join(sorted(tei_tasks)) if tei_tasks else "segment,tokenize"
-        pretty_print = getattr(args, "pretty_print", False)
-        spaceafter_handling = getattr(args, "spaceafter_handling", "preserve")
-        skip_spaceafter_for_breaking = getattr(args, "skip_spaceafter_for_breaking_elements", True)
-        tei_output = dump_teitok(
-            output_doc,
-            pretty_print=pretty_print,
-            spaceafter_handling=spaceafter_handling,
-            skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking,
-        )
-        note_candidate = (
-            note_source_path
-            or output_doc.meta.get("original_input_path")
-            or output_doc.meta.get("source_path")
-        )
-        note_value = None
-        if note_candidate and str(note_candidate) not in ("-", "<inline-data>"):
-            note_value = f"{Path(str(note_candidate)).stem}.xml"
-        change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        
-        # Collect all backends used (from piping or single backend)
-        backends_used = output_doc.meta.get("_backends_used", [])
-        if backend_type and backend_type.lower() not in backends_used:
-            backends_used.append(backend_type.lower())
-        if not backends_used:
-            backends_used = ["flexipipe"]
-        
-        # Build backend string - show all backends
-        backend_names = [b.upper() for b in backends_used]
-        change_source = ", ".join(backend_names) if len(backend_names) > 1 else (model_str or backend_names[0] if backend_names else "flexipipe")
-        change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
-        
-        # Collect model/license info and acknowledgements for notes
-        api_notes = []
-        
-        # Extract model and license info from file-level attributes
-        file_level_attrs = output_doc.meta.get("_file_level_attrs", {})
-        model_info_lines = []
-        
-        # Collect all model and license pairs
-        model_keys = sorted([k for k in file_level_attrs.keys() if k.endswith("_model")])
-        for model_key in model_keys:
-            model_name = file_level_attrs[model_key]
-            model_info_lines.append(f"# {model_key} = {model_name}")
+                print(
+                    f"[flexipipe] Writeback failed for {target_writeback_path}: {e}, falling back to regular save",
+                    file=sys.stderr,
+                )
+                if args.test and temp_writeback_path:
+                    temp_writeback_path.unlink(missing_ok=True)
+            else:
+                if args.test and temp_writeback_path:
+                    with open(temp_writeback_path, "r", encoding="utf-8") as tf:
+                        sys.stdout.write(tf.read())
+                    temp_writeback_path.unlink(missing_ok=True)
+                    return 0
+                writeback_rendered = True
+        emit_teitok_output = True
+        if use_writeback and not args.test and not output_path:
+            emit_teitok_output = args.verbose or args.debug
+        if emit_teitok_output or output_path or args.test or not use_writeback:
+            tei_tasks = _detect_performed_tasks(output_doc)
+            tasks_summary_str = ",".join(sorted(tei_tasks)) if tei_tasks else "segment,tokenize"
+            pretty_print = getattr(args, "pretty_print", False)
+            spaceafter_handling = getattr(args, "spaceafter_handling", "preserve")
+            skip_spaceafter_for_breaking = getattr(args, "skip_spaceafter_for_breaking_elements", True)
+            tei_output = dump_teitok(
+                output_doc,
+                pretty_print=pretty_print,
+                spaceafter_handling=spaceafter_handling,
+                skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking,
+                settings=teitok_settings_obj,
+            )
+            note_candidate = (
+                note_source_path
+                or output_doc.meta.get("original_input_path")
+                or output_doc.meta.get("source_path")
+            )
+            note_value = None
+            if note_candidate and str(note_candidate) not in ("-", "<inline-data>"):
+                note_value = f"{Path(str(note_candidate)).stem}.xml"
+            change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
             
-            # Add corresponding license if present
-            licence_key = f"{model_key}_licence"
-            if licence_key in file_level_attrs:
-                model_info_lines.append(f"# {licence_key} = {file_level_attrs[licence_key]}")
-        
-        if model_info_lines:
-            # Add acknowledgements if present
-            if "_api_acknowledgements" in output_doc.meta:
-                acknowledgements = output_doc.meta["_api_acknowledgements"]
-                if isinstance(acknowledgements, list):
-                    model_info_lines.append("")
-                    model_info_lines.append("# acknowledgements:")
-                    for ack in acknowledgements:
-                        model_info_lines.append(f"#   {ack}")
-                elif isinstance(acknowledgements, str):
-                    model_info_lines.append("")
-                    model_info_lines.append(f"# acknowledgements: {acknowledgements}")
+            # Collect all backends used (from piping or single backend)
+            backends_used = output_doc.meta.get("_backends_used", [])
+            if backend_type and backend_type.lower() not in backends_used:
+                backends_used.append(backend_type.lower())
+            if not backends_used:
+                backends_used = ["flexipipe"]
             
-            api_notes.append(("Model Information", "\n".join(model_info_lines)))
-        
-        tei_output = _augment_tei_output(
-            tei_output,
-            note_value=note_value,
-            change_text=change_text,
-            change_when=change_when,
-            api_notes=api_notes if api_notes else None,
-            pretty_print=pretty_print,
-            spaceafter_handling=spaceafter_handling,
-            skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking,
-        )
-        if output_path:
-            with open(output_path, "w", encoding="utf-8") as handle:
-                handle.write(tei_output)
-        else:
-            print(tei_output)
+            # Build backend string - show all backends
+            backend_names = [b.upper() for b in backends_used]
+            change_source = ", ".join(backend_names) if len(backend_names) > 1 else (model_str or backend_names[0] if backend_names else "flexipipe")
+            change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
+            
+            # Collect model/license info and acknowledgements for notes
+            api_notes = []
+            
+            # Extract model and license info from file-level attributes
+            file_level_attrs = output_doc.meta.get("_file_level_attrs", {})
+            model_info_lines = []
+            
+            # Collect all model and license pairs
+            model_keys = sorted([k for k in file_level_attrs.keys() if k.endswith("_model")])
+            for model_key in model_keys:
+                model_name = file_level_attrs[model_key]
+                model_info_lines.append(f"# {model_key} = {model_name}")
+                
+                # Add corresponding license if present
+                licence_key = f"{model_key}_licence"
+                if licence_key in file_level_attrs:
+                    model_info_lines.append(f"# {licence_key} = {file_level_attrs[licence_key]}")
+            
+            if model_info_lines:
+                # Add acknowledgements if present
+                if "_api_acknowledgements" in output_doc.meta:
+                    acknowledgements = output_doc.meta["_api_acknowledgements"]
+                    if isinstance(acknowledgements, list):
+                        model_info_lines.append("")
+                        model_info_lines.append("# acknowledgements:")
+                        for ack in acknowledgements:
+                            model_info_lines.append(f"#   {ack}")
+                    elif isinstance(acknowledgements, str):
+                        model_info_lines.append("")
+                        model_info_lines.append(f"# acknowledgements: {acknowledgements}")
+                
+                api_notes.append(("Model Information", "\n".join(model_info_lines)))
+            
+            tei_output = _augment_tei_output(
+                tei_output,
+                note_value=note_value,
+                change_text=change_text,
+                change_when=change_when,
+                api_notes=api_notes if api_notes else None,
+                pretty_print=pretty_print,
+                spaceafter_handling=spaceafter_handling,
+                skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking,
+            )
+            if output_path:
+                with open(output_path, "w", encoding="utf-8") as handle:
+                    handle.write(tei_output)
+            elif emit_teitok_output:
+                print(tei_output)
     elif output_format == "json":
         performed_tasks = sorted(_detect_performed_tasks(result.document)) or sorted(requested_tasks)
         payload = {
@@ -4399,7 +4634,6 @@ def _run_convert_tagged(args: argparse.Namespace) -> int:
                 # Force Python version by providing an attribute mapping
                 doc = load_teitok(tmp_path, xpos_attr="xpos")
             finally:
-                import os
                 os.unlink(tmp_path)
         else:
             # Force Python version by providing an attribute mapping
@@ -4653,6 +4887,7 @@ def _write_document(
     *,
     spaceafter_handling: str = "preserve",
     skip_spaceafter_for_breaking_elements: bool = True,
+    teitok_settings: Optional[TeitokSettings] = None,
 ) -> None:
     if fmt == "teitok":
         if output:
@@ -4662,6 +4897,7 @@ def _write_document(
                 pretty_print=pretty_print,
                 spaceafter_handling=spaceafter_handling,
                 skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking_elements,
+                settings=teitok_settings,
             )
         else:
             sys.stdout.write(
@@ -4670,6 +4906,7 @@ def _write_document(
                     pretty_print=pretty_print,
                     spaceafter_handling=spaceafter_handling,
                     skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking_elements,
+                    settings=teitok_settings,
                 )
             )
         return
