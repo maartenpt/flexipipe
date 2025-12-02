@@ -141,9 +141,18 @@ class FlexiBuildExt(build_ext):
 
 def install_wrapper_script():
     """Interactive installation of the flexipipe wrapper script."""
+    import os
     import shutil
     import stat
     import subprocess
+    
+    # Check for non-interactive mode (for automated installs like from PHP)
+    noninteractive = os.environ.get("FLEXIPIPE_NONINTERACTIVE", "").lower() in ("1", "true", "yes")
+    quiet_install = os.environ.get("FLEXIPIPE_QUIET_INSTALL", "").lower() in ("1", "true", "yes")
+    
+    if noninteractive or quiet_install:
+        # Skip wrapper script installation in non-interactive mode
+        return
     
     print("\n" + "="*70)
     print("Flexipipe Wrapper Script Installation")
@@ -261,7 +270,12 @@ class FlexiInstall(install):
         
         # After installation, offer to install wrapper script
         # Only prompt if running interactively (not in automated builds)
-        if sys.stdin.isatty():
+        # Skip if FLEXIPIPE_NONINTERACTIVE or FLEXIPIPE_QUIET_INSTALL is set
+        import os
+        noninteractive = os.environ.get("FLEXIPIPE_NONINTERACTIVE", "").lower() in ("1", "true", "yes")
+        quiet_install = os.environ.get("FLEXIPIPE_QUIET_INSTALL", "").lower() in ("1", "true", "yes")
+        
+        if sys.stdin.isatty() and not noninteractive and not quiet_install:
             try:
                 install_wrapper_script()
             except KeyboardInterrupt:

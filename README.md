@@ -96,6 +96,22 @@ After installation, run the guided setup to pick defaults:
 python -m flexipipe config --wizard
 ```
 
+### Non-Interactive Installation
+
+For automated installations (e.g., from PHP scripts or CI/CD), set the `FLEXIPIPE_NONINTERACTIVE` or `FLEXIPIPE_QUIET_INSTALL` environment variable to skip interactive prompts:
+
+```bash
+FLEXIPIPE_NONINTERACTIVE=1 pip install git+https://github.com/ufal/flexipipe.git
+```
+
+Or:
+
+```bash
+FLEXIPIPE_QUIET_INSTALL=1 pip install git+https://github.com/ufal/flexipipe.git
+```
+
+This will skip the wrapper script installation prompt and install silently with defaults.
+
 ### Optional Extras Behaviour
 
 Flexipipe can install extras automatically the first time you use a backend:

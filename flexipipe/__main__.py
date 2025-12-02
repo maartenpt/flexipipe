@@ -1327,7 +1327,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--version",
         "-V",
         action="version",
-        version=f"%(prog)s {version}",
+        version=f"flexipipe {version}",
     )
     # Add global arguments (available in all subcommands)
     parser.add_argument(
