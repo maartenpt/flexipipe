@@ -213,7 +213,7 @@ def list_models(args: argparse.Namespace) -> int:
                 if output_format == "json":
                     print(json.dumps({"language": language_filter, "models": []}, indent=2, ensure_ascii=False), flush=True)
                 else:
-                    print(f"No models found for language '{language_filter}'.")
+                    print(f"[flexipipe] No models found for language '{language_filter}'.")
                 if debug:
                     total_time = time.time() - start_time
                     print(f"[DEBUG] Total execution time: {total_time:.3f}s", file=sys.stderr)

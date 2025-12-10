@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import shlex
+import requests
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Collection, Dict, List, Optional, Tuple
@@ -612,7 +613,7 @@ def _display_language_filtered_models(language: Optional[str], entries_by_backen
                 import sys
                 print(json.dumps({"language": language, "models": []}, indent=2, ensure_ascii=False), flush=True)
             else:
-                print(f"No models found for language '{language}'.")
+                print(f"[flexipipe] No models found for language '{language}'.")
             return 0
 
     # Sort matches based on sort_by option (natural, case-insensitive sorting)
@@ -949,7 +950,8 @@ def _auto_select_model_for_language(
     # Check if language is a valid ISO code (2 or 3 letters) - if so, only use exact matching
     # This prevents fuzzy matching from incorrectly matching ISO codes to unrelated languages
     is_iso_code = language and len(language.strip()) in {2, 3} and language.strip().isalpha()
-    use_fuzzy = not is_iso_code  # Don't use fuzzy matching for ISO codes
+    # Disable fuzzy matching: only accept exact/normalized matches (including aliases from language mapping)
+    use_fuzzy = False
 
     def pick_best(entries_map: dict[str, dict], allow_fuzzy: bool) -> Optional[tuple[str, dict]]:
         # If language is an ISO code, don't allow fuzzy matching
@@ -1173,7 +1175,7 @@ def _auto_select_model_for_language(
 
     # If nothing found, try remaining backends
     if not selection and remaining:
-        secondary_entries = ensure_entries(remaining)
+        secondary_entries = ensure_entries(remaining, refresh=getattr(args, "refresh_cache", False))
         selection = pick_best(secondary_entries, allow_fuzzy=False)
         if not selection and use_fuzzy:
             selection = pick_best(secondary_entries, allow_fuzzy=True)
@@ -1181,7 +1183,7 @@ def _auto_select_model_for_language(
     if not selection:
         if backend_locked and requested_backend:
             return backend_type
-        # Debug: show what models are available
+        # Only emit the “no models” notice in verbose/debug, and make it clear it’s after search.
         if getattr(args, "verbose", False) or getattr(args, "debug", False):
             all_entries = {}
             for backend in combined_order:
@@ -1190,18 +1192,16 @@ def _auto_select_model_for_language(
                     if entries.get(backend):
                         all_entries.update(entries)
             if all_entries:
-                print(f"[flexipipe] DEBUG: Available models in registry:", file=sys.stderr)
+                print(f"[flexipipe] DEBUG: Available models in registry after search:", file=sys.stderr)
                 for backend, entries in all_entries.items():
                     for model_name, entry in entries.items():
                         entry_iso = (entry.get(LANGUAGE_FIELD_ISO) or "").lower()
                         entry_name = entry.get(LANGUAGE_FIELD_NAME) or ""
-                        if is_iso_code and entry_iso == language.strip().lower():
+                        if is_iso_code and entry_iso == (language or "").strip().lower():
                             print(f"[flexipipe] DEBUG:   {backend}/{model_name}: language_iso='{entry_iso}', language_name='{entry_name}' (MATCHES)", file=sys.stderr)
-                        elif is_iso_code:
-                            # Only show non-matching models in debug mode
-                            if getattr(args, "debug", False):
-                                print(f"[flexipipe] DEBUG:   {backend}/{model_name}: language_iso='{entry_iso}', language_name='{entry_name}'", file=sys.stderr)
-        print(f"[flexipipe] No available models found for language '{language}'.")
+                        elif is_iso_code and getattr(args, "debug", False):
+                            print(f"[flexipipe] DEBUG:   {backend}/{model_name}: language_iso='{entry_iso}', language_name='{entry_name}'", file=sys.stderr)
+            print(f"[flexipipe] No available models found for language '{language}' after full search.", file=sys.stderr)
         return backend_type
 
     chosen_backend, entry = selection
@@ -3477,23 +3477,30 @@ def run_tag(args: argparse.Namespace) -> int:
     example_name = getattr(args, "example", None)
     if example_name:
         if args.input not in (None, "-", "<inline-data>"):
-            print("Error: --example cannot be combined with --input.", file=sys.stderr)
+            print("[flexipipe] Error: --example cannot be combined with --input.", file=sys.stderr)
             return 1
         if getattr(args, "data", None):
-            print("Error: --example cannot be combined with --data.", file=sys.stderr)
+            print("[flexipipe] Error: --example cannot be combined with --data.", file=sys.stderr)
             return 1
         language = getattr(args, "language", None)
         if not language:
-            print("Error: --example requires --language to be specified.", file=sys.stderr)
+            print("[flexipipe] Error: --example requires --language to be specified.", file=sys.stderr)
             return 1
         example_text = _load_example_text(example_name, language)
         if not example_text:
-            print(f"Error: Could not load example '{example_name}' for language '{language}'.", file=sys.stderr)
+            print(f"[flexipipe] Error: Could not load example '{example_name}' for language '{language}'.", file=sys.stderr)
             return 1
         # Set as inline data
         args.data = [example_text]
         args.input = "<inline-data>"
     
+    # If no model was selected for a locked/explicit backend, stop early before contacting the backend.
+    model_name = getattr(args, "model", None)
+    if backend_type and not model_name:
+        lang_display = getattr(args, "language", None) or "unknown"
+        print(f"[flexipipe] No available models found for language '{lang_display}'.", file=sys.stderr)
+        return 1
+
     # If --input is not provided, check if STDIN has data
     inline_data_tokens = getattr(args, "data", None)
     inline_data_text = " ".join(inline_data_tokens).strip() if inline_data_tokens else ""
@@ -4013,6 +4020,9 @@ def run_tag(args: argparse.Namespace) -> int:
         backend_type = _auto_select_model_for_language(args, backend_type)
         args.backend = backend_type
         auto_selected = True
+        if backend_type is None:
+            print(f"[flexipipe] No available models found for language '{language_arg or args.language}'.", file=sys.stderr)
+            return 1
     elif skip_auto_select and (args.verbose or args.debug):
         print(f"[flexipipe] Skipping auto-selection (backend explicitly set: {backend_explicit}, model set: {model_set}, settings.xml backend: {settings_xml_backend_set})", file=sys.stderr)
         if backend_type:
@@ -4342,7 +4352,7 @@ def run_tag(args: argparse.Namespace) -> int:
                     sent_count = len(neural_result.document.sentences)
                     tok_count = sum(len(sent.tokens) for sent in neural_result.document.sentences)
                     print(f"[flexipipe] Backend completed: {sent_count} sentences, {tok_count} tokens", file=sys.stderr)
-            except (ValueError, FileNotFoundError, RuntimeError) as e:
+            except (ValueError, FileNotFoundError, RuntimeError, requests.exceptions.HTTPError) as e:
                 print(f"[flexipipe] {e}", file=sys.stderr)
                 return 1
             from .engine import FlexitagResult
