@@ -91,17 +91,14 @@ Mapped fields:
 - Backends that auto-download (Stanza, UDPipe REST) may log download progress the first time; subsequent runs use cached files.
 - Keep the original Flexipipe `Document` if you plan to write TEI/CoNLL-U or pass data to another backend; the spaCy `Doc` is mainly for spaCy-only processing.
 
-### G. One-click GitHub Codespaces
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://github.com/ufal/flexipipe/codespaces)
+### G. Free click-to-run options (Colab)
+We don’t want a paid Codespaces flow. For a free option, use Google Colab:
 
-1) Click the badge above to launch a Codespace with the repo preloaded.  
-2) In the Codespaces terminal, install the needed extras (for these examples we need Stanza and spaCy):
+1) Upload a small example notebook from this repo (or create one with the snippets above).  
+2) In Colab, install Flexipipe with the needed extras (note: large downloads on first run):
 ```bash
-pip install -e ".[stanza,spacy]"
+!pip install "git+https://github.com/ufal/flexipipe.git#egg=flexipipe[stanza,spacy]"
 ```
-3) (Optional) Warm caches and download a first model to avoid startup pauses:
-```bash
-python -m flexipipe info languages --refresh-cache
-python -m flexipipe process --language en --backend stanza --download-model --input-format raw --input -
-```
-4) Run any of the snippets above directly in the Codespaces terminal or a notebook. Models are cached under `~/.flexipipe/models/` for reuse.
+3) Run the code cells; models/cache live only for the session.  
+
+If you prefer a view-only render, use nbviewer on any notebook in the repo (no execution). Binder/JupyterLite are not recommended for Flexipipe because of native deps and large model downloads.
