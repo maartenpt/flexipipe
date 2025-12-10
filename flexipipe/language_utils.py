@@ -199,11 +199,18 @@ def resolve_language_query(value: str) -> Dict[str, Set[str]]:
     name_candidates: Set[str] = set()
     normalized_candidates: Set[str] = set()
     raw_normalized = normalize_language_value(value)
+
+    # If this value isn't known to the current mapping cache, force a reload (with refresh)
+    # so newly added languages are picked up without needing a separate CLI refresh.
+    from .language_mapping import _LANGUAGE_BY_CODE, _LANGUAGE_BY_NAME, _build_language_mappings
+    lowered = value.strip().lower() if value else ""
+    if lowered and lowered not in _LANGUAGE_BY_CODE and lowered not in _LANGUAGE_BY_NAME and raw_normalized not in _LANGUAGE_BY_NAME:
+        _build_language_mappings(force_reload=True, refresh_cache=True, verbose=False)
+    
     if raw_normalized:
         normalized_candidates.add(raw_normalized)
 
     if value:
-        lowered = value.strip().lower()
         if len(lowered) in {2, 3} and lowered.isalpha():
             iso_candidates.add(lowered)
 

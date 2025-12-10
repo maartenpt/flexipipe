@@ -73,6 +73,7 @@ _LANGUAGE_MAPPINGS: List[Tuple[str, str, str, str, List[str]]] = [
     ("uk", "ukr", "ukr", "Ukrainian", ["ukrainian", "українська"]),
     ("vi", "vie", "vie", "Vietnamese", ["vietnamese", "tiếng việt", "tieng viet"]),
     ("zh", "zho", "zho", "Chinese", ["chinese", "中文", "mandarin"]),
+    ("ug", "uig", "uig", "Uyghur", ["uyghur", "uygur", "uighur", "ئۇيغۇرچە"]),
     # Additional languages
     ("is", "isl", "isl", "Icelandic", ["icelandic", "íslenska"]),
     ("got", "got", "got", "Gothic", ["gothic"]),
@@ -209,15 +210,29 @@ def _load_language_mappings_from_json(
     return None
 
 
-def _build_language_mappings() -> None:
+def _build_language_mappings(
+    *,
+    force_reload: bool = False,
+    refresh_cache: bool = False,
+    verbose: bool = False,
+) -> None:
     """Build lookup dictionaries from language mappings."""
     global _LANGUAGE_BY_CODE, _LANGUAGE_BY_NAME, _LANGUAGE_MAPPINGS_LOADED
     
-    if _LANGUAGE_MAPPINGS_LOADED:  # Already built
+    if _LANGUAGE_MAPPINGS_LOADED and not force_reload:
         return
     
+    # Reset when forcing reload
+    if force_reload:
+        _LANGUAGE_BY_CODE = {}
+        _LANGUAGE_BY_NAME = {}
+        _LANGUAGE_MAPPINGS_LOADED = False
+    
     # Try to load from JSON file first (allows manual corrections)
-    json_mappings = _load_language_mappings_from_json(use_cache=True, verbose=False)
+    json_mappings = _load_language_mappings_from_json(
+        use_cache=not refresh_cache,
+        verbose=verbose,
+    )
     
     # Start with hard-coded mappings as base
     mappings_to_process: List[Tuple[Optional[str], Optional[str], Optional[str], str, List[str]]] = list(_LANGUAGE_MAPPINGS)
@@ -302,6 +317,11 @@ def _build_language_mappings() -> None:
                 _LANGUAGE_BY_NAME[variant.upper()] = lang_data
     
     _LANGUAGE_MAPPINGS_LOADED = True
+
+
+def reload_language_mappings(*, refresh_cache: bool = False, verbose: bool = False) -> None:
+    """Force reload of language mappings from remote/cache."""
+    _build_language_mappings(force_reload=True, refresh_cache=refresh_cache, verbose=verbose)
 
 
 def normalize_language_code(language: str) -> Tuple[str, str, str]:

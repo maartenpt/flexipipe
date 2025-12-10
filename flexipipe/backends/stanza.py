@@ -17,6 +17,7 @@ from ..language_utils import (
     cache_entries_standardized,
     clean_language_name,
 )
+from ..model_registry import get_remote_models_for_backend
 from ..model_storage import (
     get_backend_models_dir,
     read_model_cache_entry,
@@ -97,6 +98,7 @@ def get_stanza_model_entries(
     use_cache: bool = True,
     refresh_cache: bool = False,
     cache_ttl_seconds: int = MODEL_CACHE_TTL_SECONDS,
+    verbose: bool = False,
 ) -> Dict[str, Dict[str, str]]:
     cache_key = "stanza"
     if use_cache and not refresh_cache:
@@ -204,88 +206,56 @@ def get_stanza_model_entries(
                                 date_str = time.strftime("%Y-%m-%d", time.localtime(mtime))
                                 installed_models[key] = date_str
 
-    common_models = [
-        ("en", "ewt", "English (EWT)"),
-        ("en", "gum", "English (GUM)"),
-        ("cs", "pdt", "Czech (PDT)"),
-        ("cs", "cac", "Czech (CAC)"),
-        ("de", "gsd", "German (GSD)"),
-        ("fr", "gsd", "French (GSD)"),
-        ("es", "gsd", "Spanish (GSD)"),
-        ("it", "isdt", "Italian (ISDT)"),
-        ("ru", "syntagrus", "Russian (SynTagRus)"),
-        ("zh", "gsd", "Chinese (GSD)"),
-        ("ja", "gsd", "Japanese (GSD)"),
-        ("ko", "gsd", "Korean (GSD)"),
-        ("ar", "padt", "Arabic (PADT)"),
-        ("hi", "hdtdtb", "Hindi (HDTDTB)"),
-        ("vi", "vtb", "Vietnamese (VTB)"),
-        ("tr", "imst", "Turkish (IMST)"),
-        ("pl", "pdb", "Polish (PDB)"),
-        ("uk", "iu", "Ukrainian (IU)"),
-        ("bg", "btb", "Bulgarian (BTB)"),
-        ("hr", "set", "Croatian (SET)"),
-        ("sr", "set", "Serbian (SET)"),
-        ("sk", "snk", "Slovak (SNK)"),
-        ("sl", "ssj", "Slovenian (SSJ)"),
-        ("ca", "ancora", "Catalan (AnCora)"),
-        ("gl", "treegal", "Galician (TreeGal)"),
-        ("pt", "bosque", "Portuguese (Bosque)"),
-        ("ro", "rrt", "Romanian (RRT)"),
-        ("fi", "tdt", "Finnish (TDT)"),
-        ("sv", "talbanken", "Swedish (Talbanken)"),
-        ("no", "bokmaal", "Norwegian Bokmål"),
-        ("da", "ddt", "Danish (DDT)"),
-        ("nl", "alpino", "Dutch (Alpino)"),
-        ("et", "edt", "Estonian (EDT)"),
-        ("lv", "lvtb", "Latvian (LVTB)"),
-        ("lt", "alksnys", "Lithuanian (ALKSNYS)"),
-        ("el", "gdt", "Greek (GDT)"),
-        ("he", "htb", "Hebrew (HTB)"),
-        ("fa", "seraji", "Persian (Seraji)"),
-        ("id", "gsd", "Indonesian (GSD)"),
-        ("th", "pud", "Thai (PUD)"),
-        ("ta", "ttb", "Tamil (TTB)"),
-        ("te", "mtg", "Telugu (MTG)"),
-        ("ur", "udtb", "Urdu (UDTB)"),
-        ("eu", "bdt", "Basque (BDT)"),
-        ("ga", "idt", "Irish (IDT)"),
-        ("cy", "ccg", "Welsh (CCG)"),
-        ("gd", "arcosg", "Scottish Gaelic (ARCOSG)"),
-        ("br", "keb", "Breton (KEB)"),
-        ("mt", "mudt", "Maltese (MUDT)"),
-        ("is", "icepahc", "Icelandic (IcePaHC)"),
-        ("fo", "farpahc", "Faroese (FarPaHC)"),
-        ("nn", "nynorsk", "Norwegian Nynorsk"),
-        ("be", "hse", "Belarusian (HSE)"),
-        ("kk", "ktb", "Kazakh (KTB)"),
-        ("hy", "armtdp", "Armenian (ArmTDP)"),
-        ("mr", "ufal", "Marathi (UFAL)"),
-        ("sa", "vedic", "Sanskrit (Vedic)"),
-        ("la", "ittb", "Latin (ITTB)"),
-        ("grc", "proiel", "Ancient Greek"),
-        ("cu", "proiel", "Old Church Slavonic"),
-        ("got", "proiel", "Gothic"),
-        ("ug", "udt", "Uyghur (UDT)"),
-        ("kk", "atk", "Kazakh (ATK)"),
-        ("bn", "iitb", "Bengali (IITB)"),
-        ("km", "wtb", "Khmer (WTB)"),
-        ("lo", "pud", "Lao (PUD)"),
-        ("my", "myu", "Myanmar (Myu)"),
-    ]
+    # Load curated registry from remote (official/flexipipe/community)
+    registry_models = get_remote_models_for_backend(
+        "stanza",
+        use_cache=use_cache,
+        refresh_cache=refresh_cache,
+        verbose=verbose,
+    )
 
-    for lang, pkg, description in common_models:
-        model_key = f"{lang}_{pkg}"
+    for model_info in registry_models:
+        if not isinstance(model_info, dict):
+            continue
+        model_name = model_info.get("model")
+        if not model_name:
+            continue
+        language_iso = model_info.get("language_iso")
+        language_name = model_info.get("language_name")
         entry = build_model_entry(
             "stanza",
-            model_key,
-            language_code=lang,
-            language_name=clean_language_name(description),
-            description=description,
-            date=installed_models.get(model_key),
-            preferred=pkg == "ewt" and lang == "en",
+            model_name,
+            language_code=language_iso,
+            language_name=language_name,
+            preferred=model_info.get("preferred", False),
+            components=model_info.get("components"),
+            description=model_info.get("description"),
         )
-        result[model_key] = entry
+        entry["source"] = model_info.get("source")
+        if model_name in installed_models:
+            entry["status"] = "installed"
+            entry["installed"] = True
+            entry["date"] = installed_models[model_name]
+        result[model_name] = entry
+
+    # Add locally installed models not present in registry as flexipipe source
+    for model_name, date_str in installed_models.items():
+        if model_name in result:
+            continue
+        lang, pkg = (model_name.split("_", 1) + [""])[:2]
+        entry = build_model_entry(
+            "stanza",
+            model_name,
+            language_code=lang,
+            language_name=lang,
+            description=f"Local model ({pkg})" if pkg else "Local model",
+            preferred=False,
+        )
+        entry["source"] = "flexipipe"
+        entry["status"] = "installed"
+        entry["installed"] = True
+        entry["date"] = date_str
+        result[model_name] = entry
 
     if refresh_cache:
         try:
@@ -358,9 +328,9 @@ class StanzaBackend(BackendManager):
         self._resources = resources
         if not verbose:
             stanza_logger = logging.getLogger("stanza")
-            stanza_logger.setLevel(logging.ERROR)
+            stanza_logger.setLevel(logging.CRITICAL)  # suppress ERROR spam when retrying missing processors
             for handler in stanza_logger.handlers:
-                handler.setLevel(logging.ERROR)
+                handler.setLevel(logging.CRITICAL)
             stanza_logger.propagate = False
         self._model_name = model_name
         base_language = language or (model_name.split("_")[0] if model_name and "_" in model_name else "en")
@@ -376,6 +346,32 @@ class StanzaBackend(BackendManager):
             or DEFAULT_STANZA_PACKAGES.get(self._language, "ewt")
         )
         default_processors = ["tokenize", "pos", "lemma", "depparse", "ner"]
+        # Derive processors from registry components when available to avoid requesting
+        # processors (e.g., ner) that the package does not provide.
+        if processors is None and model_name:
+            try:
+                from .stanza import get_stanza_model_entries  # circular-safe import (self-file)
+            except Exception:
+                get_stanza_model_entries = None
+            if get_stanza_model_entries:
+                entries = get_stanza_model_entries(use_cache=True, refresh_cache=False, verbose=False)
+                entry = entries.get(model_name)
+                if entry:
+                    comp_map = {
+                        "tokenizer": "tokenize",
+                        "mwt": "mwt",
+                        "tagger": "pos",
+                        "lemmatizer": "lemma",
+                        "parser": "depparse",
+                        "ner": "ner",
+                        "sentiment": "sentiment",
+                        "constituency": "constituency",
+                        "coref": "coref",
+                    }
+                    components = entry.get("components") or []
+                    mapped = [comp_map[c] for c in components if c in comp_map]
+                    if mapped:
+                        default_processors = mapped
         if enable_wsd:
             print("[flexipipe] Warning: Stanza WSD is not supported; ignoring --stanza-wsd.")
         extra_flags = {
@@ -401,15 +397,21 @@ class StanzaBackend(BackendManager):
     def _ensure_pipeline(self):
         if self._pipeline:
             return self._pipeline
-        try:
-            self._pipeline = self._Pipeline(
+        # Track if we've already retried without missing processors to avoid loops
+        attempted_processors = self._processors
+
+        def _build_pipeline(proc_str: str):
+            return self._Pipeline(
                 lang=self._language,
                 package=self._package,
-                processors=self._processors,
+                processors=proc_str,
                 use_gpu=self._use_gpu,
                 tokenize_pretokenized=False,
                 dir=str(self._resources_dir),
             )
+
+        try:
+            self._pipeline = _build_pipeline(self._processors)
         except Exception:
             if self._download_model:
                 self._download(
@@ -418,16 +420,27 @@ class StanzaBackend(BackendManager):
                     processors=self._processors,
                     resource_dir=str(self._resources_dir),
                 )
-                self._pipeline = self._Pipeline(
-                    lang=self._language,
-                    package=self._package,
-                    processors=self._processors,
-                    use_gpu=self._use_gpu,
-                    tokenize_pretokenized=False,
-                    dir=str(self._resources_dir),
-                )
+                self._pipeline = _build_pipeline(self._processors)
             else:
-                raise
+                # Retry once without processors that are missing (e.g., ner absent for some langs)
+                proc_list = [p.strip() for p in self._processors.split(",") if p.strip()]
+                filtered = []
+                for p in proc_list:
+                    # If corresponding directory is missing, drop it
+                    proc_dir = self._resources_dir / self._language / p
+                    if proc_dir.exists():
+                        filtered.append(p)
+                    else:
+                        # Always allow core pipeline to proceed by skipping missing extras
+                        continue
+                if filtered and filtered != proc_list:
+                    try:
+                        attempted_processors = ",".join(filtered)
+                        self._pipeline = _build_pipeline(attempted_processors)
+                    except Exception:
+                        raise
+                else:
+                    raise
         return self._pipeline
 
     def tag(

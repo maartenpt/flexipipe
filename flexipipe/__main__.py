@@ -1118,6 +1118,7 @@ def _auto_select_model_for_language(
                 "cu": ["church", "slavonic", "old_church", "old_east_slavic", "birchbark", "rnc", "ruthenian", "torot"],  # Old Church Slavonic and Old East Slavic
             }
         
+        backend_unavailable_status = None
         for backend, model_name, entry in matches:
             # If backend is locked, only check the requested backend (skip availability check for others)
             if backend_locked and requested_backend and backend != requested_backend:
@@ -1125,10 +1126,16 @@ def _auto_select_model_for_language(
                     print(f"[flexipipe] DEBUG: Skipping {backend}/{model_name} - backend locked to {requested_backend}", file=sys.stderr)
                 continue
             # Skip backends that aren't available (missing required modules)
-            from .backend_registry import is_backend_available
-            if not is_backend_available(backend):
+            from .backend_registry import is_backend_available, get_backend_status
+            backend_status = get_backend_status(backend)
+            if not backend_status.get("available", False):
+                backend_unavailable_status = backend_status
                 if getattr(args, "verbose", False) or getattr(args, "debug", False):
-                    print(f"[flexipipe] Skipping backend '{backend}' (required module not available)", file=sys.stderr)
+                    hint = backend_status.get("install_hint") or ""
+                    msg = f"[flexipipe] Skipping backend '{backend}' (required module not available)"
+                    if hint:
+                        msg += f" - install hint: {hint}"
+                    print(msg, file=sys.stderr)
                 if getattr(args, "debug", False):
                     print(f"[flexipipe] DEBUG: Skipping {backend}/{model_name} - backend not available", file=sys.stderr)
                 continue
@@ -1182,6 +1189,14 @@ def _auto_select_model_for_language(
 
     if not selection:
         if backend_locked and requested_backend:
+            # If the locked backend was unavailable, surface that instead of a generic “no models”
+            if backend_unavailable_status:
+                install_hint = backend_unavailable_status.get("install_hint") or ""
+                status = backend_unavailable_status.get("status") or "unavailable"
+                msg = f"[flexipipe] Backend '{requested_backend}' is not available (status={status})."
+                if install_hint:
+                    msg += f" Install hint: {install_hint}"
+                print(msg, file=sys.stderr)
             return backend_type
         # Only emit the “no models” notice in verbose/debug, and make it clear it’s after search.
         if getattr(args, "verbose", False) or getattr(args, "debug", False):
@@ -1210,6 +1225,10 @@ def _auto_select_model_for_language(
         return backend_type
     if backend_locked and requested_backend and chosen_backend != requested_backend:
             return backend_type
+
+    # Persist the selected backend/model onto args so downstream logic knows a model was found.
+    args.backend = chosen_backend
+    args.model = chosen_model
 
     # Final verification: if language is an ISO code, ensure the selected model has that exact ISO code
     # This is a safety check in case the filter above didn't catch something
@@ -2150,6 +2169,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["table", "json"],
         default="table",
         help="Output format (default: table). Use 'json' for machine-readable output.",
+    )
+    languages_parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Force refresh of language mappings and unified catalog cache",
     )
     
     # info models
@@ -3421,6 +3445,7 @@ def run_tag(args: argparse.Namespace) -> int:
     # Apply defaults from config if not specified
     from .model_storage import get_default_backend, get_default_output_format, get_default_create_implicit_mwt, get_default_writeback, get_default_download_model
     from .doc import Document
+    from .language_mapping import get_language_metadata
     
     backend_type = args.backend
     if backend_type:
@@ -3456,6 +3481,17 @@ def run_tag(args: argparse.Namespace) -> int:
     language_arg = getattr(args, "language", None)
     if isinstance(language_arg, str) and language_arg.strip().lower() == "auto":
         args.language = None
+    elif isinstance(language_arg, str) and language_arg.strip():
+        # Normalize language to canonical ISO (prefer iso_639_1, fall back to iso_639_3)
+        lang_meta = get_language_metadata(language_arg)
+        canonical_lang = (
+            lang_meta.get("iso_639_1")
+            or lang_meta.get("iso_639_3")
+            or language_arg.strip().lower()
+        )
+        args.language = canonical_lang
+        # Keep a display name for user messages
+        args.language_name = lang_meta.get("primary_name") or language_arg
     output_explicit = args.output_format is not None
     writeback_explicit = args.writeback is not None
     if args.output_format is None:
@@ -3494,12 +3530,28 @@ def run_tag(args: argparse.Namespace) -> int:
         args.data = [example_text]
         args.input = "<inline-data>"
     
-    # If no model was selected for a locked/explicit backend, stop early before contacting the backend.
+    # If no model was selected for a locked/explicit backend, try auto-selection once
     model_name = getattr(args, "model", None)
     if backend_type and not model_name:
-        lang_display = getattr(args, "language", None) or "unknown"
-        print(f"[flexipipe] No available models found for language '{lang_display}'.", file=sys.stderr)
-        return 1
+        if not auto_selected:
+            backend_type = _auto_select_model_for_language(args, backend_type)
+            args.backend = backend_type
+            auto_selected = True
+            model_name = getattr(args, "model", None)
+        if backend_type and not model_name:
+            # If backend is unavailable, surface that explicitly
+            from .backend_registry import get_backend_status
+            status = get_backend_status(backend_type)
+            if not status.get("available", False):
+                hint = status.get("install_hint") or ""
+                msg = f"[flexipipe] Backend '{backend_type}' is not available (status={status.get('status') or 'unavailable'})."
+                if hint:
+                    msg += f" Install hint: {hint}"
+                print(msg, file=sys.stderr)
+            else:
+                lang_display = getattr(args, "language", None) or "unknown"
+                print(f"[flexipipe] No available models found for language '{lang_display}'.", file=sys.stderr)
+            return 1
 
     # If --input is not provided, check if STDIN has data
     inline_data_tokens = getattr(args, "data", None)

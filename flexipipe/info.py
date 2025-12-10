@@ -595,18 +595,23 @@ def list_languages(args: argparse.Namespace) -> int:
     """List all languages that have models available."""
     import time
     from .model_catalog import build_unified_catalog
-    from .language_mapping import get_language_metadata
+    from .language_mapping import get_language_metadata, reload_language_mappings
     
     start_time = time.time()
     debug = getattr(args, "debug", False)
     output_format = getattr(args, "output_format", "table")
+    force_refresh = bool(getattr(args, "refresh_cache", False))
     
     if debug:
         print("[DEBUG] Building unified catalog to extract language information...", file=sys.stderr)
         catalog_start = time.time()
+
+    # Refresh language mappings if requested
+    if force_refresh:
+        reload_language_mappings(refresh_cache=True, verbose=debug)
     
     # Build unified catalog to get all models
-    catalog = build_unified_catalog(use_cache=True, refresh_cache=False, verbose=debug)
+    catalog = build_unified_catalog(use_cache=not force_refresh, refresh_cache=force_refresh, verbose=debug)
     
     if debug:
         catalog_time = time.time() - catalog_start
