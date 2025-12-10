@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -10,7 +11,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from ..backend_spec import BackendSpec
-from ..conllu import conllu_to_document, document_to_conllu
+from ..conllu import conllu_to_document, document_to_conllu, parse_conllu_from_backend
 from ..doc import Document
 from ..language_utils import (
     LANGUAGE_FIELD_ISO,
@@ -32,6 +33,8 @@ from ..neural_backend import BackendManager, NeuralResult
 
 MODEL_CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 hours
 DEFAULT_REST_ENDPOINT = "https://lindat.mff.cuni.cz/services/udpipe/api/process"
+# Public UDPipe model list endpoint (for REST models)
+DEFAULT_UDPIPE_MODELS_ENDPOINT = "https://lindat.mff.cuni.cz/services/udpipe/api/models"
 DEFAULT_UDPIPE_REGISTRY_URL = DEFAULT_REGISTRY_BASE_URL.rstrip("/") + "/udpipe.json"
 
 
@@ -45,6 +48,21 @@ def get_udpipe_model_entries(
 ) -> Dict[str, Dict[str, str]]:
     endpoint = url or DEFAULT_REST_ENDPOINT
     registry_url = get_registry_url("udpipe")
+
+    # If caller asked for refresh, drop the cached registry and model cache so we refetch 2.17+
+    if refresh_cache:
+        try:
+            # Remove curated registry cache on disk
+            registry_path = get_backend_registry_file("udpipe")
+            registry_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            # Remove model list cache used for REST backends by overwriting with empty data
+            cache_key = f"udpipe:{DEFAULT_UDPIPE_MODELS_ENDPOINT}"
+            write_model_cache_entry(cache_key, {})
+        except Exception:
+            pass
 
     curated_entries = _load_curated_udpipe_registry(
         registry_url,
@@ -150,15 +168,43 @@ def _entries_from_curated_registry(
             if not model_name:
                 continue
 
+            # Preserve the original language_iso from the registry
+            # Don't normalize non-standard codes like "old_ch" (Old Church Slavonic)
+            original_language_iso = model_info.get("language_iso")
+            original_language_name = model_info.get("language_name")
+            
+            # Debug: log if we see OCS models with incorrect language_iso
+            if verbose and model_name and ("old_church" in model_name.lower() or "old_east_slavic" in model_name.lower()):
+                if original_language_iso and original_language_iso.lower() not in {"old_ch", "cu", "orv"}:
+                    print(f"[flexipipe] WARNING: OCS/Old East Slavic model '{model_name}' has language_iso='{original_language_iso}' in registry (expected 'old_ch', 'cu', or 'orv')", file=sys.stderr)
+            
             entry = build_model_entry(
                 "udpipe",
                 model_name,
-                language_code=model_info.get("language_iso"),
-                language_name=model_info.get("language_name"),
+                language_code=original_language_iso,
+                language_name=original_language_name,
                 preferred=model_info.get("preferred", False),
                 features=model_info.get("features"),
                 tasks=model_info.get("tasks"),
             )
+            
+            # If the registry has a non-standard code (like "old_ch"), preserve it
+            # standardize_language_metadata might normalize it incorrectly through name lookup
+            # Check if the model name indicates a non-standard language that should preserve its code
+            model_name_lower = (model_name or "").lower()
+            if original_language_iso:
+                original_iso_lower = original_language_iso.lower()
+                # Non-standard codes that should be preserved
+                non_standard_codes = {"old_ch", "cu", "orv"}  # Old Church Slavonic, Church Slavonic, Old East Slavic
+                if original_iso_lower in non_standard_codes:
+                    # Preserve the original non-standard code
+                    entry[LANGUAGE_FIELD_ISO] = original_iso_lower
+                elif "old_church" in model_name_lower or "old_east_slavic" in model_name_lower:
+                    # Model name indicates OCS/Old East Slavic but registry might have wrong code
+                    # If the normalized code doesn't match, preserve original if it's a known non-standard code
+                    normalized_iso = entry.get(LANGUAGE_FIELD_ISO, "").lower()
+                    if normalized_iso not in non_standard_codes and original_iso_lower in non_standard_codes:
+                        entry[LANGUAGE_FIELD_ISO] = original_iso_lower
             for extra_key in (
                 "components",
                 "description",
@@ -459,10 +505,13 @@ class UDPipeRESTBackend(BackendManager):
             # Pretokenized mode: send CoNLL-U format to preserve tokenization and TokIds
             # UDPipe REST API should preserve TokIds in MISC column when input=conllu
             # Force include TokId in MISC so UDPipe preserves it
-            conllu_text = document_to_conllu(document, include_tokid=True)
+            # Include SpaceAfter=No in MISC to accurately represent spacing and prevent incorrect MWT creation
+            conllu_text = document_to_conllu(document, include_tokid=True, suppress_space_after_in_misc=False)
             
             # UDPipe REST API doesn't accept CoNLL-U with existing dependency relations
             # Clear HEAD (column 6) and DEPREL (column 7) before sending
+            # SpaceAfter=No is included in MISC to accurately represent spacing
+            # UDPipe may create MWTs from SpaceAfter=No sequences, which we handle in matching
             lines = conllu_text.split('\n')
             cleaned_lines = []
             for line in lines:
@@ -501,10 +550,8 @@ class UDPipeRESTBackend(BackendManager):
         
         # Parse the CoNLL-U result and return the tagged document
         # When using CoNLL-U input, TokIds should be preserved in MISC column
-        tagged_doc = conllu_to_document(result_text, doc_id=document.id)
-        
-        # Preserve original metadata
-        tagged_doc.meta.update(document.meta)
+        # Use helper function that preserves flags from source document
+        tagged_doc = parse_conllu_from_backend(result_text, document)
         
         return NeuralResult(document=tagged_doc, stats={})
 

@@ -875,7 +875,7 @@ def _auto_select_model_for_language(
                     print(f"[flexipipe] Warning: could not refresh model registry for backend '{backend}': {exc}")
         return entries_map
 
-    def ensure_entries(order: list[str]) -> dict[str, dict]:
+    def ensure_entries(order: list[str], refresh: bool) -> dict[str, dict]:
         # If backend is locked and we only have one backend in order, only fetch for that one
         if backend_locked and len(order) == 1:
             backend = order[0]
@@ -883,7 +883,11 @@ def _auto_select_model_for_language(
             # Try unified catalog first
             try:
                 from .model_catalog import build_unified_catalog
-                catalog = build_unified_catalog(use_cache=True, refresh_cache=False, verbose=False)
+                catalog = build_unified_catalog(
+                    use_cache=not refresh,
+                    refresh_cache=refresh,
+                    verbose=False,
+                )
                 for entry in catalog.values():
                     if entry.get("backend") == backend:
                         model_name = entry.get("model")
@@ -895,7 +899,7 @@ def _auto_select_model_for_language(
             
             # Only fetch for this specific backend if needed
             if backend not in entries_map or not entries_map.get(backend):
-                entries_map.update(_load_backend_entries_for_order([backend], refresh=False))
+                entries_map.update(_load_backend_entries_for_order([backend], refresh=refresh))
                 if not entries_map.get(backend):
                     entries_map.update(_load_backend_entries_for_order([backend], refresh=True))
             else:
@@ -908,7 +912,11 @@ def _auto_select_model_for_language(
         try:
             from .model_catalog import build_unified_catalog
 
-            catalog = build_unified_catalog(use_cache=True, refresh_cache=False, verbose=False)
+            catalog = build_unified_catalog(
+                use_cache=not refresh,
+                refresh_cache=refresh,
+                verbose=False,
+            )
             for entry in catalog.values():
                 backend = entry.get("backend")
                 if not backend or backend not in order:
@@ -922,7 +930,7 @@ def _auto_select_model_for_language(
 
         missing_backends = [backend for backend in order if backend not in entries_map]
         if missing_backends:
-            entries_map.update(_load_backend_entries_for_order(missing_backends, refresh=False))
+            entries_map.update(_load_backend_entries_for_order(missing_backends, refresh=refresh))
 
         # Ensure all keys exist even if empty
         for backend in order:
@@ -937,51 +945,262 @@ def _auto_select_model_for_language(
         return entries_map
 
     query = resolve_language_query(language)
+    
+    # Check if language is a valid ISO code (2 or 3 letters) - if so, only use exact matching
+    # This prevents fuzzy matching from incorrectly matching ISO codes to unrelated languages
+    is_iso_code = language and len(language.strip()) in {2, 3} and language.strip().isalpha()
+    use_fuzzy = not is_iso_code  # Don't use fuzzy matching for ISO codes
 
     def pick_best(entries_map: dict[str, dict], allow_fuzzy: bool) -> Optional[tuple[str, dict]]:
-        matches = _collect_language_matches(entries_map, query, allow_fuzzy=allow_fuzzy)
+        # If language is an ISO code, don't allow fuzzy matching
+        if is_iso_code and allow_fuzzy:
+            return None
+        
+        # If language is an ISO code, only match on ISO codes (not language names)
+        # This prevents matching through normalized names which can cause incorrect matches
+        if is_iso_code:
+            from .language_mapping import get_language_metadata
+            lang_lower = language.strip().lower()
+            matches = []
+            for backend, entries in entries_map.items():
+                if not isinstance(entries, dict) or (len(entries) == 1 and "error" in entries):
+                    continue
+                for model_name, entry in entries.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    from .benchmark import is_model_disabled
+                    if is_model_disabled(backend, model_name):
+                        continue
+                    # Normalize the entry's language_iso using language mapping
+                    # This handles aliases like "old_ch" -> "cu"
+                    entry_iso_raw = (entry.get(LANGUAGE_FIELD_ISO) or "").lower()
+                    
+                    # Check model name to correct incorrect registry data
+                    # If model name clearly indicates a different language, use that instead
+                    model_name_lower = (model_name or "").lower()
+                    corrected_iso = entry_iso_raw
+                    
+                    # Language indicators from model names
+                    name_to_iso = {
+                        "old_church": "cu",
+                        "old_church_slavonic": "cu",
+                        "old_east_slavic": "orv",
+                        "birchbark": "orv",
+                        "rnc": "orv",
+                        "ruthenian": "orv",
+                        "torot": "orv",
+                    }
+                    
+                    for name_indicator, correct_iso in name_to_iso.items():
+                        if name_indicator in model_name_lower:
+                            corrected_iso = correct_iso
+                            break
+                    
+                    # Normalize the (possibly corrected) ISO code
+                    entry_metadata = get_language_metadata(corrected_iso) if corrected_iso else {}
+                    # Get the normalized ISO-1 code (or ISO-3 if no ISO-1)
+                    normalized_entry_iso = (entry_metadata.get("iso_639_1") or entry_metadata.get("iso_639_3") or corrected_iso).lower()
+                    
+                    # Only match if the normalized ISO code matches
+                    if normalized_entry_iso == lang_lower:
+                        matches.append((backend, model_name, entry))
+        else:
+            matches = _collect_language_matches(entries_map, query, allow_fuzzy=allow_fuzzy)
         if not matches:
             return None
+        
+        # If language is an ISO code, apply model name check to filter out incorrect registry data
+        # (e.g., OCS models incorrectly marked as "es" in the registry)
+        if is_iso_code:
+            lang_lower = language.strip().lower()
+            # Language indicators to check model names for conflicting languages
+            language_indicators = {
+                "es": ["spanish", "espanol", "español"],
+                "en": ["english"],
+                "de": ["german", "deutsch"],
+                "fr": ["french", "francais", "français"],
+                "it": ["italian", "italiano"],
+                "pt": ["portuguese", "portugues"],
+                "ru": ["russian", "russkij"],
+                "cs": ["czech", "cesky"],
+                "pl": ["polish", "polski"],
+                "sl": ["slovenian", "slovene"],
+                "bg": ["bulgarian"],
+                "hr": ["croatian"],
+                "sr": ["serbian"],
+                "uk": ["ukrainian"],
+                "cu": ["church", "slavonic", "old_church", "old_east_slavic", "birchbark", "rnc", "ruthenian", "torot"],  # Old Church Slavonic and Old East Slavic
+            }
+            filtered_matches = []
+            rejected_count = 0
+            for backend, model_name, entry in matches:
+                # Check model name for conflicting language indicators
+                # This catches cases where the registry has incorrect language_iso but the model name is correct
+                model_name_lower = (model_name or "").lower()
+                has_conflicting_indicator = False
+                if lang_lower in language_indicators:
+                    for other_lang, other_indicators in language_indicators.items():
+                        if other_lang != lang_lower:
+                            for indicator in other_indicators:
+                                if indicator in model_name_lower:
+                                    # Model name indicates a different language - reject it
+                                    has_conflicting_indicator = True
+                                    rejected_count += 1
+                                    if getattr(args, "verbose", False) or getattr(args, "debug", False):
+                                        entry_iso = (entry.get(LANGUAGE_FIELD_ISO) or "").lower()
+                                        print(f"[flexipipe] DEBUG: Rejecting model '{model_name}' (backend: {backend}) - model name contains '{indicator}' indicating language '{other_lang}', but registry has language_iso='{entry_iso}' (incorrect registry data)", file=sys.stderr)
+                                    break
+                            if has_conflicting_indicator:
+                                break
+                if not has_conflicting_indicator:
+                    filtered_matches.append((backend, model_name, entry))
+            matches = filtered_matches
+            if not matches:
+                if getattr(args, "verbose", False) or getattr(args, "debug", False):
+                    print(f"[flexipipe] No models found with exact ISO code match for language '{language}' (rejected {rejected_count} non-matching models)", file=sys.stderr)
+                return None
+            elif getattr(args, "verbose", False) or getattr(args, "debug", False):
+                print(f"[flexipipe] DEBUG: Found {len(matches)} models with exact ISO code '{lang_lower}' (rejected {rejected_count} non-matching models)", file=sys.stderr)
+        
         def sort_key(item: tuple[str, str, dict]):
             backend, model_name, entry = item
+            # Check backend availability first - unavailable backends should be sorted last
+            from .backend_registry import is_backend_available
+            backend_available = is_backend_available(backend)
+            # Also check spacy model availability
+            spacy_available = True
+            if backend == "spacy" and not backend_locked:
+                spacy_available = _spacy_model_available(model_name)
+            availability_score = 0 if (backend_available and spacy_available) else 1
+            
             # Use preferred flag if available (from unified catalog)
             preferred_score = 0 if entry.get("preferred", False) else 1
             status = (entry.get("status") or "").lower()
             installed_score = 0 if status == "installed" else 1
             backend_score = backend_rank.get(backend, len(combined_order))
-            return (preferred_score, installed_score, backend_score, model_name)
+            # Sort by: availability (available first), preferred, installed, backend rank, model name
+            return (availability_score, preferred_score, installed_score, backend_score, model_name)
 
         matches.sort(key=sort_key)
+        if getattr(args, "debug", False) and matches:
+            from .backend_registry import is_backend_available
+            print(f"[flexipipe] DEBUG: Sorted {len(matches)} matching models (showing first 10):", file=sys.stderr)
+            for idx, (b, m, e) in enumerate(matches[:10]):
+                backend_avail = is_backend_available(b)
+                spacy_avail = True
+                if b == "spacy" and not backend_locked:
+                    spacy_avail = _spacy_model_available(m)
+                avail_str = "available" if (backend_avail and spacy_avail) else "UNAVAILABLE"
+                print(f"[flexipipe] DEBUG:   {idx+1}. {b}/{m}: {avail_str}, preferred={e.get('preferred', False)}, status={e.get('status', 'unknown')}", file=sys.stderr)
+        
+        # If language is an ISO code, also check model names for language indicators
+        # This catches cases where the registry has incorrect language_iso but the model name is correct
+        language_indicators = None
+        if is_iso_code:
+            lang_lower = language.strip().lower()
+            language_indicators = {
+                "es": ["spanish", "espanol", "español"],
+                "en": ["english"],
+                "de": ["german", "deutsch"],
+                "fr": ["french", "francais", "français"],
+                "it": ["italian", "italiano"],
+                "pt": ["portuguese", "portugues"],
+                "ru": ["russian", "russkij"],
+                "cs": ["czech", "cesky"],
+                "pl": ["polish", "polski"],
+                "sl": ["slovenian", "slovene"],
+                "bg": ["bulgarian"],
+                "hr": ["croatian"],
+                "sr": ["serbian"],
+                "uk": ["ukrainian"],
+                "cu": ["church", "slavonic", "old_church", "old_east_slavic", "birchbark", "rnc", "ruthenian", "torot"],  # Old Church Slavonic and Old East Slavic
+            }
+        
         for backend, model_name, entry in matches:
             # If backend is locked, only check the requested backend (skip availability check for others)
             if backend_locked and requested_backend and backend != requested_backend:
+                if getattr(args, "debug", False):
+                    print(f"[flexipipe] DEBUG: Skipping {backend}/{model_name} - backend locked to {requested_backend}", file=sys.stderr)
                 continue
             # Skip backends that aren't available (missing required modules)
             from .backend_registry import is_backend_available
             if not is_backend_available(backend):
                 if getattr(args, "verbose", False) or getattr(args, "debug", False):
                     print(f"[flexipipe] Skipping backend '{backend}' (required module not available)", file=sys.stderr)
+                if getattr(args, "debug", False):
+                    print(f"[flexipipe] DEBUG: Skipping {backend}/{model_name} - backend not available", file=sys.stderr)
                 continue
             # Skip spacy if model isn't available (unless backend is locked)
             if backend == "spacy" and not backend_locked and not _spacy_model_available(model_name):
+                if getattr(args, "debug", False):
+                    print(f"[flexipipe] DEBUG: Skipping {backend}/{model_name} - spacy model not available", file=sys.stderr)
                 continue
+            
+            # Check model name for language indicators if we have an ISO code
+            skip_model = False
+            if is_iso_code and language_indicators and lang_lower in language_indicators:
+                model_name_lower = (model_name or "").lower()
+                expected_indicators = language_indicators[lang_lower]
+                # Check if model name contains indicators for other languages (especially conflicting ones)
+                for other_lang, other_indicators in language_indicators.items():
+                    if other_lang != lang_lower:
+                        for indicator in other_indicators:
+                            if indicator in model_name_lower:
+                                # This model is for a different language - skip it and try next
+                                if getattr(args, "verbose", False) or getattr(args, "debug", False):
+                                    print(f"[flexipipe] Skipping model '{model_name}' - model name contains '{indicator}' indicating language '{other_lang}', but requested '{lang_lower}'", file=sys.stderr)
+                                skip_model = True
+                                break
+                        if skip_model:
+                            break
+            if skip_model:
+                continue  # Skip to next model
+            
+            if getattr(args, "debug", False):
+                print(f"[flexipipe] DEBUG: Selected {backend}/{model_name} from {len(matches)} candidates", file=sys.stderr)
             return backend, entry
+        if getattr(args, "debug", False) and matches:
+            print(f"[flexipipe] DEBUG: All {len(matches)} matching models were skipped (backend availability or other checks)", file=sys.stderr)
         return None
 
     backend_rank = {name: idx for idx, name in enumerate(combined_order)}
 
     # First try requested backend (if any)
-    primary_entries = ensure_entries(search_order)
-    selection = pick_best(primary_entries, allow_fuzzy=False) or pick_best(primary_entries, allow_fuzzy=True)
+    primary_entries = ensure_entries(search_order, refresh=getattr(args, "refresh_cache", False))
+    selection = pick_best(primary_entries, allow_fuzzy=False)
+    if not selection and use_fuzzy:
+        selection = pick_best(primary_entries, allow_fuzzy=True)
 
     # If nothing found, try remaining backends
     if not selection and remaining:
         secondary_entries = ensure_entries(remaining)
-        selection = pick_best(secondary_entries, allow_fuzzy=False) or pick_best(secondary_entries, allow_fuzzy=True)
+        selection = pick_best(secondary_entries, allow_fuzzy=False)
+        if not selection and use_fuzzy:
+            selection = pick_best(secondary_entries, allow_fuzzy=True)
 
     if not selection:
         if backend_locked and requested_backend:
             return backend_type
+        # Debug: show what models are available
+        if getattr(args, "verbose", False) or getattr(args, "debug", False):
+            all_entries = {}
+            for backend in combined_order:
+                if backend not in excluded:
+                    entries = ensure_entries([backend], refresh=getattr(args, "refresh_cache", False))
+                    if entries.get(backend):
+                        all_entries.update(entries)
+            if all_entries:
+                print(f"[flexipipe] DEBUG: Available models in registry:", file=sys.stderr)
+                for backend, entries in all_entries.items():
+                    for model_name, entry in entries.items():
+                        entry_iso = (entry.get(LANGUAGE_FIELD_ISO) or "").lower()
+                        entry_name = entry.get(LANGUAGE_FIELD_NAME) or ""
+                        if is_iso_code and entry_iso == language.strip().lower():
+                            print(f"[flexipipe] DEBUG:   {backend}/{model_name}: language_iso='{entry_iso}', language_name='{entry_name}' (MATCHES)", file=sys.stderr)
+                        elif is_iso_code:
+                            # Only show non-matching models in debug mode
+                            if getattr(args, "debug", False):
+                                print(f"[flexipipe] DEBUG:   {backend}/{model_name}: language_iso='{entry_iso}', language_name='{entry_name}'", file=sys.stderr)
         print(f"[flexipipe] No available models found for language '{language}'.")
         return backend_type
 
@@ -990,6 +1209,54 @@ def _auto_select_model_for_language(
     if not chosen_model:
         return backend_type
     if backend_locked and requested_backend and chosen_backend != requested_backend:
+            return backend_type
+
+    # Final verification: if language is an ISO code, ensure the selected model has that exact ISO code
+    # This is a safety check in case the filter above didn't catch something
+    if is_iso_code:
+        entry_iso = (entry.get(LANGUAGE_FIELD_ISO) or "").lower()
+        lang_lower = language.strip().lower()
+        
+        # Also check model name - if it contains language indicators that don't match, reject it
+        # This catches cases where the registry has incorrect language_iso but the model name is correct
+        model_name_lower = (chosen_model or "").lower()
+        # Common language indicators in model names that should match
+        language_indicators = {
+            "es": ["spanish", "espanol", "español"],
+            "en": ["english"],
+            "de": ["german", "deutsch"],
+            "fr": ["french", "francais", "français"],
+            "it": ["italian", "italiano"],
+            "pt": ["portuguese", "portugues"],
+            "ru": ["russian", "russkij"],
+            "cs": ["czech", "cesky"],
+            "pl": ["polish", "polski"],
+            "sl": ["slovenian", "slovene"],
+            "bg": ["bulgarian"],
+            "hr": ["croatian"],
+            "sr": ["serbian"],
+            "uk": ["ukrainian"],
+            "cu": ["church", "slavonic", "old_church", "old_east_slavic", "birchbark", "rnc", "ruthenian", "torot"],  # Old Church Slavonic and Old East Slavic
+        }
+        
+        # Check if model name contains indicators for a different language
+        if lang_lower in language_indicators:
+            expected_indicators = language_indicators[lang_lower]
+            # Check if model name contains indicators for other languages (especially conflicting ones)
+            for other_lang, other_indicators in language_indicators.items():
+                if other_lang != lang_lower:
+                    for indicator in other_indicators:
+                        if indicator in model_name_lower:
+                            # This model is for a different language - reject it
+                            if getattr(args, "verbose", False) or getattr(args, "debug", False):
+                                print(f"[flexipipe] Rejecting selected model '{chosen_model}' - model name contains '{indicator}' indicating language '{other_lang}', but requested '{lang_lower}'", file=sys.stderr)
+                            print(f"[flexipipe] No available models found for language '{language}' (exact ISO code match required).", file=sys.stderr)
+                            return backend_type
+        
+        if entry_iso != lang_lower:
+            if getattr(args, "verbose", False) or getattr(args, "debug", False):
+                print(f"[flexipipe] Rejecting selected model '{chosen_model}' - language_iso mismatch: entry has '{entry_iso}', requested '{lang_lower}'", file=sys.stderr)
+            print(f"[flexipipe] No available models found for language '{language}' (exact ISO code match required).", file=sys.stderr)
             return backend_type
 
     # Prefer ISO code over language name (language names may include incorrect treebank names like "English (EWT)")
@@ -1415,6 +1682,11 @@ def build_parser() -> argparse.ArgumentParser:
         "-V",
         action="version",
         version=f"flexipipe {version}",
+    )
+    parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Force refresh of model registries and unified catalog (REST backends like UDPipe).",
     )
     # Add global arguments (available in all subcommands)
     parser.add_argument(
@@ -1922,6 +2194,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--refresh",
         action="store_true",
         help="Force refresh of example metadata (re-download files if needed)",
+    )
+    examples_parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Alias for --refresh (force re-download of example metadata)",
     )
 
     # validate -----------------------------------------------------------
@@ -3143,6 +3420,7 @@ def _prepare_spacy_model_if_needed(args: argparse.Namespace) -> None:
 def run_tag(args: argparse.Namespace) -> int:
     # Apply defaults from config if not specified
     from .model_storage import get_default_backend, get_default_output_format, get_default_create_implicit_mwt, get_default_writeback, get_default_download_model
+    from .doc import Document
     
     backend_type = args.backend
     if backend_type:
@@ -3426,12 +3704,8 @@ def run_tag(args: argparse.Namespace) -> int:
                     original_input_path = tmp_path
                     # Treat as raw text input
                     detection_source_text = raw_text
-                    detection_attempted = True
-                    detection_result = _maybe_detect_language(args, detection_source_text)
-                    if not auto_selected:
-                        backend_type = _auto_select_model_for_language(args, backend_type)
-                        args.backend = backend_type
-                        auto_selected = True
+                    # Note: Language detection will happen later after checking settings.xml
+                    # We don't set detection_attempted here so that settings.xml can be checked first
                     
                     # Determine which backend to use (needed to decide on segmentation)
                     backend_type = getattr(args, "backend", None)
@@ -3456,6 +3730,25 @@ def run_tag(args: argparse.Namespace) -> int:
                     doc.meta["original_input_xpath"] = textnode_xpath
                     if not read_from_stdin:
                         assign_doc_id_from_path(doc, original_input_path)
+                    
+                    # Load TEITOK settings even when file has no tokens (needed for writeback and language)
+                    # Note: For stdin, settings won't be available, but that's OK
+                    if not read_from_stdin:
+                        teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, tmp_path)
+                        if teitok_settings:
+                            if not teitok_settings_obj:
+                                teitok_settings_obj = teitok_settings
+                            if not writeback_explicit:
+                                args.writeback = True
+                            if args.verbose or args.debug:
+                                print("[flexipipe] Loaded TEITOK settings for untokenized file", file=sys.stderr)
+                            # Set language from settings.xml if not already set
+                            if not getattr(args, "language", None):
+                                settings_lang = teitok_settings.get_language()
+                                if settings_lang:
+                                    args.language = settings_lang
+                                    if args.verbose or args.debug:
+                                        print(f"[flexipipe] Using language from settings.xml: {settings_lang}", file=sys.stderr)
                 else:
                     # Load TEITOK settings and merge with CLI mappings
                     teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, tmp_path)
@@ -3508,12 +3801,8 @@ def run_tag(args: argparse.Namespace) -> int:
                     print("=" * 80)
                 # Treat as raw text input
                 detection_source_text = raw_text
-                detection_attempted = True
-                detection_result = _maybe_detect_language(args, detection_source_text)
-                if not auto_selected:
-                    backend_type = _auto_select_model_for_language(args, backend_type)
-                    args.backend = backend_type
-                    auto_selected = True
+                # Note: Language detection will happen later after checking settings.xml
+                # We don't set detection_attempted here so that settings.xml can be checked first
                 
                 # Determine which backend to use (needed to decide on segmentation)
                 backend_type = getattr(args, "backend", None)
@@ -3537,6 +3826,23 @@ def run_tag(args: argparse.Namespace) -> int:
                 doc.meta.setdefault("source_path", args.input)
                 assign_doc_id_from_path(doc, args.input)
                 note_source_path = note_source_path or args.input
+                
+                # Load TEITOK settings even when file has no tokens (needed for writeback and language)
+                teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, args.input)
+                if teitok_settings:
+                    if not teitok_settings_obj:
+                        teitok_settings_obj = teitok_settings
+                    if not writeback_explicit:
+                        args.writeback = True
+                    if args.verbose or args.debug:
+                        print("[flexipipe] Loaded TEITOK settings for untokenized file", file=sys.stderr)
+                    # Set language from settings.xml if not already set
+                    if not getattr(args, "language", None):
+                        settings_lang = teitok_settings.get_language()
+                        if settings_lang:
+                            args.language = settings_lang
+                            if args.verbose or args.debug:
+                                print(f"[flexipipe] Using language from settings.xml: {settings_lang}", file=sys.stderr)
             else:
                 # Load TEITOK settings and merge with CLI mappings
                 teitok_settings, merged_attrs_map = _load_and_merge_teitok_settings(args, args.input)
@@ -3578,19 +3884,50 @@ def run_tag(args: argparse.Namespace) -> int:
         # 4. Language detection
         
         # Check document metadata first (from teiHeader)
+        # teiHeader language takes priority over settings.xml
         doc_lang = None
-        if hasattr(doc, "attrs") and doc.attrs:
+        
+        # First, try to extract language from TEI header's profileDesc/langUsage/language
+        if input_format == "teitok" and args.input and args.input not in ("-", "<inline-data>"):
+            try:
+                import xml.etree.ElementTree as ET
+                tree = ET.parse(args.input)
+                root = tree.getroot()
+                # Look for <profileDesc><langUsage><language ident="...">
+                profile_desc = root.find(".//{http://www.tei-c.org/ns/1.0}profileDesc")
+                if profile_desc is None:
+                    profile_desc = root.find(".//profileDesc")
+                if profile_desc is not None:
+                    lang_usage = profile_desc.find("{http://www.tei-c.org/ns/1.0}langUsage")
+                    if lang_usage is None:
+                        lang_usage = profile_desc.find("langUsage")
+                    if lang_usage is not None:
+                        lang_elem = lang_usage.find("{http://www.tei-c.org/ns/1.0}language")
+                        if lang_elem is None:
+                            lang_elem = lang_usage.find("language")
+                        if lang_elem is not None:
+                            # Get language from @ident attribute (preferred) or text content
+                            doc_lang = lang_elem.get("ident") or lang_elem.text
+                            if doc_lang:
+                                doc_lang = doc_lang.strip()
+            except Exception:
+                # If parsing fails, continue with other methods
+                pass
+        
+        # Also check doc.attrs and doc.meta (may have been set during loading)
+        if not doc_lang and hasattr(doc, "attrs") and doc.attrs:
             doc_lang = doc.attrs.get("language") or doc.attrs.get("lang")
         if not doc_lang and hasattr(doc, "meta") and doc.meta:
             doc_lang = doc.meta.get("language") or doc.meta.get("lang")
         
-        # If we have a language from document, use it
-        if doc_lang and not getattr(args, "language", None):
+        # If we have a language from document teiHeader, use it (overrides settings.xml)
+        if doc_lang:
+            # Override any language that was set from settings.xml
             args.language = doc_lang
             if args.verbose or args.debug:
                 print(f"[flexipipe] Using language from document metadata (teiHeader): {doc_lang}", file=sys.stderr)
         
-        # Check TEITOK settings.xml if still no language
+        # Check TEITOK settings.xml if still no language (only if teiHeader didn't provide one)
         if not getattr(args, "language", None) and input_format == "teitok":
             # Try to load settings if we haven't already
             if args.input and args.input not in ("-", "<inline-data>"):
@@ -3985,6 +4322,10 @@ def run_tag(args: argparse.Namespace) -> int:
             )
             if backend_type_lower == "udmorph":
                 use_raw_text = True
+            # Set create_implicit_mwt flag in document.meta so backend can use it when parsing CoNLL-U
+            create_implicit_mwt = getattr(args, "create_implicit_mwt", False)
+            if create_implicit_mwt:
+                doc.meta["_create_implicit_mwt"] = True
             try:
                 if args.verbose or args.debug:
                     components_str = ", ".join(sorted(neural_components)) if neural_components else "none"
@@ -4133,19 +4474,8 @@ def run_tag(args: argparse.Namespace) -> int:
         )
     elif output_format == "teitok":
         # Apply create_implicit_mwt if requested (for TEITOK output with <dtok> elements)
+        # But defer this until we know if we're in writeback mode and updating existing tokens
         output_doc = result.document
-        if args.create_implicit_mwt:
-            from .conllu import _create_implicit_mwt
-            # Create a new document with MWTs created
-            new_doc = Document(id=output_doc.id, meta=dict(output_doc.meta), attrs=dict(output_doc.attrs))
-            # Copy spans from original document
-            for layer, spans in output_doc.spans.items():
-                for span in spans:
-                    new_doc.add_span(layer, span)
-            for sent in output_doc.sentences:
-                new_sent = _create_implicit_mwt(sent)
-                new_doc.sentences.append(new_sent)
-            output_doc = new_doc
         validator_source_doc = output_doc
         
         # Apply tag mapping if requested
@@ -4226,9 +4556,54 @@ def run_tag(args: argparse.Namespace) -> int:
                     if not output_path or str(original_input_path.resolve()) == str(Path(output_path).resolve()):
                         use_writeback = True
                         # Check if this came from extracted text (non-tokenized TEITOK with --tokenize)
+                        # OR if --use-raw-text was used on an untokenized XML file
                         from .teitok import teitok_has_tokens
-                        if output_doc.meta.get("original_input_path") and not teitok_has_tokens(output_doc.meta["original_input_path"]):
+                        # First check: if original input file has no tokens, we need to insert tokens
+                        if not teitok_has_tokens(str(original_input_path)):
                             is_extracted_text = True
+                        # Second check: if meta says it came from extracted text
+                        elif output_doc.meta.get("original_input_path") and not teitok_has_tokens(output_doc.meta["original_input_path"]):
+                            is_extracted_text = True
+                        # Third check: if processed from raw text and original file has no tokens
+                        elif output_doc.meta.get("_processed_from_raw_text", False):
+                            if not teitok_has_tokens(str(original_input_path)):
+                                is_extracted_text = True
+        
+        # Apply create_implicit_mwt if requested, but only when:
+        # 1. Not in writeback mode (regular output), OR
+        # 2. In writeback mode but inserting new tokens (is_extracted_text is True)
+        # Don't apply when updating existing tokens in writeback mode
+        # When updating existing tokens, the backend might create MWTs from SpaceAfter=No sequences,
+        # but we don't want to apply _create_implicit_mwt as it would break token alignment
+        if args.create_implicit_mwt and output_format == "teitok":
+            should_apply_mwt = False
+            if not use_writeback:
+                # Regular output - always apply if requested
+                should_apply_mwt = True
+            elif use_writeback and is_extracted_text:
+                # Writeback mode but inserting new tokens (untokenized file)
+                should_apply_mwt = True
+            elif use_writeback and output_doc.meta.get("_processed_from_raw_text", False) and original_input_path:
+                # Processed from raw text - check if file has no tokens
+                from .teitok import teitok_has_tokens
+                if not teitok_has_tokens(str(original_input_path)):
+                    should_apply_mwt = True
+            # Explicitly don't apply when updating existing tokens in writeback mode
+            # (is_extracted_text is False and we're in writeback mode)
+            if should_apply_mwt:
+                from .conllu import _create_implicit_mwt
+                from .doc import Document, Sentence
+                # Create a new document with MWTs created
+                new_doc = Document(id=output_doc.id, meta=dict(output_doc.meta), attrs=dict(output_doc.attrs))
+                # Copy spans from original document
+                for layer, spans in output_doc.spans.items():
+                    for span in spans:
+                        new_doc.add_span(layer, span)
+                for sent in output_doc.sentences:
+                    new_sent = _create_implicit_mwt(sent)
+                    new_doc.sentences.append(new_sent)
+                output_doc = new_doc
+                validator_source_doc = output_doc
         
         if use_writeback and original_input_path:
             target_writeback_path = original_input_path
@@ -4275,6 +4650,8 @@ def run_tag(args: argparse.Namespace) -> int:
             
             from .teitok import update_teitok
             from .insert_tokens import insert_tokens_into_teitok
+            # Note: create_implicit_mwt is already applied earlier if needed (when not in writeback mode
+            # or when inserting new tokens in writeback mode)
             try:
                 if is_extracted_text:
                     textnode_xpath = output_doc.meta.get("original_input_xpath", ".//text")
@@ -4285,6 +4662,7 @@ def run_tag(args: argparse.Namespace) -> int:
                         output_path if output_path else None,
                         textnode_xpath=textnode_xpath,
                         include_notes=include_notes,
+                        settings=teitok_settings_obj,
                     )
                     if args.verbose or args.debug:
                         target = str(target_writeback_path) if not output_path else output_path

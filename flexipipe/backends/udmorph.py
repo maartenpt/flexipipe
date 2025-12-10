@@ -7,7 +7,7 @@ import urllib.parse
 from typing import Any, Dict, Optional
 
 from ..backend_spec import BackendSpec
-from ..conllu import conllu_to_document, document_to_conllu
+from ..conllu import conllu_to_document, document_to_conllu, parse_conllu_from_backend
 from ..doc import Document
 from ..language_utils import (
     LANGUAGE_FIELD_ISO,
@@ -301,7 +301,7 @@ class UDMorphRESTBackend(BackendManager):
                     error_msg += f"\n[udmorph] Response text (first 500 chars): {response.text[:500]}"
                 raise RuntimeError(error_msg)
 
-            chunk_doc = conllu_to_document(conllu_output, doc_id=batch_doc.id or "udmorph")
+            chunk_doc = parse_conllu_from_backend(conllu_output, document, doc_id=batch_doc.id or "udmorph")
             if self.log_requests and batch_index == 0 and chunk_doc.sentences:
                 first_sentence = chunk_doc.sentences[0]
                 token_forms = " ".join(tok.form for tok in first_sentence.tokens)

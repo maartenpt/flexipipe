@@ -101,7 +101,7 @@ def list_backends(args: argparse.Namespace) -> int:
 def list_examples(args: argparse.Namespace) -> int:
     """List locally installed example datasets."""
     output_format = getattr(args, "output_format", "table")
-    refresh = getattr(args, "refresh", False)
+    refresh = getattr(args, "refresh", False) or getattr(args, "refresh_cache", False)
     try:
         from .examples_data import load_examples
         examples = load_examples(refresh=refresh)

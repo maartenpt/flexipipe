@@ -39,6 +39,7 @@ def insert_tokens_into_teitok(
     include_notes: bool = False,
     block_elements: Optional[List[str]] = None,
     extract_elements: Optional[List[str]] = None,
+    settings: Optional[Any] = None,
 ) -> None:
     """
     Insert tokens and sentences into a non-tokenized TEITOK XML file.
@@ -184,29 +185,94 @@ def insert_tokens_into_teitok(
             for i, sent in enumerate(remaining_sentences):
                 sent_idx = len(used_sentence_indices) + i
                 sent_text_norm = re.sub(r'\s+', ' ', sent.text or "").strip()
-                accumulated_text_norm = re.sub(r'\s+', ' ', accumulated_text + " " + sent_text_norm).strip()
                 
-                if plaintext_norm.startswith(accumulated_text_norm) or accumulated_text_norm.startswith(plaintext_norm):
+                # Try adding this sentence to the accumulated text
+                if accumulated_text:
+                    # Add sentence - allow flexible whitespace between sentences
+                    # Sentences might be separated by space, period+space, etc.
+                    accumulated_text_norm = re.sub(r'\s+', ' ', accumulated_text + " " + sent_text_norm).strip()
+                else:
+                    accumulated_text_norm = sent_text_norm
+                
+                # Check if the plaintext starts with the accumulated text (allowing for flexible whitespace)
+                # Normalize both for comparison
+                accumulated_norm = re.sub(r'\s+', ' ', accumulated_text_norm).strip()
+                plaintext_norm_compare = re.sub(r'\s+', ' ', plaintext_norm).strip()
+                
+                if plaintext_norm_compare.startswith(accumulated_norm):
                     matched_sentences.append(sent)
                     matched_sentence_indices.append(sent_idx)
                     accumulated_text = accumulated_text_norm
                     
-                    # If we've matched the entire plaintext, stop
-                    if accumulated_text_norm == plaintext_norm:
+                    # If we've matched the entire plaintext exactly (allowing for whitespace differences), stop
+                    if accumulated_norm == plaintext_norm_compare:
                         break
-                else:
-                    # If we can't match, try with just this sentence
-                    if sent_text_norm == plaintext_norm or plaintext_norm.startswith(sent_text_norm):
+                    # Continue to try matching more sentences
+                elif accumulated_norm.startswith(plaintext_norm_compare):
+                    # The accumulated text is longer than plaintext - we've gone too far
+                    # Use the sentences we've matched so far (if any)
+                    if matched_sentences:
+                        break
+                    # If no sentences matched yet, try with just this sentence if it matches
+                    sent_norm_compare = re.sub(r'\s+', ' ', sent_text_norm).strip()
+                    if sent_norm_compare == plaintext_norm_compare or plaintext_norm_compare.startswith(sent_norm_compare):
                         matched_sentences = [sent]
                         matched_sentence_indices = [sent_idx]
                         break
                     # Otherwise, stop trying
+                    break
+                else:
+                    # Can't match this sentence - if we have matched sentences, use those
+                    if matched_sentences:
+                        break
+                    # If no sentences matched yet, try with just this sentence if it matches
+                    sent_norm_compare = re.sub(r'\s+', ' ', sent_text_norm).strip()
+                    if sent_norm_compare == plaintext_norm_compare or plaintext_norm_compare.startswith(sent_norm_compare):
+                        matched_sentences = [sent]
+                        matched_sentence_indices = [sent_idx]
+                        break
+                    # Otherwise, stop trying - can't match anything
                     break
             
             if not matched_sentences:
                 # No match found, skip this block
                 print(f"\nWARNING: Could not match plaintext for block element, skipping...")
                 continue
+            
+            # Check if we've matched all the plaintext
+            # Normalize both for comparison
+            matched_text_norm = re.sub(r'\s+', ' ', accumulated_text).strip() if accumulated_text else ""
+            plaintext_norm_check = re.sub(r'\s+', ' ', plaintext_norm).strip()
+            
+            # If we haven't matched all the plaintext, try to match more sentences
+            if matched_text_norm != plaintext_norm_check and len(matched_sentences) < len(remaining_sentences):
+                # We have more sentences available - try to match them
+                remaining_plaintext = plaintext_norm_check[len(matched_text_norm):].strip() if len(matched_text_norm) < len(plaintext_norm_check) else ""
+                if remaining_plaintext:
+                    # Try to match remaining sentences to remaining plaintext
+                    for i in range(len(matched_sentences), len(remaining_sentences)):
+                        sent = remaining_sentences[i]
+                        sent_idx = len(used_sentence_indices) + i
+                        sent_text_norm = re.sub(r'\s+', ' ', sent.text or "").strip()
+                        
+                        # Check if remaining plaintext starts with this sentence
+                        if remaining_plaintext.startswith(sent_text_norm) or sent_text_norm.startswith(remaining_plaintext):
+                            matched_sentences.append(sent)
+                            matched_sentence_indices.append(sent_idx)
+                            # Update accumulated text
+                            if accumulated_text:
+                                accumulated_text = re.sub(r'\s+', ' ', accumulated_text + " " + sent_text_norm).strip()
+                            else:
+                                accumulated_text = sent_text_norm
+                            # Update remaining plaintext
+                            if remaining_plaintext.startswith(sent_text_norm):
+                                remaining_plaintext = remaining_plaintext[len(sent_text_norm):].strip()
+                            else:
+                                remaining_plaintext = ""
+                            
+                            # If we've matched all remaining text, stop
+                            if not remaining_plaintext:
+                                break
             
             # Create a temporary document with matched sentences
             temp_document = Document(id=document.id)
@@ -225,7 +291,8 @@ def insert_tokens_into_teitok(
             )
             
             # Rebuild XML with <s> and <tok> elements
-            rebuild_xml_with_tokens(
+            # Pass current counters and update them with the return value
+            tokens_used, sentences_used = rebuild_xml_with_tokens(
                 block_elem,
                 plaintext,
                 adjusted_markup,
@@ -234,8 +301,14 @@ def insert_tokens_into_teitok(
                 temp_document,  # Use temp_document instead of full document
                 block_elements_set,
                 extract_elements_set,
-                note_content_map
+                note_content_map,
+                start_tok_id=global_tok_id,
+                start_sent_idx=global_sent_idx,
+                settings=settings
             )
+            # Update global counters for next block element
+            global_tok_id += tokens_used
+            global_sent_idx += sentences_used
             
             # Mark these sentences as used
             for sent_idx in matched_sentence_indices:
@@ -258,15 +331,60 @@ def insert_tokens_into_teitok(
     restore_note_content(root)
     
     # Verify structural integrity (ignoring inserted tags/attributes)
-    try:
-        verify_structure_preserved(
-            original_root_snapshot,
-            root,
-            ignore_tags={"s", "tok"},
-            ignore_attrs={"id", "rpt"}
-        )
-    except Exception as exc:
-        print(f"\nWARNING: Structure verification failed: {exc}")
+    # If verification fails, raise an exception to prevent writing incorrect XML
+    verify_structure_preserved(
+        original_root_snapshot,
+        root,
+        ignore_tags={"s", "tok", "dtok"},  # Also ignore dtok tags (sub-tokens of MWTs)
+        ignore_attrs={"id", "rpt"}
+    )
+    
+    # Add change element to TEI header
+    from .teitok import _add_change_to_tei_header
+    from datetime import datetime
+    change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    # Build change text from document metadata
+    backends_used = document.meta.get("_backends_used", [])
+    if not backends_used:
+        backends_used = ["flexipipe"]
+    
+    # Get model information
+    file_level_attrs = document.meta.get("_file_level_attrs", {})
+    model_keys = sorted([k for k in file_level_attrs.keys() if k.endswith("_model")])
+    model_str = None
+    if model_keys:
+        model_str = file_level_attrs[model_keys[0]]
+    
+    # Build backend string
+    backend_names = [b.upper() for b in backends_used]
+    change_source = ", ".join(backend_names) if len(backend_names) > 1 else (model_str or backend_names[0] if backend_names else "flexipipe")
+    
+    # Detect performed tasks
+    tasks = set()
+    if document.meta.get("_tokenized", False):
+        tasks.add("tokenize")
+    if document.meta.get("_segmented", False):
+        tasks.add("segment")
+    if any(t.lemma for s in document.sentences for t in s.tokens):
+        tasks.add("lemmatize")
+    if any(t.xpos or t.upos for s in document.sentences for t in s.tokens):
+        tasks.add("tag")
+    if any(t.head for s in document.sentences for t in s.tokens):
+        tasks.add("parse")
+    # NER is stored in sentence.entities, not on tokens
+    if getattr(document, "spans", None) and document.spans.get("ner"):
+        tasks.add("ner")
+    elif any(s.entities for s in document.sentences):
+        tasks.add("ner")
+    # Normalization is detected from various token attributes
+    if any(t.reg or t.expan or t.mod or t.trslit or t.ltrslit or t.corr or t.lex or (t.misc and t.misc != "_") for s in document.sentences for t in s.tokens):
+        tasks.add("normalize")
+    
+    tasks_summary_str = ",".join(sorted(tasks)) if tasks else "segment,tokenize"
+    change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
+    
+    _add_change_to_tei_header(root, change_text, change_when)
     
     # Write updated XML (without pretty-printing)
     if HAS_LXML:
@@ -564,14 +682,30 @@ def map_tokens_to_positions(plaintext: str, document: Document) -> List[Tuple[in
     """
     Map tokens to character positions in plain text.
     
+    For MWT tokens, only map the parent token (not subtokens) to avoid text duplication.
+    
     Returns:
         List of (start_pos, end_pos, token) tuples
     """
     positions = []
     text_pos = 0
     
+    # Track subtoken IDs to skip them (they're handled as part of the MWT parent)
+    subtoken_ids = set()
     for sent in document.sentences:
         for token in sent.tokens:
+            if token.is_mwt and token.subtokens:
+                # Mark all subtokens (except the first one, which is the token itself) as subtokens to skip
+                for st in token.subtokens[1:]:
+                    if st.id:
+                        subtoken_ids.add(st.id)
+    
+    for sent in document.sentences:
+        for token in sent.tokens:
+            # Skip subtokens of MWT tokens (they're handled as part of the MWT parent)
+            if token.id and token.id in subtoken_ids:
+                continue
+            
             # Skip whitespace
             while text_pos < len(plaintext) and plaintext[text_pos].isspace():
                 text_pos += 1
@@ -579,8 +713,13 @@ def map_tokens_to_positions(plaintext: str, document: Document) -> List[Tuple[in
             if text_pos >= len(plaintext):
                 break
             
+            # For MWT tokens, use the combined form
+            if token.is_mwt and token.subtokens:
+                tok_form = token.form  # Combined form (e.g., "awesome-align")
+            else:
+                tok_form = token.form
+            
             # Try to find token
-            tok_form = token.form
             if plaintext[text_pos:].startswith(tok_form):
                 start_pos = text_pos
                 end_pos = text_pos + len(tok_form)
@@ -596,7 +735,22 @@ def map_tokens_to_positions(plaintext: str, document: Document) -> List[Tuple[in
                     positions.append((start_pos, end_pos, token))
                     text_pos = end_pos
                 else:
-                    continue
+                    # Token not found at expected position - try to find it anywhere in remaining text
+                    # This handles cases where there's extra whitespace or the token appears later
+                    remaining_text = plaintext[text_pos:]
+                    # Try to find the token form in the remaining text (case-insensitive)
+                    import re
+                    pattern = re.escape(tok_form)
+                    match = re.search(pattern, remaining_text, re.IGNORECASE)
+                    if match:
+                        start_pos = text_pos + match.start()
+                        end_pos = text_pos + match.end()
+                        positions.append((start_pos, end_pos, token))
+                        text_pos = end_pos
+                    else:
+                        # Still can't find it - skip this token but warn
+                        # This shouldn't happen often, but if it does, we continue
+                        continue
     
     return positions
 
@@ -609,21 +763,143 @@ def map_sentences_to_positions(
     """
     Map sentences to character positions based on token positions.
     
+    Ensures sentences always span at least from the first token's start to the last token's end.
+    If sentence text is available, extends to include trailing whitespace/punctuation.
+    Ensures sentences don't overlap - each sentence ends before the next one starts.
+    
     Returns:
         List of (start_pos, end_pos, sentence) tuples
     """
     positions = []
     token_idx = 0
     
-    for sent in document.sentences:
+    for i, sent in enumerate(document.sentences):
         if token_idx >= len(token_positions):
             break
         
         first_token_start = token_positions[token_idx][0]
-        last_token_end = token_positions[token_idx + len(sent.tokens) - 1][1] if token_idx + len(sent.tokens) - 1 < len(token_positions) else first_token_start
         
-        positions.append((first_token_start, last_token_end, sent))
-        token_idx += len(sent.tokens)
+        # Find the last token that belongs to this sentence
+        # We need to match tokens from token_positions to tokens in sent.tokens
+        # MWT subtokens are skipped in token_positions, so we need to account for that
+        last_token_idx = token_idx
+        sent_token_idx = 0
+        pos_idx = token_idx
+        
+        # Iterate through tokens in token_positions, matching them to sent.tokens
+        while pos_idx < len(token_positions) and sent_token_idx < len(sent.tokens):
+            token_from_pos = token_positions[pos_idx][2]  # Token object from positions
+            sent_token = sent.tokens[sent_token_idx]
+            
+            # Check if this is the same token
+            if token_from_pos == sent_token or (token_from_pos.id and sent_token.id and token_from_pos.id == sent_token.id):
+                # Match found - this token belongs to this sentence
+                last_token_idx = pos_idx
+                pos_idx += 1
+                sent_token_idx += 1
+            else:
+                # This sent_token is likely a subtoken (not in token_positions)
+                # Skip it and continue
+                sent_token_idx += 1
+        
+        # Calculate last token end position
+        if last_token_idx >= len(token_positions):
+            # Fallback: use first token position if we can't find last token
+            last_token_end = first_token_start
+        else:
+            last_token_end = token_positions[last_token_idx][1]
+        
+        # Determine the maximum end position - don't go beyond next sentence's start
+        # This is the STRICT upper bound - sentence must end before next sentence starts
+        max_sentence_end = len(plaintext)
+        if i + 1 < len(document.sentences):
+            # Find where the next sentence starts
+            # The next sentence starts at the token after the last token of this sentence
+            next_token_idx = last_token_idx + 1
+            if next_token_idx < len(token_positions):
+                next_sentence_start = token_positions[next_token_idx][0]
+                # CRITICAL: Ensure this sentence ends BEFORE the next one starts
+                # This prevents overlap - use the next sentence's start as the hard limit
+                max_sentence_end = next_sentence_start
+            else:
+                # No more tokens - also try to find next sentence by its text
+                next_sent = document.sentences[i + 1]
+                if next_sent.text:
+                    next_sent_text = next_sent.text.strip()
+                    # Search for next sentence's text in plaintext starting from last_token_end
+                    import re
+                    next_sent_pattern = re.escape(next_sent_text)
+                    next_sent_pattern = next_sent_pattern.replace(r'\ ', r'\s+')
+                    match = re.search(next_sent_pattern, plaintext[last_token_end:], re.IGNORECASE)
+                    if match:
+                        next_sentence_start = last_token_end + match.start()
+                        max_sentence_end = next_sentence_start
+        
+        # Start with sentence end at the last token's end position
+        sentence_end = last_token_end
+        
+        # If sentence text is available, try to extend to include trailing whitespace/punctuation
+        # But STRICTLY enforce that we never exceed max_sentence_end (next sentence's start)
+        if sent.text:
+            sent_text_clean = sent.text.strip()
+            if sent_text_clean:
+                # Look for the sentence text in plaintext starting from first_token_start
+                search_start = max(0, first_token_start)
+                # Search only up to max_sentence_end - never beyond
+                search_end = max_sentence_end
+                if search_end > search_start:
+                    search_text = plaintext[search_start:search_end]
+                    
+                    # Try to find the sentence text (allowing for whitespace normalization)
+                    import re
+                    # Escape special regex characters but allow flexible whitespace
+                    sent_text_pattern = re.escape(sent_text_clean)
+                    sent_text_pattern = sent_text_pattern.replace(r'\ ', r'\s+')
+                    match = re.search(sent_text_pattern, search_text, re.IGNORECASE)
+                    if match:
+                        # Found the sentence text - use its end position
+                        found_end = search_start + match.end()
+                        # CRITICAL: Never exceed max_sentence_end (next sentence's start)
+                        # If the match extends beyond, truncate it
+                        sentence_end = min(found_end, max_sentence_end)
+        
+        # Ensure sentence_end is at least last_token_end (sentence must contain all its tokens)
+        sentence_end = max(sentence_end, last_token_end)
+        
+        # FINAL CHECK: Ensure sentence doesn't extend beyond max_sentence_end (next sentence's start)
+        # This is a hard limit - never exceed it
+        sentence_end = min(sentence_end, max_sentence_end)
+        
+        # Ensure sentence doesn't extend beyond plaintext
+        sentence_end = min(sentence_end, len(plaintext))
+        
+        # CRITICAL: Final check - ensure sentence doesn't extend beyond max_sentence_end
+        # This is already set above based on next sentence's start, but double-check here
+        if sentence_end > max_sentence_end:
+            sentence_end = max_sentence_end
+        
+        # Ensure this sentence doesn't overlap with the previous sentence
+        if positions:
+            prev_start, prev_end, _ = positions[-1]
+            if first_token_start < prev_end:
+                # This sentence starts before the previous one ends - this shouldn't happen
+                # but if it does, adjust the previous sentence's end to be before this one starts
+                # Actually, we can't modify previous positions, so ensure this one starts after previous ends
+                first_token_start = max(first_token_start, prev_end)
+                sentence_end = max(sentence_end, first_token_start)
+            # Also ensure this sentence ends before it would overlap with previous
+            if sentence_end <= prev_end and first_token_start < prev_end:
+                # This sentence is completely within previous - shouldn't happen, but adjust
+                sentence_end = prev_end + 1
+        
+        # Final check: ensure sentence_end > first_token_start (sentence must have positive length)
+        if sentence_end <= first_token_start:
+            sentence_end = first_token_start + 1
+        
+        positions.append((first_token_start, sentence_end, sent))
+        # Update token_idx to point to the first token of the next sentence
+        # Use last_token_idx + 1 (the token after the last token of this sentence)
+        token_idx = last_token_idx + 1
     
     return positions
 
@@ -639,7 +915,8 @@ def rebuild_xml_with_tokens(
     extract_elements: Set[str],
     note_content_map: Dict[str, Tuple[str, Dict[str, str], List[ET.Element]]],
     start_tok_id: int = 1,
-    start_sent_idx: int = 0
+    start_sent_idx: int = 0,
+    settings: Optional[Any] = None,
 ) -> Tuple[int, int]:
     """
     Rebuild XML by inserting <s> and <tok> elements at correct positions.
@@ -647,6 +924,45 @@ def rebuild_xml_with_tokens(
     This is the core function that uses the standoff representation to correctly
     insert tokens and sentences while preserving all original XML structure.
     """
+    # Helper functions for attribute mapping (similar to teitok.py)
+    def _resolve_attr_name(internal_attr: str) -> Optional[str]:
+        if settings:
+            return settings.resolve_xml_attribute(internal_attr, default=internal_attr)
+        return internal_attr
+    
+    def _attribute_aliases(internal_attr: str) -> List[str]:
+        if settings:
+            aliases = settings.get_attribute_mapping(internal_attr)
+        else:
+            aliases = [internal_attr]
+        ordered: List[str] = []
+        for alias in aliases + [internal_attr]:
+            if alias and alias not in ordered:
+                ordered.append(alias)
+        return ordered
+    
+    def _set_attr(node: ET.Element, internal_attr: str, value: str, default_empty: bool = False) -> None:
+        """Set attribute respecting TEITOK mappings."""
+        target_attr = _resolve_attr_name(internal_attr)
+        aliases = _attribute_aliases(internal_attr)
+        
+        if target_attr is None:
+            for alias in aliases:
+                node.attrib.pop(alias, None)
+            return
+        if value and value != "_":
+            node.set(target_attr, value)
+            for alias in aliases:
+                if alias != target_attr:
+                    node.attrib.pop(alias, None)
+        elif default_empty:
+            for alias in aliases:
+                node.attrib.pop(alias, None)
+        elif target_attr != internal_attr:
+            for alias in aliases:
+                if alias != target_attr:
+                    node.attrib.pop(alias, None)
+    
     # Save original attributes
     original_attrs = dict(block_elem.attrib)
     original_tail = block_elem.tail
@@ -714,12 +1030,30 @@ def rebuild_xml_with_tokens(
     
     sentence_fallbacks = compute_sentence_fallbacks(sentence_positions, markup, plaintext)
     
+    # Note: Implicit MWT detection is handled in __main__.py via _create_implicit_mwt
+    # before calling insert_tokens_into_teitok, so we don't need to do it here.
+    # This avoids conflicts and ensures MWTs are created consistently.
+    
+    # Track token IDs that are subtokens of MWT tokens (these should be skipped during insertion)
+    mwt_subtoken_ids = set()
+    for sent_start, sent_end, sent in sentence_positions:
+        sent_tokens = [(t_start, t_end, tok) for t_start, t_end, tok in token_positions 
+                      if sent_start <= t_start < sent_end]
+        sent_tokens.sort(key=lambda x: x[0])
+        for t_start, t_end, tok in sent_tokens:
+            if tok.is_mwt and tok.subtokens:
+                # Mark all subtokens (except the first one, which is tok itself) as MWT subtokens to skip
+                for st in tok.subtokens[1:]:
+                    # Track by token ID instead of Token object (Token objects are not hashable)
+                    if st.id:
+                        mwt_subtoken_ids.add(st.id)
+    
     # Track current state
     current_elem = block_elem
     open_markup_stack = []  # Stack of (markup_entry, element) tuples
     token_idx = 0
-    sent_idx = 0
-    global_tok_id = 1
+    sent_idx = start_sent_idx  # Start from the provided index
+    global_tok_id = start_tok_id  # Start from the provided token ID
     current_tok_elem = None
     current_sent_elem = None
     current_sentence_idx = None
@@ -727,6 +1061,8 @@ def rebuild_xml_with_tokens(
     current_sentence_first_token = None
     current_sentence_obj = None
     sent_token_ids = []
+    # Map from token ord (id) to tokid for head conversion
+    ord_to_tokid: Dict[int, str] = {}
     # Track self-closing elements that were just inserted (for tail text handling)
     self_closing_elements = {}  # (start_pos, end_pos) -> element
     # Track token state when markup elements open while a token is active
@@ -747,8 +1083,7 @@ def rebuild_xml_with_tokens(
     
     # Process each character position
     initial_tok_id = start_tok_id
-    initial_sent_idx = 0  # sent_idx starts at 0 for each block
-    global_tok_id = start_tok_id
+    initial_sent_idx = start_sent_idx  # Use the provided start index
     for char_pos in range(len(plaintext) + 1):  # +1 to handle closing at end
         char = plaintext[char_pos] if char_pos < len(plaintext) else None
         
@@ -887,21 +1222,27 @@ def rebuild_xml_with_tokens(
         
         # Open elements that start at this position
         if char_pos in opens_at:
-            # Sort by end position (closing last first) to ensure correct nesting
-            # Include all types: sentences, tokens, and markup
+            # Sort to ensure correct nesting:
+            # 1. Longest elements first (sentences should be longer than tokens)
+            # 2. Type as tie-breaker (sentences before tokens)
+            # 3. Level/order for markup
             def get_open_key(item):
                 item_type, item_data = item
                 if item_type == 'sentence':
-                    end_pos = item_data[1]
-                    return (-end_pos, 0, 0)
+                    start_pos, end_pos = item_data[0], item_data[1]
+                    length = end_pos - start_pos
+                    return (-length, 0, -end_pos)  # Longest first, type 0 (sentence), then by end position
                 elif item_type == 'token':
-                    end_pos = item_data[1]
-                    return (-end_pos, 0, 1)
+                    start_pos, end_pos = item_data[0], item_data[1]
+                    length = end_pos - start_pos
+                    return (-length, 1, -end_pos)  # Longest first, type 1 (token), then by end position
                 else:  # markup
                     end_pos = item_data['end']
+                    start_pos = item_data['start']
+                    length = end_pos - start_pos
                     level = item_data.get('level', 0)
                     order = item_data.get('order', 0)
-                    return (-end_pos, level, order)
+                    return (-length, 2, -end_pos, level, order)  # Longest first, type 2 (markup), then by end position, level, order
             
             to_open = sorted(opens_at[char_pos], key=get_open_key)
             
@@ -909,6 +1250,19 @@ def rebuild_xml_with_tokens(
                 if open_type == 'sentence':
                     sent_start, sent_end, sent = open_data
                     if sent_start == char_pos:
+                        # Ensure previous sentence is closed before opening a new one
+                        if current_sent_elem is not None:
+                            # Previous sentence should have been closed - this shouldn't happen
+                            # but if it does, close it first
+                            parent_after_sentence = parent_map.get(current_sent_elem, block_elem)
+                            if open_markup_stack:
+                                current_elem = open_markup_stack[-1][1]
+                            else:
+                                current_elem = parent_after_sentence
+                            current_sent_elem = None
+                            sent_token_ids = []
+                            sent_idx += 1
+                        
                         # Open sentence
                         current_sentence_idx = sent_idx
                         current_sentence_is_fallback = current_sentence_idx in sentence_fallbacks
@@ -921,7 +1275,7 @@ def rebuild_xml_with_tokens(
                             continue
                         
                         s_elem = ET.Element("s")
-                        s_id = f"s{start_sent_idx + sent_idx + 1}"  # Use global sentence index
+                        s_id = f"s-{sent_idx + 1}"  # sent_idx already starts at start_sent_idx
                         s_elem.set("id", s_id)
                         if sent.text:
                             s_elem.set("text", sent.text)
@@ -932,26 +1286,146 @@ def rebuild_xml_with_tokens(
                 elif open_type == 'token':
                     tok_start, tok_end, token = open_data
                     if tok_start == char_pos:
-                        # Open token
-                        tok_elem = ET.Element("tok")
-                        tok_id = f"w-{global_tok_id}"
-                        global_tok_id += 1
-                        tok_elem.set("id", tok_id)
-                        tok_elem.set("form", token.form)
-                        if token.lemma:
-                            tok_elem.set("lemma", token.lemma)
-                        if token.xpos:
-                            tok_elem.set("xpos", token.xpos)
-                        if token.upos:
-                            tok_elem.set("upos", token.upos)
-                        if token.feats:
-                            tok_elem.set("feats", token.feats)
-                        
-                        current_elem.append(tok_elem)
-                        # Update parent map
-                        parent_map[tok_elem] = current_elem
-                        current_elem = tok_elem
-                        current_tok_elem = tok_elem
+                        # Skip tokens that are subtokens of MWT tokens (they're handled as part of the MWT)
+                        if token.id and token.id in mwt_subtoken_ids:
+                            continue
+                        # Check if this is an MWT token with subtokens
+                        if token.is_mwt and token.subtokens:
+                            # Create parent <tok> element with combined form
+                            tok_elem = ET.Element("tok")
+                            tok_id = f"w-{global_tok_id}"
+                            global_tok_id += 1
+                            tok_elem.set("id", tok_id)
+                            # Set the combined form as text content
+                            tok_elem.text = token.form
+                            
+                            # Store mapping from ord to tokid for head conversion (use first subtoken's id)
+                            if token.subtokens and token.subtokens[0].id:
+                                ord_to_tokid[token.subtokens[0].id] = tok_id
+                            
+                            # Create <dtok> elements for each subtoken
+                            for dtok_idx, subtoken in enumerate(token.subtokens):
+                                dtok_elem = ET.Element("dtok")
+                                dtok_id = f"{tok_id}.{dtok_idx + 1}"
+                                dtok_elem.set("id", dtok_id)
+                                dtok_elem.set("form", subtoken.form)
+                                
+                                # Store mapping from subtoken ord to dtok id for head conversion
+                                if subtoken.id:
+                                    ord_to_tokid[subtoken.id] = dtok_id
+                                
+                                # Set all annotations on <dtok>
+                                # Check both direct fields and attrs dict (backends may store in either)
+                                dtok_lemma = subtoken.lemma or subtoken.attrs.get("lemma", "")
+                                dtok_xpos = subtoken.xpos or subtoken.attrs.get("xpos", "")
+                                dtok_upos = subtoken.upos or subtoken.attrs.get("upos", "")
+                                dtok_feats = subtoken.feats or subtoken.attrs.get("feats", "")
+                                
+                                _set_attr(dtok_elem, "lemma", dtok_lemma, default_empty=True)
+                                _set_attr(dtok_elem, "xpos", dtok_xpos)
+                                _set_attr(dtok_elem, "upos", dtok_upos)
+                                _set_attr(dtok_elem, "feats", dtok_feats)
+                                
+                                # Set other attributes
+                                _set_attr(dtok_elem, "reg", subtoken.reg or "")
+                                _set_attr(dtok_elem, "expan", subtoken.expan or "")
+                                _set_attr(dtok_elem, "mod", subtoken.mod or "")
+                                _set_attr(dtok_elem, "trslit", subtoken.trslit or "")
+                                _set_attr(dtok_elem, "ltrslit", subtoken.ltrslit or "")
+                                
+                                # Set ord attribute
+                                if subtoken.id:
+                                    _set_attr(dtok_elem, "ord", str(subtoken.id))
+                                
+                                # Set head attribute (convert from ord to tokid)
+                                # SubToken doesn't have head directly, check attrs
+                                dtok_head_int = 0
+                                if "head" in subtoken.attrs:
+                                    head_attr = subtoken.attrs["head"]
+                                    if isinstance(head_attr, int):
+                                        dtok_head_int = head_attr
+                                    elif isinstance(head_attr, str):
+                                        try:
+                                            dtok_head_int = int(head_attr)
+                                        except (ValueError, TypeError):
+                                            dtok_head_int = 0
+                                
+                                if dtok_head_int > 0:
+                                    head_tokid = ord_to_tokid.get(dtok_head_int)
+                                    if head_tokid:
+                                        _set_attr(dtok_elem, "head", head_tokid)
+                                    else:
+                                        # Head not found yet, use ord for now
+                                        _set_attr(dtok_elem, "head", str(dtok_head_int))
+                                else:
+                                    _set_attr(dtok_elem, "head", "", default_empty=True)
+                                
+                                # Set deprel attribute (check attrs dict)
+                                dtok_deprel = subtoken.attrs.get("deprel", "")
+                                _set_attr(dtok_elem, "deprel", dtok_deprel, default_empty=True)
+                                
+                                # Set deps attribute (check attrs dict)
+                                dtok_deps = subtoken.attrs.get("deps", "")
+                                if dtok_deps:
+                                    _set_attr(dtok_elem, "deps", dtok_deps)
+                                
+                                # Set misc attribute (check attrs dict)
+                                dtok_misc = subtoken.attrs.get("misc", "")
+                                if dtok_misc:
+                                    _set_attr(dtok_elem, "misc", dtok_misc)
+                                
+                                tok_elem.append(dtok_elem)
+                            
+                            current_elem.append(tok_elem)
+                            # Update parent map
+                            parent_map[tok_elem] = current_elem
+                            # Don't change current_elem - MWT tokens don't contain other elements
+                            current_tok_elem = tok_elem
+                        else:
+                            # Regular (non-MWT) token
+                            tok_elem = ET.Element("tok")
+                            tok_id = f"w-{global_tok_id}"
+                            global_tok_id += 1
+                            tok_elem.set("id", tok_id)  # id is always "id", not mapped
+                            tok_elem.set("form", token.form)  # form is always "form", not mapped
+                            
+                            # Store mapping from ord to tokid for head conversion
+                            if token.id:
+                                ord_to_tokid[token.id] = tok_id
+                            
+                            _set_attr(tok_elem, "lemma", token.lemma or "", default_empty=True)
+                            _set_attr(tok_elem, "xpos", token.xpos or "")
+                            _set_attr(tok_elem, "upos", token.upos or "")
+                            _set_attr(tok_elem, "feats", token.feats or "")
+                            
+                            # Set ord attribute
+                            if token.id:
+                                _set_attr(tok_elem, "ord", str(token.id))
+                            
+                            # Set head attribute (convert from ord to tokid)
+                            head_ord = token.head
+                            if head_ord and head_ord > 0:
+                                head_tokid = ord_to_tokid.get(head_ord)
+                                if head_tokid:
+                                    _set_attr(tok_elem, "head", head_tokid)
+                                else:
+                                    # Head not found yet (might be later in document), use ord for now
+                                    _set_attr(tok_elem, "head", str(head_ord))
+                            else:
+                                _set_attr(tok_elem, "head", "", default_empty=True)
+                            
+                            # Set deprel attribute
+                            _set_attr(tok_elem, "deprel", token.deprel or "", default_empty=True)
+                            
+                            # Set misc attribute
+                            if token.misc:
+                                _set_attr(tok_elem, "misc", token.misc)
+                            
+                            current_elem.append(tok_elem)
+                            # Update parent map
+                            parent_map[tok_elem] = current_elem
+                            current_elem = tok_elem
+                            current_tok_elem = tok_elem
                         
                         if current_sentence_first_token is None:
                             current_sentence_first_token = tok_elem
@@ -1100,18 +1574,24 @@ def rebuild_xml_with_tokens(
                             is_inside_tok = True
                         
                         if current_elem == current_tok_elem:
-                            # Append after any existing children to preserve order
-                            if len(current_tok_elem):
-                                last_child = current_tok_elem[-1]
-                                if last_child.tail:
-                                    last_child.tail += char
+                            # Check if this is an MWT token (has <dtok> children)
+                            # MWT tokens already have their text set, so don't add characters
+                            has_dtoks = any(c.tag.endswith("}dtok") or c.tag == "dtok" for c in current_tok_elem)
+                            if not has_dtoks:
+                                # Not an MWT token - append text as usual
+                                # Append after any existing children to preserve order
+                                if len(current_tok_elem):
+                                    last_child = current_tok_elem[-1]
+                                    if last_child.tail:
+                                        last_child.tail += char
+                                    else:
+                                        last_child.tail = char
                                 else:
-                                    last_child.tail = char
-                            else:
-                                if current_tok_elem.text:
-                                    current_tok_elem.text += char
-                                else:
-                                    current_tok_elem.text = char
+                                    if current_tok_elem.text:
+                                        current_tok_elem.text += char
+                                    else:
+                                        current_tok_elem.text = char
+                            # If it's an MWT token, skip adding text (already set when token was created)
                         else:
                             if not current_elem.text:
                                 current_elem.text = char
@@ -1214,7 +1694,7 @@ def rebuild_xml_with_tokens(
                     current_sent_elem = None
                 elif current_sentence_is_fallback and sent_token_ids:
                     s_elem = ET.Element("s")
-                    s_id = f"s{start_sent_idx + sent_idx + 1}"
+                    s_id = f"s-{sent_idx + 1}"  # sent_idx already starts at start_sent_idx
                     
                     s_elem.set("id", s_id)
                     if current_sentence_obj and current_sentence_obj.text:
@@ -1244,6 +1724,24 @@ def rebuild_xml_with_tokens(
     # Restore original tail whitespace for this block element
     if original_tail is not None:
         block_elem.tail = original_tail
+    
+    # Second pass: Update all head values from ord to tokid
+    # Now that all tokens are created, we can convert head ord values to tokids
+    for tok_elem in block_elem.iter():
+        if tok_elem.tag.endswith("}tok") or tok_elem.tag == "tok":
+            # Get current head value
+            head_attr = _resolve_attr_name("head")
+            if head_attr:
+                head_value = tok_elem.get(head_attr)
+                if head_value and head_value.isdigit():
+                    # It's an ord value, try to convert to tokid
+                    head_ord = int(head_value)
+                    head_tokid = ord_to_tokid.get(head_ord)
+                    if head_tokid:
+                        _set_attr(tok_elem, "head", head_tokid)
+                    elif head_ord == 0:
+                        # Root token, remove head attribute
+                        _set_attr(tok_elem, "head", "", default_empty=True)
     
     # Return number of tokens and sentences used
     tokens_used = global_tok_id - initial_tok_id

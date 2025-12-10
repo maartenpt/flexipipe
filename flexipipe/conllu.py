@@ -88,6 +88,7 @@ def _create_implicit_mwt(sentence: Sentence) -> Sentence:
         if len(sequence) >= 2:
             # Check if any token in sequence is punctuation
             # But allow apostrophes/single quotes in contractions (e.g., "Let's", "don't")
+            # And allow hyphens in compound words (e.g., "awesome-align")
             has_punctuation = any(_is_punctuation(tok) for tok in sequence)
             # Allow apostrophes in contractions: if punctuation is only apostrophe-like and at position 1
             # (e.g., "Let" + "'s" or "do" + "n't")
@@ -100,7 +101,23 @@ def _create_implicit_mwt(sentence: Sentence) -> Sentence:
                     if form.startswith("'") or form.startswith("'") or "'" in form:
                         is_contraction = True
             
-            if not has_punctuation or is_contraction:
+            # Allow hyphens in compound words (e.g., "awesome-align" -> "awesome", "-", "align")
+            is_compound_word = False
+            if has_punctuation:
+                # Check if punctuation tokens are only hyphens and they're between word tokens
+                punct_tokens = [tok for tok in sequence if _is_punctuation(tok)]
+                if punct_tokens:
+                    # Check if all punctuation tokens are hyphens
+                    all_hyphens = all(
+                        tok.form in ("-", "–", "—") or tok.form.strip() == "-"
+                        for tok in punct_tokens
+                    )
+                    if all_hyphens:
+                        # Check that first and last tokens are not punctuation (hyphens are in the middle)
+                        if not _is_punctuation(sequence[0]) and not _is_punctuation(sequence[-1]):
+                            is_compound_word = True
+            
+            if not has_punctuation or is_contraction or is_compound_word:
                 # Create MWT
                 parent_form = "".join(tok.form for tok in sequence)
                 parent = Token(
@@ -172,12 +189,14 @@ def _merge_spaceafter_no_contractions(document: Document) -> None:
             current = sentence.tokens[i]
             
             # Check if we should merge with next token
-            # Skip if current token is already part of an MWT (has subtokens)
+            # Skip if current token is already part of an MWT (has subtokens or is_mwt flag is set)
             if (i + 1 < len(sentence.tokens) and 
-                not current.subtokens and  # Not already an MWT
+                not current.is_mwt and  # Not already an MWT (check flag first)
+                not current.subtokens and  # Not already an MWT (has subtokens)
                 current.space_after is False and  # SpaceAfter=No
                 not _is_punctuation(current) and  # Current is not punctuation
                 not _is_punctuation(sentence.tokens[i + 1]) and  # Next is not punctuation
+                not sentence.tokens[i + 1].is_mwt and  # Next is not already an MWT
                 not sentence.tokens[i + 1].subtokens):  # Next is not already an MWT
                 
                 # Merge current and next token into a contraction
@@ -257,7 +276,32 @@ def _merge_spaceafter_no_contractions(document: Document) -> None:
         
         sentence.tokens = new_tokens
 
-def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: bool = False) -> Document:
+def parse_conllu_from_backend(conllu_text: str, source_document: "Document", doc_id: str | None = None) -> "Document":
+    """
+    Parse CoNLL-U text from a backend, preserving flags from the source document.
+    
+    This is a convenience function for backends that output CoNLL-U and need to parse it back.
+    It checks the source document's meta for flags like _create_implicit_mwt and passes them
+    to conllu_to_document.
+    
+    Args:
+        conllu_text: The CoNLL-U text to parse
+        source_document: The original Document that was sent to the backend (for metadata)
+        doc_id: Optional document ID override (defaults to source_document.id)
+    
+    Returns:
+        A new Document parsed from the CoNLL-U text
+    """
+    if doc_id is None:
+        doc_id = source_document.id
+    create_implicit_mwt = source_document.meta.get("_create_implicit_mwt", False)
+    tagged_doc = conllu_to_document(conllu_text, doc_id=doc_id, create_implicit_mwt=create_implicit_mwt)
+    # Preserve original metadata
+    tagged_doc.meta.update(source_document.meta)
+    return tagged_doc
+
+
+def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: bool = False, create_implicit_mwt: bool = False) -> Document:
     """
     Parse CoNLL-U text into a Document, respecting UD hierarchy.
     
@@ -546,6 +590,9 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
                 mwt_end=end_id,
                 tokid=tokid,
             )
+            # Ensure attrs dict is initialized
+            if parent.attrs is None:
+                parent.attrs = {}
             # Set ord attribute (CoNLL-U ordinal number)
             if start_id:
                 parent.attrs["ord"] = str(start_id)
@@ -565,9 +612,23 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
             current_sentence = Sentence(id="")
         # Determine if this token falls inside a pending MWT
         parent_for_sub: Token | None = None
+        matched_start_id: int | None = None
         for start_id, (end_id, _) in list(pending_mwt.items()):
             if start_id <= token_id <= end_id:
                 parent_for_sub = mwt_parents.get(start_id)
+                if parent_for_sub is None:
+                    # Parent should exist if pending_mwt has this range
+                    # Try to find it in the current sentence's tokens
+                    if current_sentence:
+                        for tok in current_sentence.tokens:
+                            if tok.id == start_id and tok.is_mwt:
+                                parent_for_sub = tok
+                                mwt_parents[start_id] = tok
+                                break
+                    if parent_for_sub is None:
+                        # Still not found - this shouldn't happen, skip this token as subtoken
+                        continue
+                matched_start_id = start_id
                 if token_id == end_id:
                     # Last child closes this MWT
                     pending_mwt.pop(start_id, None)
@@ -595,6 +656,20 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
                 tokid=sub_tokid,
                 space_after=True,  # Default; SpaceAfter only matters on range in CoNLL-U
             )
+            # Store head, deprel, deps, misc in attrs dict for subtokens
+            # (SubToken doesn't have these as direct attributes)
+            if st.attrs is None:
+                st.attrs = {}
+            if head:
+                st.attrs["head"] = head
+            if deprel:
+                st.attrs["deprel"] = deprel
+            if deps:
+                st.attrs["deps"] = deps
+            if misc:
+                st.attrs["misc"] = misc
+            if token_id:
+                st.attrs["ord"] = str(token_id)
             parent_for_sub.subtokens.append(st)
         else:
             tok = Token(
@@ -676,6 +751,18 @@ def conllu_to_document(conllu_text: str, doc_id: str | None = None, add_tokids: 
         if sent.tokens:
             sent.tokens[-1].space_after = None
     
+    # Create implicit MWTs from SpaceAfter=No sequences if requested
+    # This should be done after all other processing (merging, etc.)
+    if create_implicit_mwt:
+        new_sentences = []
+        for sent in document.sentences:
+            if sent.tokens:
+                new_sent = _create_implicit_mwt(sent)
+                new_sentences.append(new_sent)
+            else:
+                new_sentences.append(sent)
+        document.sentences = new_sentences
+    
     # If sentence text missing, reconstruct with simple heuristic
     for sent in document.sentences:
         if not getattr(sent, "text", ""):
@@ -701,6 +788,7 @@ def document_to_conllu(
     entity_format: str = "iob",  # "iob" for Entity=B-PER format, "ne" for NE=ORG_3 format
     custom_misc_attrs: Optional[Dict[str, str]] = None,  # Map attr key -> MISC tag name (e.g., {"myattr": "MyTag"})
     include_tokid: bool = False,  # Force include TokId in MISC (even auto-generated ones)
+    suppress_space_after_in_misc: bool = False,  # If True, don't add SpaceAfter=No to MISC (use token.space_after instead)
 ) -> str:
     lines: List[str] = []
 
@@ -868,7 +956,7 @@ def document_to_conllu(
         if create_implicit_mwt:
             sentence = _create_implicit_mwt(sentence)
         extra_entities = span_entities.get(sent_idx)
-        sentence_lines = _sentence_lines(sentence, extra_entities=extra_entities, entity_format=entity_format, custom_misc_attrs=custom_misc_attrs, include_tokid=include_tokid)
+        sentence_lines = _sentence_lines(sentence, extra_entities=extra_entities, entity_format=entity_format, custom_misc_attrs=custom_misc_attrs, include_tokid=include_tokid, suppress_space_after_in_misc=suppress_space_after_in_misc)
         lines.extend(sentence_lines)
         # Add exactly one empty line after each sentence (required by CoNLL-U format)
         lines.append("")
@@ -893,7 +981,7 @@ def document_to_conllu(
     return result
 
 
-def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] = None, entity_format: str = "iob", custom_misc_attrs: Optional[Dict[str, str]] = None, include_tokid: bool = False) -> List[str]:
+def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] = None, entity_format: str = "iob", custom_misc_attrs: Optional[Dict[str, str]] = None, include_tokid: bool = False, suppress_space_after_in_misc: bool = False) -> List[str]:
     lines: List[str] = []
     # Print standard UD sentence attributes
     sent_standard_attrs = sentence.get_standard_attrs()
@@ -1040,7 +1128,7 @@ def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] =
                 space_after_tok = None
             
             entity_label = token_entity_labels.get(current_id, "")
-            lines.append(_format_token_line(current_id, token, space_after_override=space_after_tok, ignore_token_space_after=is_last_token, entity_label=entity_label, include_tokid=include_tokid, entity_format=entity_format, use_ne_format=use_ne_format, custom_misc_attrs=custom_misc_attrs))
+            lines.append(_format_token_line(current_id, token, space_after_override=space_after_tok, ignore_token_space_after=is_last_token, entity_label=entity_label, include_tokid=include_tokid, entity_format=entity_format, use_ne_format=use_ne_format, custom_misc_attrs=custom_misc_attrs, suppress_space_after_in_misc=suppress_space_after_in_misc))
             current_id += 1
 
     return lines
@@ -1058,6 +1146,7 @@ def _format_token_line(
     entity_format: str = "iob",
     use_ne_format: bool = False,
     custom_misc_attrs: Optional[Dict[str, str]] = None,
+    suppress_space_after_in_misc: bool = False,
 ) -> str:
     head = getattr(token, "head", 0) or 0
     head_value = "_" if head <= 0 else str(head)
@@ -1067,7 +1156,7 @@ def _format_token_line(
     misc = _format_misc(
         token,
         space_after_override=(False if force_no_space else space_after_override),
-        suppress_space_entry=force_no_space,
+        suppress_space_entry=force_no_space or suppress_space_after_in_misc,
         ignore_token_space_after=ignore_token_space_after,
         entity_label=entity_label,
         custom_misc_attrs=custom_misc_attrs,

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from ..backend_spec import BackendSpec
-from ..conllu import conllu_to_document, document_to_conllu
+from ..conllu import conllu_to_document, document_to_conllu, parse_conllu_from_backend
 from ..doc import Document
 from ..language_utils import (
     LANGUAGE_FIELD_ISO,
@@ -275,7 +275,7 @@ class UDPipeCLIBackend(BackendManager):
                         # Success without parser
                         output_text = result.stdout
                         if output_text.strip():
-                            tagged_doc = conllu_to_document(output_text, doc_id=document.id)
+                            tagged_doc = parse_conllu_from_backend(output_text, document)
                             return NeuralResult(document=tagged_doc, stats={})
                 
                 # If we get here, it's a real error
@@ -293,7 +293,7 @@ class UDPipeCLIBackend(BackendManager):
                 raise RuntimeError(f"UDPipe produced no output. stderr: {error_msg}")
             
             # Parse output
-            tagged_doc = conllu_to_document(output_text, doc_id=document.id)
+            tagged_doc = parse_conllu_from_backend(output_text, document)
             
             return NeuralResult(document=tagged_doc, stats={})
             

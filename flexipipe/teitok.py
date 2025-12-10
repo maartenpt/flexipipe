@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
@@ -359,10 +360,63 @@ def load_teitok(
     Returns:
         Document object
     """
-    # If attribute mappings are provided, use Python-based loading
-    if xpos_attr or reg_attr or expan_attr or lemma_attr:
+    # Always fix duplicate IDs first (before loading)
+    # This ensures the backend receives deduplicated IDs
+    had_duplicates = False
+    temp_path = None
+    try:
+        # Handle files with debug output at the start (find first XML tag)
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+            xml_start = content.find("<")
+            if xml_start >= 0:
+                from io import StringIO
+                tree = ET.parse(StringIO(content[xml_start:]))
+                root = tree.getroot()
+                # Check for duplicates before fixing
+                seen_sent_ids: Dict[str, int] = {}
+                seen_tokids: Dict[str, int] = {}
+                for s_node in root.iter():
+                    if s_node.tag.endswith("}s") or s_node.tag == "s":
+                        sent_id = s_node.get("id") or s_node.get("{http://www.w3.org/XML/1998/namespace}id")
+                        if sent_id:
+                            seen_sent_ids[sent_id] = seen_sent_ids.get(sent_id, 0) + 1
+                for tok_node in root.iter():
+                    if tok_node.tag.endswith("}tok") or tok_node.tag == "tok":
+                        tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
+                        if tokid:
+                            seen_tokids[tokid] = seen_tokids.get(tokid, 0) + 1
+                
+                # Check if there are duplicates
+                has_duplicates = any(count > 1 for count in seen_sent_ids.values()) or any(count > 1 for count in seen_tokids.values())
+                
+                if has_duplicates:
+                    had_duplicates = True
+                    _fix_duplicate_ids(root)
+                    # Write fixed XML back to a temp file
+                    # (We'll use this temp file for loading)
+                    import tempfile
+                    # Include XML declaration
+                    fixed_content = '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode")
+                    # Write to temp file
+                    temp_fd, temp_path = tempfile.mkstemp(suffix=".xml", text=True)
+                    try:
+                        with os.fdopen(temp_fd, "w", encoding="utf-8") as tf:
+                            tf.write(fixed_content)
+                    except Exception:
+                        os.close(temp_fd)
+                        temp_path = None
+    except Exception:
+        # If fixing fails, just use original file
+        pass
+    
+    load_path = temp_path if temp_path and had_duplicates else path
+    
+    # If attribute mappings are provided OR we fixed duplicates, use Python-based loading
+    # (Python loader can handle the fixed XML, C++ loader might not)
+    if xpos_attr or reg_attr or expan_attr or lemma_attr or had_duplicates:
         doc = _load_teitok_with_mappings(
-            path,
+            load_path,
             xpos_attr=xpos_attr,
             reg_attr=reg_attr,
             expan_attr=expan_attr,
@@ -370,12 +424,20 @@ def load_teitok(
         )
     else:
         # Otherwise, use the fast C++ loader
-        data = _load_teitok(path)  # type: ignore
+        data = _load_teitok(load_path)  # type: ignore
         doc = Document.from_dict(data)
         _apply_sentence_correspondence(doc)
         # Fix space_after values by inferring from sentence text
         _infer_space_after_from_text(doc)
         doc = _sanitize_document(doc)
+    
+    # Clean up temp file if we created one
+    if temp_path and os.path.exists(temp_path):
+        try:
+            os.unlink(temp_path)
+        except Exception:
+            pass
+    
     assign_doc_id_from_path(doc, path)
     doc.meta.setdefault("source_path", path)
     for sentence in doc.sentences:
@@ -579,6 +641,77 @@ def extract_teitok_plain_text(path: str, textnode_xpath: str = ".//text", includ
         raise ValueError(f"Failed to extract text from TEITOK file {path}: {e}") from e
 
 
+def _fix_duplicate_ids(root: ET.Element) -> None:
+    """
+    Fix duplicate sentence and token IDs in the XML tree by appending suffixes.
+    
+    This ensures that all IDs are unique, which is required for valid XML.
+    Duplicate IDs are renamed with suffixes: s1 -> s1-2, s1-3, etc.
+    
+    Args:
+        root: Root XML element
+    """
+    # Fix duplicate sentence IDs
+    all_sentences: List[ET.Element] = []
+    seen_sent_ids: Dict[str, int] = {}
+    
+    # First pass: collect all sentences and detect duplicates
+    for s_node in root.iter():
+        if s_node.tag.endswith("}s") or s_node.tag == "s":
+            all_sentences.append(s_node)
+            sent_id = s_node.get("id") or s_node.get("{http://www.w3.org/XML/1998/namespace}id")
+            if sent_id:
+                seen_sent_ids[sent_id] = seen_sent_ids.get(sent_id, 0) + 1
+    
+    # Second pass: fix duplicate sentence IDs
+    sent_id_counts: Dict[str, int] = {}
+    for s_node in all_sentences:
+        sent_id = s_node.get("id") or s_node.get("{http://www.w3.org/XML/1998/namespace}id")
+        if sent_id and seen_sent_ids.get(sent_id, 0) > 1:
+            # This is a duplicate - need to fix it
+            sent_id_counts[sent_id] = sent_id_counts.get(sent_id, 0) + 1
+            if sent_id_counts[sent_id] > 1:
+                # Append suffix for duplicates
+                new_sent_id = f"{sent_id}-{sent_id_counts[sent_id]}"
+                # Remove old id attribute (could be id or xml:id)
+                if s_node.get("id"):
+                    s_node.attrib.pop("id")
+                if s_node.get("{http://www.w3.org/XML/1998/namespace}id"):
+                    s_node.attrib.pop("{http://www.w3.org/XML/1998/namespace}id")
+                # Set new id
+                s_node.set("id", new_sent_id)
+    
+    # Fix duplicate token IDs
+    all_tok_nodes: List[ET.Element] = []
+    seen_tokids: Dict[str, int] = {}
+    
+    # First pass: collect all tokens and detect duplicates
+    for tok_node in root.iter():
+        if tok_node.tag.endswith("}tok") or tok_node.tag == "tok":
+            all_tok_nodes.append(tok_node)
+            tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
+            if tokid:
+                seen_tokids[tokid] = seen_tokids.get(tokid, 0) + 1
+    
+    # Second pass: fix duplicate token IDs
+    tokid_counts: Dict[str, int] = {}
+    for tok_node in all_tok_nodes:
+        tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
+        if tokid and seen_tokids.get(tokid, 0) > 1:
+            # This is a duplicate - need to fix it
+            tokid_counts[tokid] = tokid_counts.get(tokid, 0) + 1
+            if tokid_counts[tokid] > 1:
+                # Append suffix for duplicates (w-1 -> w-1-2, w-1-3, etc.)
+                new_tokid = f"{tokid}-{tokid_counts[tokid]}"
+                # Remove old id attribute (could be id or xml:id)
+                if tok_node.get("id"):
+                    tok_node.attrib.pop("id")
+                if tok_node.get("{http://www.w3.org/XML/1998/namespace}id"):
+                    tok_node.attrib.pop("{http://www.w3.org/XML/1998/namespace}id")
+                # Set new id
+                tok_node.set("id", new_tokid)
+
+
 def _load_teitok_with_mappings(
     path: str,
     *,
@@ -613,6 +746,9 @@ def _load_teitok_with_mappings(
             error_msg += f": {str(e)}"
             raise ValueError(error_msg) from e
     root = tree.getroot()
+    
+    # Fix duplicate IDs before processing
+    _fix_duplicate_ids(root)
     
     # Parse comma-separated attribute lists
     xpos_attrs = [a.strip() for a in xpos_attr.split(",")] if xpos_attr else []
@@ -668,7 +804,7 @@ def _load_teitok_with_mappings(
         sent_id_attr = s_elem.get("sent_id", "")
         assigned_id = xml_sent_id or sent_id_attr
         if not assigned_id:
-            assigned_id = f"s{sentence_counter}"
+            assigned_id = f"s-{sentence_counter}"
         # Store all attributes from <s> element in attrs (except those we use directly)
         s_attrs: Dict[str, str] = {}
         for key, value in s_elem.attrib.items():
@@ -1495,7 +1631,7 @@ def _verify_character_level_alignment(
         sent_id = sent.sent_id or sent.id or sent.source_id
         s_node = sentid_to_xml_node.get(sent_id) if sent_id else None
         
-        if s_node:
+        if s_node is not None:
             # First try to use sentence text attribute (most accurate, especially in raw text mode)
             sent_text = s_node.get("text", "")
             if sent_text:
@@ -1611,6 +1747,44 @@ def _verify_character_level_alignment(
     return (False, error_msg)
 
 
+def _add_change_to_tei_header(
+    root: ET.Element,
+    change_text: str,
+    change_when: Optional[str] = None,
+) -> None:
+    """
+    Add a <change> element to the <revisionDesc> in the TEI header.
+    
+    Args:
+        root: The root element of the TEI XML tree
+        change_text: The text content for the <change> element
+        change_when: Optional ISO 8601 timestamp (defaults to current UTC time)
+    """
+    if change_when is None:
+        from datetime import datetime
+        change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    # Find or create teiHeader
+    tei_header = root.find("teiHeader")
+    if tei_header is None:
+        tei_header = ET.Element("teiHeader")
+        # Insert at the beginning (before <text>)
+        root.insert(0, tei_header)
+    
+    # Find or create revisionDesc
+    revision_desc = tei_header.find("revisionDesc")
+    if revision_desc is None:
+        revision_desc = ET.SubElement(tei_header, "revisionDesc")
+    
+    # Add change element
+    change_elem = ET.SubElement(
+        revision_desc,
+        "change",
+        {"when": change_when, "who": "flexipipe"},
+    )
+    change_elem.text = change_text
+
+
 def update_teitok(
     document: Document,
     original_path: str,
@@ -1698,6 +1872,7 @@ def update_teitok(
     
     # Find all <s>, <tok>, and <dtok> nodes
     # Handle both namespaced and non-namespaced elements
+    # Note: Duplicate IDs are already fixed during loading, so we can just collect them
     for s_node in root.iter():
         if s_node.tag.endswith("}s") or s_node.tag == "s":
             sent_id = s_node.get("id") or s_node.get("{http://www.w3.org/XML/1998/namespace}id") or s_node.get("sent_id")
@@ -1711,7 +1886,7 @@ def update_teitok(
                     siblings = [c for c in parent if (c.tag.endswith("}s") or c.tag == "s")]
                     if s_node in siblings:
                         idx = siblings.index(s_node) + 1
-                        sent_id = f"s{idx}"
+                        sent_id = f"s-{idx}"
                         s_node.set("id", sent_id)
                         sentid_to_node[sent_id] = s_node
     
@@ -1724,6 +1899,7 @@ def update_teitok(
     # Second pass: assign IDs and build mapping
     # Preserve existing IDs, only generate new ones if missing
     # Prefer id over xml:id when reading
+    # Note: Duplicate IDs are already fixed during loading
     global_token_counter = 1
     for tok_node in all_tok_nodes:
         tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
@@ -2155,7 +2331,105 @@ def update_teitok(
                             tokid_to_node[token.tokid] = tok_node
                             global_ord_to_tokid[token.id] = token.tokid
         
-        # Second pass: match remaining tokens using form-based alignment with split handling
+        # Second pass (pretokenized mode only): match MWT tokens to multiple XML tokens
+        # This handles cases where the backend creates MWTs - we match subtokens to individual XML tokens
+        if not from_raw_text:
+            for token_idx, token in enumerate(sent.tokens):
+                if not token.id:
+                    continue
+                # Skip if already matched
+                if (sent_idx, token_idx) in global_token_to_tok_node:
+                    continue
+                if is_comment_line_token(token):
+                    continue
+                
+                # Only process MWT tokens in this pass
+                if not (token.is_mwt and token.subtokens):
+                    continue
+                
+                unmatched_nodes = [n for n in sent_tok_nodes if n not in matched_xml_nodes]
+                
+                # First, try to match the MWT token directly to an XML token that is also an MWT
+                # (XML already has MWT structure from previous run)
+                matched_mwt_node = None
+                for candidate in unmatched_nodes:
+                    # Check if candidate is an MWT (has dtok children)
+                    has_dtoks = any(c.tag.endswith("}dtok") or c.tag == "dtok" for c in candidate)
+                    if has_dtoks:
+                        # Check if forms match
+                        candidate_text = get_full_text_content(candidate).strip()
+                        candidate_canonical = gettokform(candidate, settings).strip()
+                        token_form = token.form.strip() if token.form else ""
+                        
+                        # Normalize for comparison
+                        candidate_text_norm = candidate_text.lower()
+                        candidate_canonical_norm = candidate_canonical.lower()
+                        token_form_norm = token_form.lower()
+                        
+                        if (candidate_text_norm == token_form_norm or 
+                            candidate_canonical_norm == token_form_norm):
+                            matched_mwt_node = candidate
+                            break
+                
+                if matched_mwt_node:
+                    # XML already has MWT structure - match directly
+                    tok_node = matched_mwt_node
+                    matched_xml_nodes.add(tok_node)
+                    global_token_to_tok_node[(sent_idx, token_idx)] = tok_node
+                    # Don't set _mwt_subtoken_xml_nodes - XML already has dtoks, annotations will go there
+                    continue
+                
+                # Second, try to match subtokens to individual XML tokens
+                # (XML has individual tokens, backend has MWT)
+                if len(token.subtokens) > len(unmatched_nodes):
+                    continue  # Not enough unmatched nodes
+                
+                # Try to find a starting position where all subtokens match consecutively
+                matched_nodes_for_mwt = None
+                for start_pos in range(len(unmatched_nodes) - len(token.subtokens) + 1):
+                    # Try matching subtokens starting at this position
+                    candidate_matches = []
+                    all_match = True
+                    for sub_idx, subtoken in enumerate(token.subtokens):
+                        candidate = unmatched_nodes[start_pos + sub_idx]
+                        candidate_text = get_full_text_content(candidate).strip()
+                        candidate_canonical = gettokform(candidate, settings).strip()
+                        subtoken_form = subtoken.form.strip() if subtoken.form else ""
+                        
+                        # Normalize for comparison (case-insensitive)
+                        candidate_text_norm = candidate_text.lower()
+                        candidate_canonical_norm = candidate_canonical.lower()
+                        subtoken_form_norm = subtoken_form.lower()
+                        
+                        # Check if subtoken matches this XML node
+                        if (candidate_text_norm == subtoken_form_norm or 
+                            candidate_canonical_norm == subtoken_form_norm):
+                            candidate_matches.append(candidate)
+                        else:
+                            all_match = False
+                            break
+                    
+                    if all_match and len(candidate_matches) == len(token.subtokens):
+                        matched_nodes_for_mwt = candidate_matches
+                        break
+                
+                if matched_nodes_for_mwt:
+                    # Match all subtokens to XML nodes
+                    # Map the MWT token to the first XML node
+                    tok_node = matched_nodes_for_mwt[0]
+                    # Mark ALL matched XML nodes as matched
+                    for xml_node in matched_nodes_for_mwt:
+                        matched_xml_nodes.add(xml_node)
+                    global_token_to_tok_node[(sent_idx, token_idx)] = tok_node
+                    
+                    # Store mapping from subtoken index to XML node for later annotation
+                    if "_mwt_subtoken_xml_nodes" not in token.attrs:
+                        token.attrs["_mwt_subtoken_xml_nodes"] = {}
+                    for sub_idx, xml_node in enumerate(matched_nodes_for_mwt):
+                        if sub_idx > 0:  # First subtoken maps to tok_node (already set above)
+                            token.attrs["_mwt_subtoken_xml_nodes"][sub_idx] = xml_node
+        
+        # Third pass: match remaining tokens using form-based alignment with split handling
         # COMPLETELY REWRITTEN: Simple, strict matching that NEVER accepts incorrect matches
         matched_backend_token_indices = set()
         
@@ -2178,6 +2452,12 @@ def update_teitok(
             token_form = token.form.strip()
             if not token_form:
                 continue
+            
+            # Skip MWT tokens in pretokenized mode only if they were successfully matched in second pass
+            if token.is_mwt and token.subtokens and not from_raw_text:
+                if (sent_idx, token_idx) in global_token_to_tok_node:
+                    # Already matched in second pass, skip
+                    continue
             
             tok_node = None
             matched_form = None  # Track which form matched (for verification)
@@ -2238,7 +2518,7 @@ def update_teitok(
                                         matched_backend_token_indices.add(token_idx + i)
                                 break
                 
-                if tok_node:
+                if tok_node is not None:
                     break
             
             # Strategy 2: Try exact single-token match (only if sequence matching failed)
@@ -2352,7 +2632,7 @@ def update_teitok(
         # Ensure sentence has an ID - assign one if missing
         if not s_node.get("id") and not s_node.get("{http://www.w3.org/XML/1998/namespace}id"):
             # Generate sentence ID
-            sent_id = f"s{sent_idx + 1}"
+            sent_id = f"s-{sent_idx + 1}"
             s_node.set("id", sent_id)
             sentid_to_node[sent_id] = s_node
         
@@ -2373,7 +2653,7 @@ def update_teitok(
                 skipped_tokens += 1
                 # Debug output for mismatched tokens
                 import sys
-                sent_id_str = sent.sent_id or sent.id or sent.source_id or f"s{sent_idx+1}"
+                sent_id_str = sent.sent_id or sent.id or sent.source_id or f"s-{sent_idx+1}"
                 print(f"[flexipipe] update_teitok: Token mismatch - sent {sent_idx+1} (id={sent_id_str}), token {token_idx+1} (ord={token.id}, tokid={token.tokid}, form='{token.form}') has no matching XML node", file=sys.stderr)
                 continue
             
@@ -2608,7 +2888,145 @@ def update_teitok(
                 # Skip the rest of the attribute setting for this token
                 continue
             
-            # For MWT tokens, update the <tok> element but annotations go on <dtok>
+            # For MWT tokens where XML already has MWT structure (has dtoks)
+            # Apply subtoken annotations to existing dtoks
+            if token.is_mwt and token.subtokens and not from_raw_text:
+                # Check if XML node already has dtoks
+                xml_has_dtoks = any(c.tag.endswith("}dtok") or c.tag == "dtok" for c in tok_node)
+                if xml_has_dtoks:
+                    # XML already has MWT structure - apply annotations to existing dtoks
+                    dtok_nodes = [c for c in tok_node if (c.tag.endswith("}dtok") or c.tag == "dtok")]
+                    for sub_idx, subtoken in enumerate(token.subtokens):
+                        if sub_idx >= len(dtok_nodes):
+                            break
+                        dtok_node = dtok_nodes[sub_idx]
+                        
+                        # Apply subtoken annotations to dtok
+                        dtok_lemma = subtoken.lemma or subtoken.attrs.get("lemma", "")
+                        dtok_xpos = subtoken.xpos or subtoken.attrs.get("xpos", "")
+                        dtok_upos = subtoken.upos or subtoken.attrs.get("upos", "")
+                        dtok_feats = subtoken.feats or subtoken.attrs.get("feats", "")
+                        dtok_deprel = subtoken.attrs.get("deprel", "")
+                        dtok_deps = subtoken.attrs.get("deps", "")
+                        
+                        _set_attr(dtok_node, "lemma", dtok_lemma, default_empty=True)
+                        _set_attr(dtok_node, "xpos", dtok_xpos)
+                        _set_attr(dtok_node, "upos", dtok_upos)
+                        _set_attr(dtok_node, "feats", dtok_feats)
+                        
+                        # Set ord attribute
+                        if subtoken.id:
+                            _set_attr(dtok_node, "ord", str(subtoken.id))
+                        
+                        # Set head attribute (convert from ord to tokid)
+                        head_int = 0
+                        if "head" in subtoken.attrs:
+                            head_attr = subtoken.attrs["head"]
+                            if isinstance(head_attr, int):
+                                head_int = head_attr
+                            elif isinstance(head_attr, str):
+                                try:
+                                    head_int = int(head_attr)
+                                except (ValueError, TypeError):
+                                    head_int = 0
+                        
+                        if head_int > 0:
+                            head_tokid = global_ord_to_tokid.get(head_int)
+                            if not head_tokid:
+                                head_token = ord_to_token.get(head_int)
+                                if head_token and head_token.tokid:
+                                    head_tokid = head_token.tokid
+                                    global_ord_to_tokid[head_int] = head_tokid
+                            if head_tokid:
+                                _set_attr(dtok_node, "head", head_tokid)
+                            else:
+                                _set_attr(dtok_node, "head", str(head_int))
+                        else:
+                            _set_attr(dtok_node, "head", "", default_empty=True)
+                        
+                        if dtok_deprel:
+                            _set_attr(dtok_node, "deprel", dtok_deprel)
+                        if dtok_deps:
+                            _set_attr(dtok_node, "deps", dtok_deps)
+                        
+                        misc_val = subtoken.attrs.get("misc", "")
+                        if misc_val:
+                            _set_attr(dtok_node, "misc", misc_val)
+                    
+                    # Skip the rest of the attribute setting for this token
+                    continue
+            
+            # For MWT tokens that were matched to multiple XML tokens (pretokenized mode)
+            # Apply each subtoken's annotations to its corresponding XML token
+            if token.is_mwt and token.subtokens and not from_raw_text and "_mwt_subtoken_xml_nodes" in token.attrs:
+                # This MWT was matched to multiple XML tokens - apply annotations directly to those tokens
+                subtoken_xml_nodes = token.attrs["_mwt_subtoken_xml_nodes"]
+                for sub_idx, subtoken in enumerate(token.subtokens):
+                    if sub_idx == 0:
+                        # First subtoken - apply to the main XML token (tok_node)
+                        xml_node = tok_node
+                    else:
+                        # Remaining subtokens - apply to their respective XML tokens
+                        xml_node = subtoken_xml_nodes.get(sub_idx)
+                        if not xml_node:
+                            continue
+                    
+                    # Apply subtoken annotations to this XML node
+                    dtok_lemma = subtoken.lemma or subtoken.attrs.get("lemma", "")
+                    dtok_xpos = subtoken.xpos or subtoken.attrs.get("xpos", "")
+                    dtok_upos = subtoken.upos or subtoken.attrs.get("upos", "")
+                    dtok_feats = subtoken.feats or subtoken.attrs.get("feats", "")
+                    dtok_deprel = subtoken.attrs.get("deprel", "")
+                    dtok_deps = subtoken.attrs.get("deps", "")
+                    
+                    _set_attr(xml_node, "lemma", dtok_lemma, default_empty=True)
+                    _set_attr(xml_node, "xpos", dtok_xpos)
+                    _set_attr(xml_node, "upos", dtok_upos)
+                    _set_attr(xml_node, "feats", dtok_feats)
+                    
+                    # Set ord attribute
+                    if subtoken.id:
+                        _set_attr(xml_node, "ord", str(subtoken.id))
+                    
+                    # Set head attribute (convert from ord to tokid)
+                    head_int = 0
+                    if "head" in subtoken.attrs:
+                        head_attr = subtoken.attrs["head"]
+                        if isinstance(head_attr, int):
+                            head_int = head_attr
+                        elif isinstance(head_attr, str):
+                            try:
+                                head_int = int(head_attr)
+                            except (ValueError, TypeError):
+                                head_int = 0
+                    
+                    if head_int > 0:
+                        head_tokid = global_ord_to_tokid.get(head_int)
+                        if not head_tokid:
+                            head_token = ord_to_token.get(head_int)
+                            if head_token and head_token.tokid:
+                                head_tokid = head_token.tokid
+                                global_ord_to_tokid[head_int] = head_tokid
+                        if head_tokid:
+                            _set_attr(xml_node, "head", head_tokid)
+                        else:
+                            _set_attr(xml_node, "head", str(head_int))
+                    else:
+                        _set_attr(xml_node, "head", "", default_empty=True)
+                    
+                    if dtok_deprel:
+                        _set_attr(xml_node, "deprel", dtok_deprel)
+                    if dtok_deps:
+                        _set_attr(xml_node, "deps", dtok_deps)
+                    
+                    misc_val = subtoken.attrs.get("misc", "")
+                    if misc_val:
+                        _set_attr(xml_node, "misc", misc_val)
+                
+                # Skip the rest of the attribute setting for this token
+                continue
+            
+            # For MWT tokens that match a single XML token (raw text mode), update the <tok> element but annotations go on <dtok>
             if token.is_mwt and token.subtokens:
                 # Update <tok> attributes (form, reg, expan, etc. but not lemma/xpos/upos)
                 _set_attr(tok_node, "reg", token.reg)
@@ -2871,6 +3289,53 @@ def update_teitok(
             f"Proceeding with partial update, but results may be incorrect.",
             file=sys.stderr
         )
+    
+    # Add change element to TEI header
+    # Extract change information from document metadata
+    from datetime import datetime
+    change_when = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    # Build change text from document metadata
+    backends_used = document.meta.get("_backends_used", [])
+    if not backends_used:
+        backends_used = ["flexipipe"]
+    
+    # Get model information
+    file_level_attrs = document.meta.get("_file_level_attrs", {})
+    model_keys = sorted([k for k in file_level_attrs.keys() if k.endswith("_model")])
+    model_str = None
+    if model_keys:
+        model_str = file_level_attrs[model_keys[0]]
+    
+    # Build backend string
+    backend_names = [b.upper() for b in backends_used]
+    change_source = ", ".join(backend_names) if len(backend_names) > 1 else (model_str or backend_names[0] if backend_names else "flexipipe")
+    
+    # Detect performed tasks
+    tasks = set()
+    if document.meta.get("_tokenized", False):
+        tasks.add("tokenize")
+    if document.meta.get("_segmented", False):
+        tasks.add("segment")
+    if any(t.lemma for s in document.sentences for t in s.tokens):
+        tasks.add("lemmatize")
+    if any(t.xpos or t.upos for s in document.sentences for t in s.tokens):
+        tasks.add("tag")
+    if any(t.head for s in document.sentences for t in s.tokens):
+        tasks.add("parse")
+    # NER is stored in sentence.entities, not on tokens
+    if getattr(document, "spans", None) and document.spans.get("ner"):
+        tasks.add("ner")
+    elif any(s.entities for s in document.sentences):
+        tasks.add("ner")
+    # Normalization is detected from various token attributes
+    if any(t.reg or t.expan or t.mod or t.trslit or t.ltrslit or t.corr or t.lex or (t.misc and t.misc != "_") for s in document.sentences for t in s.tokens):
+        tasks.add("normalize")
+    
+    tasks_summary_str = ",".join(sorted(tasks)) if tasks else "segment,tokenize"
+    change_text = f"Tagged via {change_source} (tasks={tasks_summary_str})"
+    
+    _add_change_to_tei_header(root, change_text, change_when)
     
     # Write updated XML
     if preserve_comments:

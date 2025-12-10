@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..backend_spec import BackendSpec
-from ..conllu import conllu_to_document, document_to_conllu
+from ..conllu import conllu_to_document, document_to_conllu, parse_conllu_from_backend
 from ..doc import Document, Entity
 from ..language_utils import (
     LANGUAGE_FIELD_ISO,
@@ -590,9 +590,10 @@ class NameTagRESTBackend(BackendManager):
         
         # Parse the CoNLL-U (this will extract nametag_* headers into doc.attrs)
         # This also parses #newpar markers and creates paragraph spans
-        doc = conllu_to_document(conllu_text, doc_id=original_doc.id or "nametag")
+        # Use helper function that preserves flags from source document
+        doc = parse_conllu_from_backend(conllu_text, original_doc, doc_id=original_doc.id or "nametag")
         
-        # Preserve original document's attrs and meta
+        # Preserve original document's attrs (meta is already preserved by helper)
         if hasattr(original_doc, 'attrs'):
             for key, value in original_doc.attrs.items():
                 if key not in doc.attrs:
@@ -601,6 +602,7 @@ class NameTagRESTBackend(BackendManager):
             # Save parsed document's file-level attrs before general meta update
             parsed_file_level = doc.meta.get("_file_level_attrs", {}).copy()
             # Do general meta update (this might overwrite _file_level_attrs)
+            # Note: helper already updated meta, but we need to preserve file-level attrs
             doc.meta.update(original_doc.meta)
             # Restore and merge file-level attrs (parsed document takes priority)
             if "_file_level_attrs" not in doc.meta:
