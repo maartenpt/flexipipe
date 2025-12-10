@@ -549,6 +549,15 @@ def get_udpipe1_model_entries(
     if use_cache and not refresh_cache:
         cached = read_model_cache_entry(cache_key, max_age_seconds=cache_ttl_seconds)
         if cached and cache_entries_standardized(cached):
+            # Re-check filesystem to update installed/local_path flags even when using cache
+            models_dir = get_backend_models_dir("udpipe1", create=False)
+            for model_name, entry in cached.items():
+                expected_path = models_dir / f"{model_name}.udpipe"
+                if expected_path.exists():
+                    entry["installed"] = True
+                    entry["local_path"] = str(expected_path)
+                else:
+                    entry["installed"] = False
             if verbose:
                 print("[flexipipe] Using cached UDPipe CLI model list (use --refresh-cache to update).")
             return cached

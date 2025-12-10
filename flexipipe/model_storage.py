@@ -692,6 +692,11 @@ def is_model_installed(backend: str, model_name: str) -> bool:
                         pt_file = processor_dir / variant_file
                         if pt_file.exists():
                             return True
+    elif backend == "udpipe1":
+        # UDPipe CLI models: <model>.udpipe in backend dir
+        model_file = backend_dir / f"{model_name}.udpipe"
+        if model_file.exists():
+            return True
     
     return False
 
