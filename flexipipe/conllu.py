@@ -294,8 +294,27 @@ def parse_conllu_from_backend(conllu_text: str, source_document: "Document", doc
     """
     if doc_id is None:
         doc_id = source_document.id
+
+    # Backends (especially CLI tools like UDPipe1) may inject their own
+    # document identifiers into the CoNLL-U output via lines such as:
+    #   # newdoc id = /tmp/tmpabcd.plain
+    # These are backend‑internal file paths and should NOT be exposed as
+    # user‑visible document IDs in FlexiPipe output. We therefore strip
+    # any backend‑supplied `id = ...` from `# newdoc` lines here and let
+    # `doc_id` / `Document.id` control the visible ID instead.
+    cleaned_lines: list[str] = []
+    for line in conllu_text.splitlines():
+        if line.startswith("# newdoc"):
+            # Preserve the marker but drop any id or other attributes
+            # coming from the backend. `conllu_to_document` will use
+            # the explicit `doc_id` we pass in.
+            cleaned_lines.append("# newdoc")
+        else:
+            cleaned_lines.append(line)
+    cleaned_conllu = "\n".join(cleaned_lines)
+
     create_implicit_mwt = source_document.meta.get("_create_implicit_mwt", False)
-    tagged_doc = conllu_to_document(conllu_text, doc_id=doc_id, create_implicit_mwt=create_implicit_mwt)
+    tagged_doc = conllu_to_document(cleaned_conllu, doc_id=doc_id, create_implicit_mwt=create_implicit_mwt)
     # Preserve original metadata
     tagged_doc.meta.update(source_document.meta)
     return tagged_doc
@@ -1064,6 +1083,32 @@ def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] =
         
         use_ne_format = False
 
+    # Check if sentence has any actual dependencies (non-zero heads or non-empty deprels)
+    # If all tokens have head=0/None and deprel=_/empty, we should output _ for head instead of 0
+    has_dependencies = False
+    for token in sentence.tokens:
+        head = getattr(token, "head", 0) or 0
+        try:
+            head_int = int(head) if head not in ("", None, "_") else 0
+        except (TypeError, ValueError):
+            head_int = 0
+        deprel = getattr(token, "deprel", "") or ""
+        # Check subtokens too if this is an MWT
+        if token.is_mwt and token.subtokens:
+            for sub in token.subtokens:
+                sub_head = getattr(sub, "head", 0) or 0
+                try:
+                    sub_head_int = int(sub_head) if sub_head not in ("", None, "_") else 0
+                except (TypeError, ValueError):
+                    sub_head_int = 0
+                sub_deprel = getattr(sub, "deprel", "") or ""
+                if sub_head_int > 0 or (sub_deprel and sub_deprel != "_"):
+                    has_dependencies = True
+                    break
+        if head_int > 0 or (deprel and deprel != "_"):
+            has_dependencies = True
+            break
+    
     current_id = 1
     pos = 0  # index into sentence_text for space derivation
     tokens_list = list(sentence.tokens)
@@ -1101,7 +1146,7 @@ def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] =
             # Subtokens: no SpaceAfter in MISC (they are not orthographic)
             for sub in token.subtokens:
                 entity_label = token_entity_labels.get(current_id, "")
-                lines.append(_format_token_line(current_id, sub, force_no_space=True, entity_label=entity_label, include_tokid=include_tokid, entity_format=entity_format, use_ne_format=use_ne_format, custom_misc_attrs=custom_misc_attrs))
+                lines.append(_format_token_line(current_id, sub, force_no_space=True, entity_label=entity_label, include_tokid=include_tokid, entity_format=entity_format, use_ne_format=use_ne_format, custom_misc_attrs=custom_misc_attrs, has_dependencies=has_dependencies))
                 current_id += 1
         else:
             # Normal token: derive space from sentence_text or use explicit value
@@ -1128,7 +1173,7 @@ def _sentence_lines(sentence: Sentence, extra_entities: Optional[List[Entity]] =
                 space_after_tok = None
             
             entity_label = token_entity_labels.get(current_id, "")
-            lines.append(_format_token_line(current_id, token, space_after_override=space_after_tok, ignore_token_space_after=is_last_token, entity_label=entity_label, include_tokid=include_tokid, entity_format=entity_format, use_ne_format=use_ne_format, custom_misc_attrs=custom_misc_attrs, suppress_space_after_in_misc=suppress_space_after_in_misc))
+            lines.append(_format_token_line(current_id, token, space_after_override=space_after_tok, ignore_token_space_after=is_last_token, entity_label=entity_label, include_tokid=include_tokid, entity_format=entity_format, use_ne_format=use_ne_format, custom_misc_attrs=custom_misc_attrs, suppress_space_after_in_misc=suppress_space_after_in_misc, has_dependencies=has_dependencies))
             current_id += 1
 
     return lines
@@ -1147,9 +1192,20 @@ def _format_token_line(
     use_ne_format: bool = False,
     custom_misc_attrs: Optional[Dict[str, str]] = None,
     suppress_space_after_in_misc: bool = False,
+    has_dependencies: bool = True,  # Default to True for backward compatibility
 ) -> str:
-    head = getattr(token, "head", 0) or 0
-    head_value = "_" if head <= 0 else str(head)
+    # Normalize head: flexipipe stores root as 0/None; some callers may use "_" or "".
+    head_raw = getattr(token, "head", 0)
+    try:
+        head_int = int(head_raw) if head_raw not in ("", None, "_") else 0
+    except (TypeError, ValueError):
+        head_int = 0
+    # If sentence has no dependencies at all, use "_" for root tokens instead of "0"
+    # Only use "0" if there are actual dependencies in the sentence
+    if head_int <= 0:
+        head_value = "_" if not has_dependencies else "0"
+    else:
+        head_value = str(head_int)
     deprel = getattr(token, "deprel", "") or "_"
     deps = getattr(token, "deps", "") or "_"
     # If force_no_space is True (subtokens), suppress SpaceAfter completely (no entry in MISC)

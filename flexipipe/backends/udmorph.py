@@ -206,6 +206,20 @@ class UDMorphRESTBackend(BackendManager):
     ):
         if not endpoint_url:
             raise ValueError("endpoint_url is required for UDMorph REST backend")
+        # Validate that endpoint_url has a scheme (http:// or https://)
+        if not endpoint_url.startswith(("http://", "https://")):
+            raise ValueError(
+                f"Invalid UDMorph endpoint URL '{endpoint_url}': "
+                "URL must start with http:// or https://"
+            )
+        # Warn if endpoint looks like a GitHub URL (likely wrong)
+        if "github" in endpoint_url.lower() or "github.io" in endpoint_url.lower():
+            import warnings
+            warnings.warn(
+                f"UDMorph endpoint URL appears to be a GitHub URL: {endpoint_url}. "
+                "This is likely incorrect. UDMorph should use the Lindat service endpoint.",
+                UserWarning
+            )
         self.endpoint_url = endpoint_url
         if not model:
             raise ValueError("UDMorph REST backend requires a model name. Provide --udmorph-model.")
@@ -380,15 +394,46 @@ class UDMorphRESTBackend(BackendManager):
                 data=payload,
                 headers=self.headers,
                 timeout=self.timeout,
+                allow_redirects=True,  # Explicitly allow redirects (default, but make it clear)
             )
             response.raise_for_status()
             return response
         except requests.HTTPError as exc:
             err_msg = self._extract_error_from_response(exc.response) if exc.response is not None else ""
             details = f": {err_msg}" if err_msg else ""
-            raise RuntimeError(f"UDMorph REST returned HTTP {exc.response.status_code}{details}") from exc
+            status_code = exc.response.status_code if exc.response else "unknown"
+            # Show the actual URL that was hit (might differ from endpoint_url if redirected)
+            actual_url = exc.response.url if exc.response else self.endpoint_url
+            url_info = ""
+            if actual_url != self.endpoint_url:
+                url_info = f" (redirected to: {actual_url})"
+            elif "github" in actual_url.lower() or "github.io" in actual_url.lower():
+                url_info = f" (WARNING: endpoint appears to be a GitHub URL: {actual_url})"
+            
+            # Provide more context for common error codes
+            if status_code == 422:
+                model_info = f" (model: {self.model})" if self.model else ""
+                raise RuntimeError(
+                    f"UDMorph REST returned HTTP 422 Unprocessable Entity{model_info}{url_info}. "
+                    f"This usually means the request format is invalid or the model name is incorrect.{details}"
+                ) from exc
+            raise RuntimeError(f"UDMorph REST returned HTTP {status_code}{url_info}{details}") from exc
         except requests.RequestException as exc:
-            raise RuntimeError(f"UDMorph REST request failed: {exc}") from exc
+            # Extract a user-friendly error message without exposing full URLs
+            error_msg = str(exc)
+            # Remove URL details from common error messages
+            if "No connection adapters were found" in error_msg:
+                # This usually means the URL is malformed (missing scheme/base URL)
+                error_msg = "Invalid endpoint URL (missing base URL or scheme)"
+            elif "Connection" in error_msg or "timeout" in error_msg.lower():
+                # Network-related errors - keep the error type but remove URL
+                error_msg = error_msg.split(":")[0] if ":" in error_msg else error_msg
+            elif "HTTPSConnectionPool" in error_msg or "HTTPConnectionPool" in error_msg:
+                # Connection pool errors - extract just the error type
+                parts = error_msg.split(":")
+                if len(parts) > 1:
+                    error_msg = parts[-1].strip()
+            raise RuntimeError(f"UDMorph REST request failed: {error_msg}") from exc
 
     def _extract_conllu_from_response(self, response: requests.Response) -> str:
         """Extract CoNLL-U text from a UDMorph REST response."""
@@ -414,6 +459,8 @@ class UDMorphRESTBackend(BackendManager):
             return ""
         content_type = (response.headers.get("Content-Type") or "").lower()
         text = response.text
+        
+        # Handle JSON responses
         if "application/json" in content_type or text.strip().startswith("{"):
             try:
                 data = response.json()
@@ -423,6 +470,26 @@ class UDMorphRESTBackend(BackendManager):
                 if key in data and isinstance(data[key], str):
                     return data[key].strip()
             return text.strip()
+        
+        # Handle HTML error pages (e.g., GitHub Pages 404)
+        if "text/html" in content_type or text.strip().startswith("<"):
+            # Try to extract a meaningful error message from HTML
+            import re
+            # Look for common error page patterns
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', text, re.IGNORECASE | re.DOTALL)
+            if title_match:
+                title = re.sub(r'\s+', ' ', title_match.group(1)).strip()
+                if title and title not in ("Error", "404", "Not Found"):
+                    return f"HTML error page: {title}"
+            # Look for error messages in common HTML error pages
+            error_match = re.search(r'<h1[^>]*>(.*?)</h1>', text, re.IGNORECASE | re.DOTALL)
+            if error_match:
+                error_text = re.sub(r'<[^>]+>', '', error_match.group(1)).strip()
+                if error_text:
+                    return f"HTML error: {error_text[:200]}"
+            # If we can't extract a meaningful message, indicate it's an HTML error page
+            return "Server returned HTML error page (endpoint may be incorrect or service unavailable)"
+        
         return text.strip()
 
     def train(  # pragma: no cover - UDMorph REST backend cannot train
@@ -440,6 +507,7 @@ def _create_udmorph_backend(
     *,
     endpoint_url: str,
     model: Optional[str] = None,
+    language: Optional[str] = None,
     timeout: float = 30.0,
     batch_size: int = 50,
     extra_params: Optional[Dict[str, str]] = None,
@@ -449,13 +517,24 @@ def _create_udmorph_backend(
     **kwargs: Any,
 ) -> UDMorphRESTBackend:
     """Instantiate the UDMorph REST backend."""
-    from ..backend_utils import validate_backend_kwargs
+    from ..backend_utils import validate_backend_kwargs, resolve_model_from_language
     
     validate_backend_kwargs(kwargs, "UDMorph", allowed_extra=["download_model", "training"])
     
+    # If no model provided but language is, try to look up a model for that language
+    resolved_model = model
+    if not resolved_model and language:
+        try:
+            resolved_model = resolve_model_from_language(language, "udmorph", preferred_only=True, use_cache=True)
+            if log_requests:
+                print(f"[udmorph] Resolved model '{resolved_model}' for language '{language}'")
+        except ValueError as exc:
+            # No model found for language - raise a clearer error
+            raise ValueError(f"UDMorph REST backend: No model found for language '{language}'. Provide --model to specify a model name.") from exc
+    
     return UDMorphRESTBackend(
         endpoint_url=endpoint_url,
-        model=model,
+        model=resolved_model,
         timeout=timeout,
         batch_size=batch_size,
         extra_params=extra_params,

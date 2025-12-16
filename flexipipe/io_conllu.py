@@ -19,7 +19,8 @@ def _load_conllu(*, args, stdin_content: Optional[str] = None) -> Document:
     if not input_path:
         raise SystemExit("ConLL-U input requires --input or data on STDIN.")
     path = Path(input_path)
-    text = path.read_text(encoding="utf-8", errors="replace")
+    from .file_utils import read_text_file
+    text = read_text_file(path)
     doc = conllu_to_document(text, doc_id=path.stem)
     doc.meta.setdefault("source_path", str(path))
     assign_doc_id_from_path(doc, str(path))

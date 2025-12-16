@@ -316,6 +316,9 @@ class NameTagRESTBackend(BackendManager):
         use_raw_text: bool = False,
     ) -> NeuralResult:
         start = time.time()
+        # Accept NeuralResult inputs for convenience (unwrap to the underlying Document)
+        if isinstance(document, NeuralResult):
+            document = document.document
 
         batches = self._split_document(document)
         aggregated_doc = Document(
@@ -858,7 +861,7 @@ class NameTagRESTBackend(BackendManager):
 
 def _create_nametag_backend(
     *,
-    endpoint_url: str,
+    endpoint_url: Optional[str] = None,
     model: Optional[str] = None,
     language: Optional[str] = None,
     version: str = "3",
@@ -874,6 +877,10 @@ def _create_nametag_backend(
     from ..backend_utils import validate_backend_kwargs
     
     validate_backend_kwargs(kwargs, "NameTag", allowed_extra=["download_model", "training"])
+    
+    # Default to Lindat NameTag endpoint if not provided
+    if not endpoint_url:
+        endpoint_url = "https://lindat.mff.cuni.cz/services/nametag/api/recognize"
     
     return NameTagRESTBackend(
         endpoint_url=endpoint_url,

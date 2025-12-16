@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -21,6 +22,8 @@ from ..model_storage import (
     get_backend_models_dir,
     read_model_cache_entry,
     write_model_cache_entry,
+    read_backend_registry_file,
+    write_backend_registry_file,
 )
 from ..neural_backend import BackendManager, NeuralResult
 
@@ -179,6 +182,19 @@ class UDPipeCLIBackend(BackendManager):
         self._verbose = verbose
         self._backend_name = "UDPipe CLI"
         self._model_name = self._model.stem
+        
+        # Look up model's unicode_normalization from registry
+        self._model_unicode_normalization = None
+        try:
+            model_entries = get_udpipe1_model_entries(use_cache=True, verbose=False)
+            model_entry = model_entries.get(self._model_name)
+            if model_entry:
+                self._model_unicode_normalization = model_entry.get("unicode_normalization")
+                if self._verbose and self._model_unicode_normalization:
+                    print(f"[flexipipe] Model '{self._model_name}' expects {self._model_unicode_normalization} normalization")
+        except Exception:
+            # If registry lookup fails, continue without model-specific normalization
+            pass
     
     def tag(
         self,
@@ -201,6 +217,17 @@ class UDPipeCLIBackend(BackendManager):
         Returns:
             Tagged document
         """
+        # Normalize input to match model's expected normalization
+        if self._model_unicode_normalization and self._model_unicode_normalization != "none":
+            from ..unicode_utils import normalize_unicode
+            if self._verbose:
+                print(f"[flexipipe] Normalizing input to {self._model_unicode_normalization} (model '{self._model_name}' expects this format)", file=sys.stderr)
+            # Create a copy to avoid modifying the original
+            import copy
+            normalized_doc = copy.deepcopy(document)
+            normalized_doc.normalize_unicode(self._model_unicode_normalization)
+            document = normalized_doc
+        
         if use_raw_text:
             # Convert to plain text
             input_text = _document_to_plain_text(document)
@@ -313,6 +340,7 @@ class UDPipeCLIBackend(BackendManager):
         tokenizer_options: Optional[str] = None,
         tagger_options: Optional[str] = None,
         parser_options: Optional[str] = None,
+        unicode_normalization: Optional[str] = None,
         **kwargs,
     ) -> Path:
         """
@@ -339,8 +367,26 @@ class UDPipeCLIBackend(BackendManager):
         model_path = output_dir / f"{model_name}.udpipe"
         
         # Convert train_data to Path if it's a Document or List[Document]
+        # Also normalize if unicode_normalization is specified
         train_path: Path
+        train_data_normalized = False  # Track if we created a temp file for normalization
         if isinstance(train_data, (Document, list)):
+            # Normalize documents if requested
+            if unicode_normalization and unicode_normalization != "none":
+                from ..unicode_utils import normalize_unicode
+                import copy
+                if isinstance(train_data, Document):
+                    normalized_doc = copy.deepcopy(train_data)
+                    normalized_doc.normalize_unicode(unicode_normalization)
+                    train_data = normalized_doc
+                else:
+                    normalized_docs = [copy.deepcopy(doc) for doc in train_data]
+                    for doc in normalized_docs:
+                        doc.normalize_unicode(unicode_normalization)
+                    train_data = normalized_docs
+                if verbose:
+                    print(f"[flexipipe] Normalized training data to {unicode_normalization}")
+            
             # Write to temporary file
             with tempfile.NamedTemporaryFile(mode="w", suffix=".conllu", delete=False, encoding="utf-8") as f:
                 if isinstance(train_data, Document):
@@ -351,8 +397,10 @@ class UDPipeCLIBackend(BackendManager):
                     conllu_text = "\n\n".join(conllu_parts)
                 f.write(conllu_text)
                 train_path = Path(f.name)
+                train_data_normalized = True
         else:
             train_path = Path(train_data).expanduser().resolve()
+            original_train_path = train_path  # Keep original for normalization message
             if train_path.is_dir():
                 from ..train import _find_ud_splits  # Local import to avoid circular at top-level
                 splits = _find_ud_splits(train_path)
@@ -361,11 +409,52 @@ class UDPipeCLIBackend(BackendManager):
                 train_path = splits["train"]
                 if dev_data is None and "dev" in splits:
                     dev_path = splits["dev"]
+            
+            # If normalization is requested and data is from a file, load, normalize, and write to temp file
+            if unicode_normalization and unicode_normalization != "none" and train_path.is_file():
+                from ..conllu import conllu_to_document
+                from ..file_utils import read_text_file
+                from ..unicode_utils import normalize_unicode
+                import copy
+                
+                # Load the CoNLL-U file
+                conllu_text = read_text_file(train_path)
+                doc = conllu_to_document(conllu_text)
+                
+                # Normalize
+                normalized_doc = copy.deepcopy(doc)
+                normalized_doc.normalize_unicode(unicode_normalization)
+                
+                # Write to temp file
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".conllu", delete=False, encoding="utf-8") as f:
+                    conllu_text = document_to_conllu(normalized_doc, create_implicit_mwt=False)
+                    f.write(conllu_text)
+                    train_path = Path(f.name)
+                    train_data_normalized = True
+                
+                if verbose:
+                    print(f"[flexipipe] Normalized training data from {original_train_path} to {unicode_normalization}")
         
         # Convert dev_data to Path if needed
+        # Also normalize if unicode_normalization is specified
         dev_path: Optional[Path] = None
+        dev_data_normalized = False  # Track if we created a temp file for normalization
         if dev_data:
             if isinstance(dev_data, (Document, list)):
+                # Normalize documents if requested
+                if unicode_normalization and unicode_normalization != "none":
+                    from ..unicode_utils import normalize_unicode
+                    import copy
+                    if isinstance(dev_data, Document):
+                        normalized_doc = copy.deepcopy(dev_data)
+                        normalized_doc.normalize_unicode(unicode_normalization)
+                        dev_data = normalized_doc
+                    else:
+                        normalized_docs = [copy.deepcopy(doc) for doc in dev_data]
+                        for doc in normalized_docs:
+                            doc.normalize_unicode(unicode_normalization)
+                        dev_data = normalized_docs
+                
                 with tempfile.NamedTemporaryFile(mode="w", suffix=".conllu", delete=False, encoding="utf-8") as f:
                     if isinstance(dev_data, Document):
                         conllu_text = document_to_conllu(dev_data, create_implicit_mwt=False)
@@ -374,8 +463,34 @@ class UDPipeCLIBackend(BackendManager):
                         conllu_text = "\n\n".join(conllu_parts)
                     f.write(conllu_text)
                     dev_path = Path(f.name)
+                    dev_data_normalized = True
             else:
                 dev_path = Path(dev_data).expanduser().resolve()
+                
+                # If normalization is requested and data is from a file, load, normalize, and write to temp file
+                if unicode_normalization and unicode_normalization != "none" and dev_path.is_file():
+                    from ..conllu import conllu_to_document
+                    from ..file_utils import read_text_file
+                    from ..unicode_utils import normalize_unicode
+                    import copy
+                    
+                    # Load the CoNLL-U file
+                    conllu_text = read_text_file(dev_path)
+                    doc = conllu_to_document(conllu_text)
+                    
+                    # Normalize
+                    normalized_doc = copy.deepcopy(doc)
+                    normalized_doc.normalize_unicode(unicode_normalization)
+                    
+                    # Write to temp file
+                    with tempfile.NamedTemporaryFile(mode="w", suffix=".conllu", delete=False, encoding="utf-8") as f:
+                        conllu_text = document_to_conllu(normalized_doc, create_implicit_mwt=False)
+                        f.write(conllu_text)
+                        dev_path = Path(f.name)
+                        dev_data_normalized = True
+                    
+                    if verbose:
+                        print(f"[flexipipe] Normalized dev data from {Path(dev_data)} to {unicode_normalization}")
         
         try:
             # Build UDPipe train command
@@ -485,12 +600,41 @@ class UDPipeCLIBackend(BackendManager):
             if not model_path.exists():
                 raise RuntimeError(f"UDPipe training failed: model file not created at {model_path}")
             
+            # Register model in local registry
+            try:
+                # Determine features based on what was trained
+                features_parts = []
+                if not any(opt.lower() == "none" for opt in tokenizer_opts):
+                    features_parts.append("tokenizer")
+                if not tagger_disabled_by_user and has_tagger_annotations:
+                    features_parts.append("tagger")
+                if not parser_disabled_by_user and has_parser_annotations:
+                    features_parts.append("parser")
+                features = ", ".join(features_parts) if features_parts else "tokenizer"
+                
+                # Ensure model_path is absolute
+                model_path_abs = model_path.resolve()
+                
+                register_udpipe1_model(
+                    model_name=model_name,
+                    model_path=model_path_abs,
+                    language_code=language,
+                    language_name=None,  # Could be enriched from language mapping if needed
+                    unicode_normalization=unicode_normalization,  # Use the normalization applied during training
+                    features=features,
+                    verbose=verbose,
+                )
+            except Exception as e:
+                # Don't fail training if registration fails
+                if verbose:
+                    print(f"[flexipipe] Warning: Failed to register model in registry: {e}")
+            
             return model_path
         finally:
             # Clean up temporary files if we created them
-            if isinstance(train_data, (Document, list)) and train_path.exists():
+            if train_data_normalized and train_path.exists():
                 train_path.unlink(missing_ok=True)
-            if dev_path and isinstance(dev_data, (Document, list)) and dev_path.exists():
+            if dev_data_normalized and dev_path and dev_path.exists():
                 dev_path.unlink(missing_ok=True)
     
     @property
@@ -500,6 +644,60 @@ class UDPipeCLIBackend(BackendManager):
 
 
 MODEL_CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 hours
+
+
+def register_udpipe1_model(
+    model_name: str,
+    model_path: Path,
+    *,
+    language_code: Optional[str] = None,
+    language_name: Optional[str] = None,
+    unicode_normalization: Optional[str] = None,
+    features: Optional[str] = None,
+    verbose: bool = False,
+) -> None:
+    """
+    Register or update a UDPipe1 model in the local registry.
+    
+    Args:
+        model_name: Model name (without .udpipe extension)
+        model_path: Path to the .udpipe model file
+        language_code: ISO language code (e.g., "yo", "en")
+        language_name: Human-readable language name (e.g., "Yoruba")
+        unicode_normalization: Unicode normalization form ("NFC", "NFD", or None)
+        features: Model features description (e.g., "tokenizer, tagger, parser")
+        verbose: Whether to print messages
+    """
+    from datetime import datetime
+    
+    # Load existing registry
+    registry = read_backend_registry_file("udpipe1") or {}
+    
+    # Ensure it's a dict keyed by model name
+    if not isinstance(registry, dict):
+        registry = {}
+    
+    # Build model entry
+    entry = build_model_entry(
+        "udpipe1",
+        model_name,
+        language_code=language_code,
+        language_name=language_name,
+        name=model_name,
+        local_path=str(model_path),
+        installed=True,
+        unicode_normalization=unicode_normalization,
+        features=features or "tokenizer, tagger, parser",
+    )
+    
+    # Update or add entry
+    registry[model_name] = entry
+    
+    # Write updated registry
+    write_backend_registry_file("udpipe1", registry)
+    
+    if verbose:
+        print(f"[flexipipe] Registered udpipe1 model '{model_name}' in local registry")
 
 
 def _parse_udpipe1_model_filename(filename: str) -> tuple[Optional[str], Optional[str]]:
@@ -540,10 +738,10 @@ def get_udpipe1_model_entries(
     verbose: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Get UDPipe CLI model entries from local directory.
+    Get UDPipe CLI model entries from local registry and filesystem.
     
-    Models are stored in models_dir/udpipe1/ with format 'iso-project.udpipe'.
-    Metadata is enriched from UDMorph cache since models come from the same source.
+    The registry is the source of truth for model metadata (language, unicode_normalization, etc.).
+    Filesystem scanning is used to discover new models not yet in the registry.
     """
     cache_key = "udpipe1:local"
     if use_cache and not refresh_cache:
@@ -563,42 +761,96 @@ def get_udpipe1_model_entries(
             return cached
     
     if verbose:
-        print("[flexipipe] Scanning for UDPipe CLI models...")
+        print("[flexipipe] Loading UDPipe CLI models from registry and filesystem...")
     
     # Get models directory
     models_dir = get_backend_models_dir("udpipe1", create=False)
     
-    # Load UDMorph metadata to enrich model entries
-    udmorph_metadata: Dict[str, Dict[str, Any]] = {}
+    # Load local registry (source of truth for metadata)
+    local_registry: Dict[str, Dict[str, Any]] = {}
     try:
-        from ..backends.udmorph import get_udmorph_model_entries
-        udmorph_metadata = get_udmorph_model_entries(use_cache=True, refresh_cache=False, verbose=False)
+        registry_data = read_backend_registry_file("udpipe1")
+        if registry_data:
+            # Handle both dict format (keyed by model name) and list format
+            if isinstance(registry_data, dict):
+                for model_name, entry in registry_data.items():
+                    if isinstance(entry, dict):
+                        # Ensure model name is set
+                        if "model" not in entry:
+                            entry["model"] = model_name
+                        local_registry[model_name] = entry
+            elif isinstance(registry_data, list):
+                for entry in registry_data:
+                    if isinstance(entry, dict) and "model" in entry:
+                        local_registry[entry["model"]] = entry
     except Exception:
-        # If UDMorph metadata is not available, continue without it
+        # If local registry is not available, continue without it
         pass
     
-    prepared_models: Dict[str, Dict[str, Any]] = {}
+    # Load remote registry entries for additional metadata
+    remote_registry_entries: Dict[str, Dict[str, Any]] = {}
+    try:
+        from ..model_registry import get_remote_models_for_backend
+        remote_models = get_remote_models_for_backend(
+            "udpipe1",
+            use_cache=True,
+            refresh_cache=False,
+            verbose=False,
+        )
+        # Index by model name for quick lookup
+        for model_entry in remote_models:
+            model_name = model_entry.get("model")
+            if model_name:
+                remote_registry_entries[model_name] = model_entry
+    except Exception:
+        # If remote registry is not available, continue without it
+        pass
     
-    # Scan for .udpipe files
+    # Start with registry entries (source of truth)
+    prepared_models: Dict[str, Dict[str, Any]] = {}
+    for model_name, entry in local_registry.items():
+        # Verify model file exists
+        model_path = Path(entry.get("local_path", ""))
+        if not model_path.exists():
+            # Try default location
+            model_path = models_dir / f"{model_name}.udpipe"
+        
+        if model_path.exists():
+            entry_copy = dict(entry)
+            entry_copy["installed"] = True
+            entry_copy["local_path"] = str(model_path)
+            prepared_models[model_name] = entry_copy
+        else:
+            # Model in registry but file missing - mark as not installed
+            entry_copy = dict(entry)
+            entry_copy["installed"] = False
+            prepared_models[model_name] = entry_copy
+    
+    # Scan filesystem for models not in registry
     if models_dir.exists():
         for model_file in models_dir.glob("*.udpipe"):
             model_name = model_file.stem  # filename without .udpipe
+            
+            # Skip if already in registry
+            if model_name in prepared_models:
+                continue
+            
+            # New model not in registry - create basic entry
+            # Try to infer language from filename (fallback only)
             iso_code, project = _parse_udpipe1_model_filename(model_file.name)
             
-            # Try to find matching UDMorph model for metadata
-            # UDMorph models use the format 'iso-project' as the key
-            model_key = f"{iso_code}-{project}" if iso_code and project else model_name
-            udmorph_entry = udmorph_metadata.get(model_key)
-            
-            # Extract language info from UDMorph metadata if available
+            # Try to get metadata from remote registry
+            remote_entry = remote_registry_entries.get(model_name)
             language_code = iso_code
             language_name = None
             features = "tokenizer, tagger, parser"
+            unicode_normalization = None
             
-            if udmorph_entry:
-                language_code = udmorph_entry.get(LANGUAGE_FIELD_ISO) or iso_code
-                language_name = udmorph_entry.get(LANGUAGE_FIELD_NAME)
-                features = udmorph_entry.get("features", features)
+            if remote_entry:
+                language_code = remote_entry.get(LANGUAGE_FIELD_ISO) or language_code
+                language_name = remote_entry.get(LANGUAGE_FIELD_NAME)
+                features = remote_entry.get("features", features)
+                unicode_normalization = remote_entry.get("unicode_normalization")
             
             entry = build_model_entry(
                 "udpipe1",
@@ -609,6 +861,7 @@ def get_udpipe1_model_entries(
                 name=model_name,
                 local_path=str(model_file),
                 installed=True,
+                unicode_normalization=unicode_normalization,
             )
             prepared_models[model_name] = entry
     
@@ -679,6 +932,7 @@ def _create_udpipe1_backend(
     model: str | None = None,
     model_path: str | None = None,
     model_name: str | None = None,
+    language: str | None = None,
     udpipe_binary: str = "udpipe",
     timeout: float | None = None,
     verbose: bool = False,
@@ -689,14 +943,29 @@ def _create_udpipe1_backend(
 
     # Accept and drop download-specific flags that higher layers might set
     kwargs.pop("download_model", None)
+    kwargs.pop("training", None)  # Accept but ignore (used for parity)
 
     if kwargs:
         unexpected = ", ".join(sorted(kwargs.keys()))
         raise ValueError(f"Unexpected UDPipe CLI backend arguments: {unexpected}")
 
     resolved_model = model or model_path or model_name
+    
+    # If no model provided but language is, try to look up a model for that language
+    if not resolved_model and language:
+        from ..backend_utils import resolve_model_from_language
+        try:
+            resolved_model = resolve_model_from_language(language, "udpipe1", preferred_only=True, use_cache=True)
+            if verbose:
+                print(f"[udpipe1] Resolved model '{resolved_model}' for language '{language}'")
+        except ValueError:
+            # No model found for language - will raise error below
+            pass
+    
     if not resolved_model:
-        raise ValueError("UDPipe CLI backend requires model path. Provide --model.")
+        if language:
+            raise ValueError(f"UDPipe CLI backend: No model found for language '{language}'. Provide --model to specify a model path.")
+        raise ValueError("UDPipe CLI backend requires model path. Provide --model or --language.")
 
     return UDPipeCLIBackend(
         model=resolved_model,

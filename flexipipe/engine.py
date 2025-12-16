@@ -165,13 +165,52 @@ def _sanitize_document(doc: Document) -> Document:
 
 
 def assign_doc_id_from_path(doc: Document, path: Optional[str]) -> None:
-    """Set doc.id to the basename (without extension) of the given path when appropriate."""
+    """Set doc.id to the basename (without extension) of the given path when appropriate.
+    
+    Skips setting doc.id if the path is a temporary file (e.g., /tmp/, /var/tmp/, /var/folders/).
+    """
     if not path:
         return
     path_str = str(path).strip()
     if not path_str or path_str in {"-", "<inline-data>"}:
         return
+    
     path_obj = Path(path_str)
+    
+    # Check if this is a temporary file path
+    import tempfile
+    try:
+        temp_dir = Path(tempfile.gettempdir()).resolve()
+        path_resolved = path_obj.resolve()
+        # Check if the path is within the system temp directory
+        try:
+            is_temp_file = path_resolved.is_relative_to(temp_dir)
+        except AttributeError:
+            # Python < 3.9 compatibility
+            is_temp_file = str(path_resolved).startswith(str(temp_dir))
+    except (OSError, ValueError):
+        # If we can't resolve paths, fall back to pattern matching
+        path_lower = path_str.lower()
+        temp_indicators = [
+            "/tmp/",
+            "/var/tmp/",
+            "/var/folders/",  # macOS temp directories
+            "\\temp\\",  # Windows temp
+            "\\tmp\\",  # Windows alternative
+        ]
+        filename_lower = path_obj.name.lower()
+        temp_prefixes = ["tmp", "temp"]
+        is_temp_file = (
+            any(indicator in path_lower for indicator in temp_indicators) or
+            any(filename_lower.startswith(prefix) for prefix in temp_prefixes)
+        )
+    
+    if is_temp_file:
+        # Don't set doc.id from temporary file paths
+        # Still set source_path in meta for reference, but don't use it as doc ID
+        doc.meta.setdefault("source_path", str(path_obj))
+        return
+    
     doc.meta.setdefault("source_path", str(path_obj))
 
     candidates = {path_str, str(path_obj)}

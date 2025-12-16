@@ -555,6 +555,22 @@ class UDPipeRESTBackend(BackendManager):
         
         return NeuralResult(document=tagged_doc, stats={})
 
+    def tag_text(self, text: str, *, doc_id: str = "") -> Document:
+        """
+        Convenience method to tag raw text directly.
+        
+        Args:
+            text: Raw text to tag
+            doc_id: Optional document ID
+            
+        Returns:
+            Tagged Document
+        """
+        from ..doc import Document
+        input_doc = Document.from_plain_text(text, doc_id=doc_id, tokenize=False, segment=False)
+        result = self.tag(input_doc, use_raw_text=True)
+        return result.document
+
     def train(self, *args, **kwargs):  # pragma: no cover - not implemented
         raise NotImplementedError("UDPipe REST backend does not support training.")
 

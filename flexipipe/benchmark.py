@@ -138,6 +138,7 @@ class BenchmarkRunner:
         dry_run: bool = False,
         treebank_catalog: Optional[list[dict]] = None,
         download_models: bool = False,
+        unicode_normalize: str = "none",
     ):
         self.storage = storage
         self.treebank_root = treebank_root.expanduser() if treebank_root else None
@@ -147,6 +148,7 @@ class BenchmarkRunner:
         self.verbose = verbose
         self.dry_run = dry_run
         self.download_models = download_models
+        self.unicode_normalize = unicode_normalize
         self.treebank_catalog = treebank_catalog or self._build_treebank_catalog()
 
     # ------------------------------------------------------------------ discovery
@@ -513,6 +515,7 @@ class BenchmarkRunner:
                     verbose=self.verbose,
                     mode=job.mode,
                     create_implicit_mwt=False,
+                    unicode_normalize=self.unicode_normalize,
                 )
             except Exception as exc:
                 print(
@@ -1314,17 +1317,22 @@ def handle_run(args: argparse.Namespace, runner: BenchmarkRunner) -> None:
     treebanks_catalog = runner.treebank_catalog or runner._build_treebank_catalog()
     
     # Determine which backends we'll be using
+    # Support both --backends (plural) and --backend (singular)
+    backend_list = args.backends
+    if not backend_list and hasattr(args, 'backend') and args.backend:
+        backend_list = [args.backend]
+    
     # Handle "all" for backends first, so we can filter languages based on selected backends
-    if args.backends and "all" in [b.lower() for b in args.backends]:
+    if backend_list and "all" in [b.lower() for b in backend_list]:
         all_backends = list_backends(include_hidden=False)
         # For "all" backends, we'll filter later based on models
         backends = sorted(all_backends.keys())
         if runner.verbose:
             print(f"[benchmark] Using all {len(backends)} available backend(s)")
     else:
-        backends = [b.lower() for b in (args.backends or [])]
+        backends = [b.lower() for b in (backend_list or [])]
         if not backends:
-            raise SystemExit("No backends specified. Provide --backends backend1 backend2 ... or --backends all")
+            raise SystemExit("No backends specified. Provide --backends backend1 backend2 ... (or --backend backend1) or --backends all")
         # Validate that explicitly specified backends exist (including hidden ones)
         all_backends = list_backends(include_hidden=True)
         invalid_backends = [b for b in backends if b not in all_backends]
@@ -1389,9 +1397,15 @@ def handle_run(args: argparse.Namespace, runner: BenchmarkRunner) -> None:
         if runner.verbose:
             print(f"[benchmark] Filtered to {len(languages)} language(s) with both models and tests")
     else:
-        languages = args.languages or runner.discover_languages()
+        # Support both --languages (plural) and --language (singular)
+        if args.languages:
+            languages = args.languages
+        elif hasattr(args, 'language') and args.language:
+            languages = [args.language]
+        else:
+            languages = runner.discover_languages()
         if not languages:
-            raise SystemExit("No languages specified and none discovered. Provide --languages or --treebank-root.")
+            raise SystemExit("No languages specified and none discovered. Provide --languages (or --language) or --treebank-root.")
     model_map = parse_model_map(args.models)
     tasks = parse_tasks_arg(args.tasks)
     explicit_treebanks: Optional[list[Path]] = None
@@ -1405,6 +1419,17 @@ def handle_run(args: argparse.Namespace, runner: BenchmarkRunner) -> None:
             explicit_treebanks.append(tb_path)
         if not explicit_treebanks:
             print("[benchmark] No valid treebank paths supplied via --treebank.")
+        # When explicit treebanks are provided, only use the explicitly provided language(s)
+        # Don't discover or use all languages - just use what was specified
+        if languages and (args.languages or (hasattr(args, 'language') and args.language)):
+            # Filter to only the explicitly provided languages
+            provided_langs = args.languages if args.languages else ([args.language] if hasattr(args, 'language') and args.language else [])
+            languages = [lang for lang in languages if lang.lower() in [l.lower() for l in provided_langs]]
+            if not languages:
+                # If filtering removed everything, use the provided languages as-is
+                languages = [lang.lower() for lang in provided_langs]
+            if runner.verbose:
+                print(f"[benchmark] Using explicitly provided language(s): {', '.join(languages)}")
     jobs: list[BenchmarkJob] = []
     for language in languages:
         if explicit_treebanks is not None:
@@ -1575,6 +1600,11 @@ def run_cli(args: argparse.Namespace) -> None:
             data = json.load(handle)
             if isinstance(data, list):
                 models_catalog = data
+    # Get Unicode normalization form (from args or config, default NFC)
+    from .model_storage import get_unicode_normalization
+    unicode_normalize = getattr(args, "unicode_normalize", None)
+    if unicode_normalize is None:
+        unicode_normalize = get_unicode_normalization()
     runner = BenchmarkRunner(
         storage,
         treebank_root=treebank_root,
@@ -1583,6 +1613,7 @@ def run_cli(args: argparse.Namespace) -> None:
         dry_run=args.dry_run,
         treebank_catalog=treebank_catalog,
         download_models=getattr(args, "download_models", False),
+        unicode_normalize=unicode_normalize,
     )
     if getattr(args, "export_treebanks", None) is not None:
         export_treebanks = getattr(args, "export_treebanks", None)

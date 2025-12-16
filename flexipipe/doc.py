@@ -955,6 +955,27 @@ class Document(AttrsMixin):
             }
         return result
 
+    def normalize_unicode(self, form: str = "none") -> None:
+        """
+        Normalize Unicode in all token forms and lemmas in-place.
+        
+        Args:
+            form: Unicode normalization form ("none", "NFC", "NFD")
+        """
+        if form == "none":
+            return
+        from .unicode_utils import normalize_unicode
+        for sentence in self.sentences:
+            for token in sentence.tokens:
+                token.form = normalize_unicode(token.form, form) or ""
+                token.lemma = normalize_unicode(token.lemma, form) or ""
+                if token.subtokens:
+                    for subtoken in token.subtokens:
+                        subtoken.form = normalize_unicode(subtoken.form, form) or ""
+                        subtoken.lemma = normalize_unicode(subtoken.lemma, form) or ""
+            # Rebuild sentence text after normalization
+            sentence.text = _rebuild_sentence_text(sentence.tokens)
+
     def tokens(self) -> Iterable[Token]:
         for sentence in self.sentences:
             yield from sentence.tokens

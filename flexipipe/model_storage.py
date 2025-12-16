@@ -347,6 +347,25 @@ def set_language_detector(detector: str) -> None:
     write_config({"language_detector": detector})
 
 
+def get_unicode_normalization() -> str:
+    """
+    Get the configured default Unicode normalization form.
+    Returns "NFC", "NFD", or "none". Defaults to "NFC".
+    """
+    config = read_config()
+    return config.get("unicode_normalization", "NFC")
+
+
+def set_unicode_normalization(form: str) -> None:
+    """
+    Set the default Unicode normalization form in configuration.
+    form must be one of: "NFC", "NFD", "none"
+    """
+    if form not in {"NFC", "NFD", "none"}:
+        raise ValueError(f"Unicode normalization form must be one of: NFC, NFD, none (got: {form})")
+    write_config({"unicode_normalization": form})
+
+
 def get_auto_install_extras() -> bool:
     """Return whether optional extras should be installed automatically."""
     config = read_config()

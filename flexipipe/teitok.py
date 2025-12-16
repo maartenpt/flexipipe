@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 from .doc import Document, Sentence, SubToken, Token, Entity
 from .doc_utils import collect_span_entities_by_sentence
+from .unicode_utils import normalize_unicode
 
 # Import helper functions from engine
 from .engine import (
@@ -23,6 +24,25 @@ from .engine import (
 )
 
 XML_NS = "{http://www.w3.org/XML/1998/namespace}"
+
+
+def _normalize_annotation_attr(value: str, unicode_normalization: Optional[str] = None) -> str:
+    """
+    Normalize an annotation attribute value (form, lemma, etc.) for XML output.
+    
+    This normalizes annotation attributes but NOT innerText content, which should
+    preserve the original encoding differences (NFC vs NFD).
+    
+    Args:
+        value: The attribute value to normalize
+        unicode_normalization: Normalization form ("NFC", "NFD", or None/"none")
+        
+    Returns:
+        Normalized value, or original if normalization is None/"none"
+    """
+    if not value or not unicode_normalization or unicode_normalization == "none":
+        return value
+    return normalize_unicode(value, unicode_normalization) or value
 
 # Import C++ bindings for fast TEITOK I/O
 try:
@@ -161,7 +181,7 @@ except ImportError:  # pragma: no cover - handled during runtime
         _dump_teitok = None  # Will be set to Python fallback below
 
 # Python fallback for _dump_teitok when C++ extension is not available
-def _dump_teitok_python(payload: Dict[str, Any], custom_attributes: List[str], pretty_print: bool = False) -> str:
+def _dump_teitok_python(payload: Dict[str, Any], custom_attributes: List[str], pretty_print: bool = False, *, unicode_normalization: Optional[str] = None) -> str:
     """
     Python fallback implementation of dump_teitok.
     
@@ -231,31 +251,31 @@ def _dump_teitok_python(payload: Dict[str, Any], custom_attributes: List[str], p
             parent = name_elem if name_elem is not None else s_elem
             tok_elem = ET.SubElement(parent, "tok")
             
-            # Set text content to token form (innerText)
+            # Set text content to token form (innerText) - DO NOT normalize, preserve original encoding
             if tok.form:
                 tok_elem.text = tok.form
             
-            # Add standard attributes
+            # Add standard attributes - normalize annotation attributes but NOT innerText
             if tok.form:
-                tok_elem.set("form", tok.form)
+                tok_elem.set("form", _normalize_annotation_attr(tok.form, unicode_normalization))
             if tok.lemma:
-                tok_elem.set("lemma", tok.lemma)
+                tok_elem.set("lemma", _normalize_annotation_attr(tok.lemma, unicode_normalization))
             if tok.xpos:
-                tok_elem.set("xpos", tok.xpos)
+                tok_elem.set("xpos", tok.xpos)  # xpos/upos are tags, not text
             if tok.upos:
                 tok_elem.set("upos", tok.upos)
             if tok.feats:
-                tok_elem.set("feats", tok.feats)
+                tok_elem.set("feats", tok.feats)  # FEATS are tags, not text
             if tok.reg:
-                tok_elem.set("reg", tok.reg)
+                tok_elem.set("reg", _normalize_annotation_attr(tok.reg, unicode_normalization))
             if tok.expan:
-                tok_elem.set("expan", tok.expan)
+                tok_elem.set("expan", _normalize_annotation_attr(tok.expan, unicode_normalization))
             if tok.mod:
-                tok_elem.set("mod", tok.mod)
+                tok_elem.set("mod", _normalize_annotation_attr(tok.mod, unicode_normalization))
             if tok.trslit:
-                tok_elem.set("trslit", tok.trslit)
+                tok_elem.set("trslit", _normalize_annotation_attr(tok.trslit, unicode_normalization))
             if tok.ltrslit:
-                tok_elem.set("ltrslit", tok.ltrslit)
+                tok_elem.set("ltrslit", _normalize_annotation_attr(tok.ltrslit, unicode_normalization))
             if tok.tokid:
                 tok_elem.set("tokid", tok.tokid)
             if tok.id:
@@ -286,19 +306,19 @@ def _dump_teitok_python(payload: Dict[str, Any], custom_attributes: List[str], p
                 for st in tok.subtokens:
                     dtok_elem = ET.SubElement(tok_elem, "dtok")
                     if st.form:
-                        dtok_elem.set("form", st.form)
+                        dtok_elem.set("form", _normalize_annotation_attr(st.form, unicode_normalization))
                     if st.lemma:
-                        dtok_elem.set("lemma", st.lemma)
+                        dtok_elem.set("lemma", _normalize_annotation_attr(st.lemma, unicode_normalization))
                     if st.xpos:
-                        dtok_elem.set("xpos", st.xpos)
+                        dtok_elem.set("xpos", st.xpos)  # xpos/upos are tags, not text
                     if st.upos:
                         dtok_elem.set("upos", st.upos)
                     if st.feats:
-                        dtok_elem.set("feats", st.feats)
+                        dtok_elem.set("feats", st.feats)  # FEATS are tags, not text
                     if st.reg:
-                        dtok_elem.set("reg", st.reg)
+                        dtok_elem.set("reg", _normalize_annotation_attr(st.reg, unicode_normalization))
                     if st.expan:
-                        dtok_elem.set("expan", st.expan)
+                        dtok_elem.set("expan", _normalize_annotation_attr(st.expan, unicode_normalization))
                     # Add subtoken custom attributes
                     if st.attrs:
                         if custom_attributes:
@@ -366,28 +386,29 @@ def load_teitok(
     temp_path = None
     try:
         # Handle files with debug output at the start (find first XML tag)
+        # Note: We let the XML parser handle the declared encoding.
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
             xml_start = content.find("<")
-            if xml_start >= 0:
-                from io import StringIO
-                tree = ET.parse(StringIO(content[xml_start:]))
-                root = tree.getroot()
-                # Check for duplicates before fixing
-                seen_sent_ids: Dict[str, int] = {}
-                seen_tokids: Dict[str, int] = {}
-                for s_node in root.iter():
-                    if s_node.tag.endswith("}s") or s_node.tag == "s":
-                        sent_id = s_node.get("id") or s_node.get("{http://www.w3.org/XML/1998/namespace}id")
-                        if sent_id:
-                            seen_sent_ids[sent_id] = seen_sent_ids.get(sent_id, 0) + 1
-                for tok_node in root.iter():
-                    if tok_node.tag.endswith("}tok") or tok_node.tag == "tok":
-                        tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
-                        if tokid:
-                            seen_tokids[tokid] = seen_tokids.get(tokid, 0) + 1
-                
-                # Check if there are duplicates
+        if xml_start >= 0:
+            from io import StringIO
+            tree = ET.parse(StringIO(content[xml_start:]))
+            root = tree.getroot()
+            # Check for duplicates before fixing
+            seen_sent_ids: Dict[str, int] = {}
+            seen_tokids: Dict[str, int] = {}
+            for s_node in root.iter():
+                if s_node.tag.endswith("}s") or s_node.tag == "s":
+                    sent_id = s_node.get("id") or s_node.get("{http://www.w3.org/XML/1998/namespace}id")
+                    if sent_id:
+                        seen_sent_ids[sent_id] = seen_sent_ids.get(sent_id, 0) + 1
+            for tok_node in root.iter():
+                if tok_node.tag.endswith("}tok") or tok_node.tag == "tok":
+                    tokid = tok_node.get("id") or tok_node.get("{http://www.w3.org/XML/1998/namespace}id")
+                    if tokid:
+                        seen_tokids[tokid] = seen_tokids.get(tokid, 0) + 1
+            
+            # Check if there are duplicates
                 has_duplicates = any(count > 1 for count in seen_sent_ids.values()) or any(count > 1 for count in seen_tokids.values())
                 
                 if has_duplicates:
@@ -494,19 +515,20 @@ def teitok_has_tokens(path: str) -> bool:
     """
     try:
         # Try to find XML content (skip any leading non-XML lines like debug output)
+        # Note: We let the XML parser handle the declared encoding.
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
             # Find the first XML tag
             xml_start = content.find("<")
-            if xml_start < 0:
-                return False
-            # Try parsing from the XML start
-            from io import StringIO
-            tree = ET.parse(StringIO(content[xml_start:]))
-            root = tree.getroot()
-            # Check for any tok elements (handle namespaces)
-            toks = root.findall(".//{*}tok") or root.findall(".//tok")
-            return len(toks) > 0
+        if xml_start < 0:
+            return False
+        # Try parsing from the XML start
+        from io import StringIO
+        tree = ET.parse(StringIO(content[xml_start:]))
+        root = tree.getroot()
+        # Check for any tok elements (handle namespaces)
+        toks = root.findall(".//{*}tok") or root.findall(".//tok")
+        return len(toks) > 0
     except (ET.ParseError, OSError, ValueError):
         # Fallback: simple text search for <tok
         try:
@@ -727,24 +749,25 @@ def _load_teitok_with_mappings(
     and fallback to form (innerText) for reg/expan.
     """
     # Handle files with debug output at the start (find first XML tag)
+    # Note: We let the XML parser handle the declared encoding.
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
         xml_start = content.find("<")
-        if xml_start < 0:
-            raise ValueError(f"Invalid XML file {path}: No XML content found")
-        # Parse from the XML start
-        from io import StringIO
-        try:
-            tree = ET.parse(StringIO(content[xml_start:]))
-        except ET.ParseError as e:
-            # Provide helpful error message with file path and line number if available
-            error_msg = f"Invalid XML in file {path}"
-            if hasattr(e, 'position') and e.position:
-                line_num = content[:xml_start + e.position[0]].count('\n') + 1
-                col_num = e.position[1] if len(e.position) > 1 else 0
-                error_msg += f" at line {line_num}, column {col_num}"
-            error_msg += f": {str(e)}"
-            raise ValueError(error_msg) from e
+    if xml_start < 0:
+        raise ValueError(f"Invalid XML file {path}: No XML content found")
+    # Parse from the XML start
+    from io import StringIO
+    try:
+        tree = ET.parse(StringIO(content[xml_start:]))
+    except ET.ParseError as e:
+        # Provide helpful error message with file path and line number if available
+        error_msg = f"Invalid XML in file {path}"
+        if hasattr(e, 'position') and e.position:
+            line_num = content[:xml_start + e.position[0]].count('\n') + 1
+            col_num = e.position[1] if len(e.position) > 1 else 0
+            error_msg += f" at line {line_num}, column {col_num}"
+        error_msg += f": {str(e)}"
+        raise ValueError(error_msg) from e
     root = tree.getroot()
     
     # Fix duplicate IDs before processing
@@ -1225,6 +1248,7 @@ def save_teitok(
     spaceafter_handling: str = "preserve",
     skip_spaceafter_for_breaking_elements: bool = True,
     settings: Optional["TeitokSettings"] = None,
+    unicode_normalization: Optional[str] = None,
 ) -> None:
     """
     Save a Document to a TEITOK XML file.
@@ -1251,6 +1275,7 @@ def save_teitok(
         spaceafter_handling=spaceafter_handling,
         skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking_elements,
         settings=settings,
+        unicode_normalization=unicode_normalization,
     )
     Path(path).write_text(xml_str, encoding="utf-8")
 
@@ -1263,6 +1288,7 @@ def dump_teitok(
     spaceafter_handling: str = "preserve",
     skip_spaceafter_for_breaking_elements: bool = True,
     settings: Optional["TeitokSettings"] = None,
+    unicode_normalization: Optional[str] = None,
 ) -> str:
     """
     Convert a Document to a TEITOK XML string.
@@ -1299,20 +1325,26 @@ def dump_teitok(
     payload = _ensure_serializable(sanitized.to_dict())
     if custom_attributes is None:
         custom_attributes = []
-    try:
-        xml_str = _dump_teitok(payload, custom_attributes, pretty_print=False)  # type: ignore
-    except RuntimeError as e:
-        # If the C++ extension is not available, the error message will be informative
-        # The Python fallback should already be set, so this shouldn't happen, but handle gracefully
-        if "flexitag_py extension is not available" in str(e):
-            # This should not happen if fallback is properly set, but just in case
-            raise RuntimeError(
-                "TEITOK output requires the flexitag_py C++ extension, which is not available. "
-                "The Python fallback should have been used automatically. "
-                "Please report this issue. "
-                "To build the C++ extension, see: https://github.com/ufal/flexipipe#building-native-modules"
-            ) from e
-        raise
+    
+    # If Unicode normalization is needed, use Python version (C++ doesn't support it)
+    # Otherwise, try C++ version first for performance
+    if unicode_normalization and unicode_normalization != "none":
+        xml_str = _dump_teitok_python(payload, custom_attributes, pretty_print=False, unicode_normalization=unicode_normalization)
+    else:
+        try:
+            xml_str = _dump_teitok(payload, custom_attributes, pretty_print=False)  # type: ignore
+        except RuntimeError as e:
+            # If the C++ extension is not available, the error message will be informative
+            # The Python fallback should already be set, so this shouldn't happen, but handle gracefully
+            if "flexitag_py extension is not available" in str(e):
+                # This should not happen if fallback is properly set, but just in case
+                raise RuntimeError(
+                    "TEITOK output requires the flexitag_py C++ extension, which is not available. "
+                    "The Python fallback should have been used automatically. "
+                    "Please report this issue. "
+                    "To build the C++ extension, see: https://github.com/ufal/flexipipe#building-native-modules"
+                ) from e
+            raise
     if settings:
         xml_str = _remap_teitok_attributes(xml_str, settings)
     if pretty_print:
@@ -1793,6 +1825,7 @@ def update_teitok(
     settings: Optional["TeitokSettings"] = None,
     from_raw_text: bool = False,
     strict_alignment: bool = True,
+    unicode_normalization: Optional[str] = None,
 ) -> None:
     """
     Update a TEITOK XML file in-place by matching nodes by ID and updating annotation attributes.
@@ -2684,9 +2717,14 @@ def update_teitok(
             
             # Update token attributes
             def _set_attr(node: ET.Element, internal_attr: str, value: str, default_empty: bool = False) -> None:
-                """Set attribute respecting TEITOK mappings."""
+                """Set attribute respecting TEITOK mappings. Normalizes text attributes (form, lemma, etc.) but not tags."""
                 target_attr = _resolve_attr_name(internal_attr)
                 aliases = _attribute_aliases(internal_attr)
+                
+                # Normalize text attributes (form, lemma, reg, expan, mod, trslit, ltrslit) but not tags (xpos, upos, feats)
+                text_attrs = {"form", "lemma", "reg", "expan", "mod", "trslit", "ltrslit"}
+                if value and value != "_" and internal_attr.lower() in text_attrs:
+                    value = _normalize_annotation_attr(value, unicode_normalization)
                 
                 if target_attr is None:
                     for alias in aliases:
@@ -2747,7 +2785,7 @@ def update_teitok(
                 # Only write @form if it's different from inner text or if there are children
                 if token.form:
                     if has_children or token.form != inner_text:
-                        tok_node.set("form", token.form)
+                        tok_node.set("form", _normalize_annotation_attr(token.form, unicode_normalization))
                     elif tok_node.get("form") and token.form == inner_text:
                         # Remove @form if it matches inner text and there are no children
                         tok_node.attrib.pop("form", None)
@@ -2822,7 +2860,7 @@ def update_teitok(
                     
                     # Use _set_attr to respect TEITOK attribute mappings (e.g., xpos -> pos)
                     if split_token.form:
-                        dtok_node.set("form", split_token.form)
+                        dtok_node.set("form", _normalize_annotation_attr(split_token.form, unicode_normalization))
                     _set_attr(dtok_node, "lemma", lemma_val, default_empty=True)
                     _set_attr(dtok_node, "xpos", xpos_val)
                     _set_attr(dtok_node, "upos", upos_val)

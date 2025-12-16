@@ -52,13 +52,17 @@ Flexipipe uses the curated Stanza registry to request only processors that exist
 ### C. Using UDPipe (REST) via Flexipipe
 
 ```python
-from flexipipe.backends import udpipe
+from flexipipe.backend_registry import create_backend
 
-doc = udpipe.tag(
-    "Bonjour tout le monde.",
-    model="french-gsd-ud-2.17-251125",   # curated name from the registry
-    refresh_cache=False,                 # set True to force registry refresh
-)
+# Create backend and tag text directly
+backend = create_backend("udpipe", model="french-gsd-ud-2.17-251125")
+doc = backend.tag_text("Bonjour tout le monde.")
+
+# Or use the full Document API if you need more control
+from flexipipe.doc import Document
+input_doc = Document.from_plain_text("Bonjour tout le monde.", doc_id="", tokenize=False, segment=False)
+result = backend.tag(input_doc, use_raw_text=True)
+doc = result.document
 ```
 
 ### D. Convert Flexipipe `Document` -> spaCy `Doc`

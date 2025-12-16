@@ -952,6 +952,9 @@ def _auto_select_model_for_language(
     is_iso_code = language and len(language.strip()) in {2, 3} and language.strip().isalpha()
     # Disable fuzzy matching: only accept exact/normalized matches (including aliases from language mapping)
     use_fuzzy = False
+    
+    # Track backend unavailable status for error reporting
+    backend_unavailable_status = None
 
     def pick_best(entries_map: dict[str, dict], allow_fuzzy: bool) -> Optional[tuple[str, dict]]:
         # If language is an ISO code, don't allow fuzzy matching
@@ -1118,7 +1121,7 @@ def _auto_select_model_for_language(
                 "cu": ["church", "slavonic", "old_church", "old_east_slavic", "birchbark", "rnc", "ruthenian", "torot"],  # Old Church Slavonic and Old East Slavic
             }
         
-        backend_unavailable_status = None
+        nonlocal backend_unavailable_status
         for backend, model_name, entry in matches:
             # If backend is locked, only check the requested backend (skip availability check for others)
             if backend_locked and requested_backend and backend != requested_backend:
@@ -1336,8 +1339,11 @@ def detect_input_format(path: str) -> str:
         raise ValueError("detect_input_format cannot handle stdin directly - use run_tag with auto format detection")
     
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-            sample = handle.read(4096)
+        from .file_utils import read_text_file
+        from pathlib import Path
+        # Read a sample for format detection (first 4096 chars)
+        full_text = read_text_file(Path(path))
+        sample = full_text[:4096]
     except OSError as exc:
         raise SystemExit(f"Failed to read input file '{path}': {exc}") from exc
 
@@ -1419,6 +1425,9 @@ def _detect_language_from_text(
             print("[flexipipe] Language detection is disabled (detector set to 'none').")
         return None
 
+    if log_failures:
+        print(f"[flexipipe] Attempting language detection with detector: {detector_name}")
+
     try:
         result = detect_language_with(
             detector_name,
@@ -1427,21 +1436,99 @@ def _detect_language_from_text(
             confidence_threshold=0.0,
             verbose=explicit or log_failures,
         )
+    except ValueError as exc:
+        # Unknown detector name
+        if explicit or log_failures:
+            from .language_detector_registry import list_language_detectors
+            available = sorted(list_language_detectors(include_none=False).keys())
+            print(f"[flexipipe] Error: Unknown language detector '{detector_name}'.", file=sys.stderr)
+            print(f"[flexipipe] Available detectors: {', '.join(available)}", file=sys.stderr)
+        return None
     except RuntimeError as exc:
         if explicit or log_failures:
             print(f"[flexipipe] Language detection unavailable ({detector_name}): {exc}")
         return None
+    # Fallback: if primary detector failed, try trigram (lightweight) if available
+    if not result and detector_name.lower() == "fasttext":
+        if log_failures:
+            print(f"[flexipipe] Primary detector ({detector_name}) produced no result, trying trigram fallback...")
+        try:
+            result = detect_language_with(
+                "trigram",
+                snippet,
+                min_length=min_length,
+                confidence_threshold=0.0,
+                verbose=explicit or log_failures,
+            )
+            if result and (explicit or log_failures):
+                print("[flexipipe] Language detection fallback: trigram detector used.")
+        except Exception as exc:
+            if log_failures:
+                print(f"[flexipipe] Trigram fallback failed: {exc}")
+            # Ignore fallback errors
+            pass
     if not result:
         if log_failures:
-            print("[flexipipe] Language detection produced no candidates.")
+            print(f"[flexipipe] Language detection ({detector_name}) produced no candidates.")
         return None
+
+    # Special handling for trigram detector: use CWALI-style reliability (best vs second-best)
+    # instead of a fixed absolute confidence threshold when running explicitly. For implicit
+    # detection, we still accept the best guess but surface ambiguity in verbose logs.
+    if detector_name.lower() == "trigram":
+        sep = result.get("separation_ratio")
+        reliable = result.get("reliable")
+        if isinstance(reliable, bool) and not reliable:
+            if explicit or log_failures:
+                print(
+                    "[flexipipe] Language could not accurately be detected by trigram detector "
+                    "(second-best score is too close to best). Please provide --language."
+                )
+                candidates = result.get("candidates") or []
+                if candidates:
+                    best_conf = float(result.get("confidence") or 0.0)
+                    print("Top language candidates:")
+                    for idx, candidate in enumerate(candidates[:5], start=1):
+                        iso = candidate.get("language_iso") or candidate.get("label") or "-"
+                        name = candidate.get("language_name") or candidate.get("label") or "-"
+                        conf = candidate.get("confidence", 0.0)
+                        # For trigram, show raw score and, for the 2nd candidate,
+                        # also show its proportion of the best score (CWALI-style).
+                        if idx == 2 and best_conf > 0:
+                            ratio = conf / best_conf
+                            print(f"  {idx}. {name} ({iso}): {conf:.2f} ({ratio:.1%})")
+                        else:
+                            print(f"  {idx}. {name} ({iso}): {conf:.2f}")
+                    if isinstance(sep, (int, float)):
+                        print(f"  separation_ratio (2nd/best): {sep:.2%}")
+            # For explicit --detect-language, treat an unreliable result as failure.
+            if explicit:
+                return None
+            elif log_failures:
+                # In implicit mode with debug/verbose, log that we're using the unreliable result
+                detected_iso = result.get("language_iso") or result.get("label") or "unknown"
+                detected_name = result.get("language_name") or detected_iso
+                best_conf = float(result.get("confidence") or 0.0)
+                print(f"[flexipipe] Using best guess from trigram (unreliable, separation {sep:.1%}): {detected_iso} ({detected_name}, score {best_conf:.2f})")
+        elif log_failures and not explicit:
+            # Log successful trigram detection in implicit mode
+            detected_iso = result.get("language_iso") or result.get("label") or "unknown"
+            detected_name = result.get("language_name") or detected_iso
+            best_conf = float(result.get("confidence") or 0.0)
+            print(f"[flexipipe] Trigram detector: {detected_iso} ({detected_name}, score {best_conf:.2f})")
+        # For implicit detection, accept trigram result without applying global confidence threshold
+        result.setdefault("detector", detector_name)
+        return result
+
     confidence = float(result.get("confidence") or 0.0)
     if confidence < LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD:
         if explicit or log_failures:
             print(
-                "[flexipipe] Language could not accurately be detected "
-                f"(confidence {confidence:.2%}). Please provide --language."
+                f"[flexipipe] Language detection ({detector_name}) produced low confidence "
+                f"({confidence:.2%}, threshold: {LANGUAGE_DETECTION_CONFIDENCE_THRESHOLD:.2%})."
             )
+            if explicit:
+                print("Please provide --language.")
             # Show top candidates to help debug
             candidates = result.get("candidates") or []
             if candidates:
@@ -1451,7 +1538,15 @@ def _detect_language_from_text(
                     name = candidate.get("language_name") or candidate.get("label") or "-"
                     conf = candidate.get("confidence", 0.0)
                     print(f"  {idx}. {name} ({iso}): {conf:.2%}")
-        return None
+        # For explicit detection commands, treat low confidence as failure.
+        # For implicit detection (auto selection), keep the best guess anyway.
+        if explicit:
+            return None
+        elif log_failures:
+            # In implicit mode with debug/verbose, still log that we're using the best guess
+            detected_iso = result.get("language_iso") or result.get("label") or "unknown"
+            detected_name = result.get("language_name") or detected_iso
+            print(f"[flexipipe] Using best guess from {detector_name}: {detected_iso} ({detected_name}, confidence {confidence:.2%})")
     result.setdefault("detector", detector_name)
     return result
 
@@ -1527,8 +1622,11 @@ def _run_detect_language_standalone(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--detector",
-        choices=sorted(list_language_detectors().keys()),
         help="Language detector backend to use (default: configured value)",
+    )
+    parser.add_argument(
+        "--backend",
+        help="Alias for --detector to test another detector without changing config",
     )
     parser.add_argument(
         "--top-k",
@@ -1540,6 +1638,11 @@ def _run_detect_language_standalone(argv: list[str]) -> int:
         "--verbose",
         action="store_true",
         help="Print detailed detection info (language name, ISO code, candidates, confidence)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug output (implies --verbose).",
     )
     args = parser.parse_args(argv)
     if getattr(args, "debug", False):
@@ -1573,7 +1676,26 @@ def _run_detect_language_standalone(argv: list[str]) -> int:
 
     from .model_storage import get_language_detector
 
-    detector = args.detector or get_language_detector() or LANGUAGE_DETECTOR_DEFAULT
+    detector = args.detector or args.backend or get_language_detector() or LANGUAGE_DETECTOR_DEFAULT
+    # Normalize common aliases
+    if detector == "trigrams":
+        detector = "trigram"
+    # Check if it's a valid detector before proceeding
+    from .language_detector_registry import list_language_detectors
+    available_detectors = set(list_language_detectors(include_none=True).keys())
+    if detector.lower() not in available_detectors:
+        # Common mistakes: backend names that aren't detectors
+        common_backends = {"flexipipe", "flexitag", "spacy", "stanza", "udpipe", "udpipe1", "udmorph", "nametag", "transformers", "treetagger", "classla", "flair"}
+        if detector.lower() in common_backends:
+            print(
+                f"[flexipipe] Error: '{detector}' is a backend name, not a language detector.",
+                file=sys.stderr,
+            )
+            print(
+                f"[flexipipe] Available language detectors: {', '.join(sorted(available_detectors - {'none'}))}",
+                file=sys.stderr,
+            )
+            return 1
     if detector == "none":
         print(
             "[flexipipe] Error: Language detection is disabled (detector set to 'none'). "
@@ -1604,13 +1726,17 @@ def _run_detect_language_standalone(argv: list[str]) -> int:
                 print(f"[flexipipe] Error: Language detection failed: {exc}", file=sys.stderr)
             return 1
     else:
-        result = _detect_language_from_text(
-            text,
-            explicit=True,
-            min_length=args.min_length,
-            log_failures=True,
-            detector_override=detector,
-        )
+        try:
+            result = _detect_language_from_text(
+                text,
+                explicit=True,
+                min_length=args.min_length,
+                log_failures=True,
+                detector_override=detector,
+            )
+        except ValueError:
+            # Already handled with helpful message in _detect_language_from_text
+            return 1
 
     if not result:
         print("[flexipipe] Language detection produced no candidates.")
@@ -1622,13 +1748,28 @@ def _run_detect_language_standalone(argv: list[str]) -> int:
         candidates = result.get("candidates") or []
         if candidates:
             print("\nTop candidates:")
-            print(f"{'Rank':<6} {'ISO':<6} {'Language':<20} {'Confidence':<10}")
-            print("-" * 50)
+            print(f"{'Rank':<6} {'ISO':<6} {'Language':<20} {'Score':<12}")
+            print("-" * 60)
+            detector_is_trigram = detector.lower() == "trigram"
+            best_conf = float(result.get("confidence") or 0.0) if detector_is_trigram else None
             for idx, candidate in enumerate(candidates[: args.top_k], start=1):
                 iso = candidate.get("language_iso") or candidate.get("label") or "-"
                 name = candidate.get("language_name") or candidate.get("label") or "-"
-                conf = candidate.get("confidence", 0.0)
-                print(f"{idx:<6} {iso:<6} {name:<20} {conf:>8.2%}")
+                conf = float(candidate.get("confidence", 0.0))
+                if detector_is_trigram:
+                    # For trigram: show raw score; for 2nd candidate also show ratio vs best
+                    if idx == 2 and best_conf and best_conf > 0:
+                        ratio = conf / best_conf
+                        print(f"{idx:<6} {iso:<6} {name:<20} {conf:>6.2f} ({ratio:.1%})")
+                    else:
+                        print(f"{idx:<6} {iso:<6} {name:<20} {conf:>6.2f}")
+                else:
+                    # For other detectors keep percentage formatting
+                    print(f"{idx:<6} {iso:<6} {name:<20} {conf:>8.2%}")
+            if detector_is_trigram:
+                sep = result.get("separation_ratio")
+                if isinstance(sep, (int, float)):
+                    print(f"\nseparation_ratio (2nd/best): {sep:.2%}")
         else:
             print(f"[flexipipe] Detector '{detector}' does not expose alternative candidates.")
         return 0
@@ -1893,6 +2034,20 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["teitok", "conllu", "conllu-ne", "json"],
         default=None,
         help="Output format (default: from config, or teitok)",
+    )
+    process_parser.add_argument(
+        "--unicode-normalize",
+        choices=["none", "NFC", "NFD"],
+        default=None,
+        help="Unicode normalization form for input text and document encoding (default: from config, or NFC). "
+             "Applied to token forms and lemmas when creating/processing documents.",
+    )
+    process_parser.add_argument(
+        "--output-unicode-normalize",
+        choices=["none", "NFC", "NFD"],
+        default=None,
+        help="Unicode normalization form for output serialization (default: from config, or NFC). "
+             "Applied to token forms and lemmas when writing CoNLL-U or TEITOK output.",
     )
     process_parser.add_argument(
         "--pretty-print",
@@ -2622,6 +2777,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="udpipe1_parser",
         help="Override UDPipe CLI parser training options.",
     )
+    train_parser.add_argument(
+        "--unicode-normalize",
+        choices=["none", "NFC", "NFD"],
+        default=None,
+        help="Normalize training data to specified Unicode form (NFC, NFD, or none). Default: use config setting.",
+    )
     
     # convert ------------------------------------------------------
     convert_parser = subparsers.add_parser(
@@ -2788,7 +2949,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     benchmark_parser.add_argument(
         "--backend",
-        help="Backend name for --test command (alternative to --backends). Example: --backend spacy",
+        help="Backend name (alternative to --backends for single backend). Example: --backend spacy",
     )
     benchmark_parser.add_argument(
         "--models",
@@ -2859,6 +3020,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "raw", "tokenized", "split"],
         default="auto",
         help="Evaluation mode: 'auto' (default, tokenized for CoNLL-U, raw for TEI), 'raw' (re-tokenize), 'tokenized' (preserve tokenization), 'split' (preserve MWTs).",
+    )
+    benchmark_parser.add_argument(
+        "--unicode-normalize",
+        choices=["none", "NFC", "NFD"],
+        default=None,
+        help="Unicode normalization form for benchmark evaluation (default: from config, or NFC). "
+             "Applied to both gold standard and system output before comparison.",
     )
     benchmark_parser.add_argument(
         "--output-format",
@@ -3177,10 +3345,12 @@ def _build_udmorph_backend_kwargs(args: argparse.Namespace) -> dict:
     if model_name:
         entry = get_udmorph_model_entry(model_name)
         if not entry:
-            raise ValueError(
-                f"UDMorph model '{model_name}' is not available or not supported via the UDMorph backend. "
-                "UDPIPE2-based models should be used with --backend udpipe."
+            print(
+                f"[flexipipe] UDMorph model '{model_name}' is not available or not supported via the UDMorph backend. "
+                "UDPIPE2-based models should be used with --backend udpipe.",
+                file=sys.stderr
             )
+            sys.exit(1)
         endpoint_override = entry.get("endpoint_url")
         if endpoint_override:
             kwargs["endpoint_url"] = endpoint_override
@@ -3443,9 +3613,23 @@ def _prepare_spacy_model_if_needed(args: argparse.Namespace) -> None:
 
 def run_tag(args: argparse.Namespace) -> int:
     # Apply defaults from config if not specified
-    from .model_storage import get_default_backend, get_default_output_format, get_default_create_implicit_mwt, get_default_writeback, get_default_download_model
+    from .model_storage import get_default_backend, get_default_output_format, get_default_create_implicit_mwt, get_default_writeback, get_default_download_model, get_unicode_normalization
     from .doc import Document
     from .language_mapping import get_language_metadata
+    from .unicode_utils import normalize_unicode
+    
+    # Get Unicode normalization form (from args or config, default NFC)
+    unicode_normalize = getattr(args, "unicode_normalize", None)
+    if unicode_normalize is None:
+        unicode_normalize = get_unicode_normalization()
+    output_unicode_normalize = getattr(args, "output_unicode_normalize", None)
+    if output_unicode_normalize is None:
+        output_unicode_normalize = get_unicode_normalization()
+    
+    # Debug output for normalization settings
+    if args.debug:
+        print(f"[flexipipe] DEBUG: Input Unicode normalization: {unicode_normalize}", file=sys.stderr)
+        print(f"[flexipipe] DEBUG: Output Unicode normalization: {output_unicode_normalize}", file=sys.stderr)
     
     backend_type = args.backend
     if backend_type:
@@ -3530,6 +3714,21 @@ def run_tag(args: argparse.Namespace) -> int:
         args.data = [example_text]
         args.input = "<inline-data>"
     
+    # If --input is not provided, check if STDIN has data
+    inline_data_tokens = getattr(args, "data", None)
+    inline_data_text = " ".join(inline_data_tokens).strip() if inline_data_tokens else ""
+    # Normalize input text before processing
+    if inline_data_text and unicode_normalize != "none":
+        inline_data_text = normalize_unicode(inline_data_text, unicode_normalize) or ""
+    
+    # Try language detection early if we have inline data and no language specified
+    if inline_data_text and not getattr(args, "language", None):
+        detection_result = _maybe_detect_language(args, inline_data_text)
+        if detection_result and not auto_selected:
+            backend_type = _auto_select_model_for_language(args, backend_type)
+            args.backend = backend_type
+            auto_selected = True
+    
     # If no model was selected for a locked/explicit backend, try auto-selection once
     model_name = getattr(args, "model", None)
     if backend_type and not model_name:
@@ -3549,13 +3748,12 @@ def run_tag(args: argparse.Namespace) -> int:
                     msg += f" Install hint: {hint}"
                 print(msg, file=sys.stderr)
             else:
-                lang_display = getattr(args, "language", None) or "unknown"
-                print(f"[flexipipe] No available models found for language '{lang_display}'.", file=sys.stderr)
+                lang_display = getattr(args, "language", None)
+                if not lang_display:
+                    print("[flexipipe] Unable to automatically detect the language and no language was specified. Provide --language to specify the language explicitly.", file=sys.stderr)
+                else:
+                    print(f"[flexipipe] No available models found for language '{lang_display}'.", file=sys.stderr)
             return 1
-
-    # If --input is not provided, check if STDIN has data
-    inline_data_tokens = getattr(args, "data", None)
-    inline_data_text = " ".join(inline_data_tokens).strip() if inline_data_tokens else ""
     if inline_data_text:
         if args.input not in (None, "-", "<inline-data>"):
             print("Error: --data cannot be combined with --input.", file=sys.stderr)
@@ -3644,11 +3842,15 @@ def run_tag(args: argparse.Namespace) -> int:
         input_format = "raw"
         detection_source_text = inline_data_text
         detection_attempted = True
-        detection_result = _maybe_detect_language(args, detection_source_text)
-        if not auto_selected:
-            backend_type = _auto_select_model_for_language(args, backend_type)
-            args.backend = backend_type
-            auto_selected = True
+        # Only try detection again if we don't already have a language (from earlier detection)
+        if not getattr(args, "language", None):
+            detection_result = _maybe_detect_language(args, detection_source_text)
+            if detection_result and not auto_selected:
+                backend_type = _auto_select_model_for_language(args, backend_type)
+                args.backend = backend_type
+                auto_selected = True
+        else:
+            detection_result = None
         backend_type = getattr(args, "backend", None) or "flexitag"
         segment_locally = backend_type == "flexitag" or bool(getattr(args, "pretokenize", False))
         tokenize_locally = segment_locally
@@ -3659,9 +3861,15 @@ def run_tag(args: argparse.Namespace) -> int:
             tokenize=tokenize_locally,
         )
         doc.meta.setdefault("source", "inline-data")
+        # Normalize document encoding
+        if unicode_normalize != "none":
+            doc.normalize_unicode(unicode_normalize)
     elif input_entry:
         stdin_payload = stdin_content if read_from_stdin else None
         doc = input_entry.load(args=args, stdin_content=stdin_payload)
+        # Normalize document encoding
+        if unicode_normalize != "none":
+            doc.normalize_unicode(unicode_normalize)
         if not read_from_stdin and args.input not in (None, "-"):
             note_source_path = note_source_path or args.input
         elif read_from_stdin:
@@ -3694,8 +3902,19 @@ def run_tag(args: argparse.Namespace) -> int:
                 stdin_content = sys.stdin.read()
             raw_text = stdin_content
         else:
-            with open(args.input, "r", encoding="utf-8") as handle:
-                raw_text = handle.read()
+            from .file_utils import read_text_file
+            if args.debug:
+                raw_text, detected_encoding = read_text_file(Path(args.input), return_encoding=True)
+                print(f"[flexipipe] DEBUG: Detected file encoding: {detected_encoding}", file=sys.stderr)
+            else:
+                raw_text = read_text_file(Path(args.input))
+        # Normalize input text before processing
+        if unicode_normalize != "none":
+            if args.debug:
+                print(f"[flexipipe] DEBUG: Normalizing input text to {unicode_normalize}", file=sys.stderr)
+            raw_text = normalize_unicode(raw_text, unicode_normalize) or ""
+        elif args.debug:
+            print(f"[flexipipe] DEBUG: Input text normalization: none", file=sys.stderr)
         detection_source_text = raw_text
         detection_attempted = True
         detection_result = _maybe_detect_language(args, detection_source_text)
@@ -3719,6 +3938,9 @@ def run_tag(args: argparse.Namespace) -> int:
             segment=segment_locally,
             tokenize=tokenize_locally,
         )
+        # Normalize document encoding
+        if unicode_normalize != "none":
+            doc.normalize_unicode(unicode_normalize)
         assign_doc_id_from_path(doc, args.input if not read_from_stdin else None)
         if not read_from_stdin and args.input not in (None, "-"):
             note_source_path = note_source_path or args.input
@@ -3754,6 +3976,9 @@ def run_tag(args: argparse.Namespace) -> int:
                     textnode_xpath = getattr(args, "textnode", ".//text")
                     include_notes = getattr(args, "textnotes", False)
                     raw_text = extract_teitok_plain_text(tmp_path, textnode_xpath, include_notes=include_notes)
+                    # Normalize input text before processing
+                    if unicode_normalize != "none":
+                        raw_text = normalize_unicode(raw_text, unicode_normalize) or ""
                     if args.debug:
                         print(f"[flexipipe] Extracted raw text from TEITOK XML (xpath={textnode_xpath}, include_notes={include_notes}):")
                         print("=" * 80)
@@ -3782,6 +4007,9 @@ def run_tag(args: argparse.Namespace) -> int:
                         segment=segment_locally,
                         tokenize=tokenize_locally,
                     )
+                    # Normalize document encoding
+                    if unicode_normalize != "none":
+                        doc.normalize_unicode(unicode_normalize)
                     doc.meta["original_input_path"] = original_input_path
                     doc.meta.setdefault("source_path", original_input_path)
                     if read_from_stdin:
@@ -3827,6 +4055,9 @@ def run_tag(args: argparse.Namespace) -> int:
                         expan_attr=expan_attr,
                         lemma_attr=lemma_attr,
                     )
+                    # Normalize document encoding
+                    if unicode_normalize != "none":
+                        doc.normalize_unicode(unicode_normalize)
                     # Auto-enable writeback if teitok-settings is detected and writeback not explicitly set
                     # Note: For stdin input, writeback is not supported, so we skip this
                     # Store settings for later language resolution
@@ -3921,6 +4152,9 @@ def run_tag(args: argparse.Namespace) -> int:
                     expan_attr=expan_attr,
                     lemma_attr=lemma_attr,
                 )
+                # Normalize document encoding
+                if unicode_normalize != "none":
+                    doc.normalize_unicode(unicode_normalize)
                 # Auto-enable writeback if teitok-settings is detected and writeback not explicitly set
                 # Only enable if settings.xml actually exists (we're in a TEITOK project)
                 if args.writeback is None and teitok_settings and teitok_settings.settings_path and teitok_settings.settings_path.exists():
@@ -4526,6 +4760,13 @@ def run_tag(args: argparse.Namespace) -> int:
 
     output_entry = io_registry.get_output(output_format)
     if output_entry:
+        # Normalize output document before serialization
+        if output_unicode_normalize != "none":
+            if args.debug:
+                print(f"[flexipipe] DEBUG: Normalizing output document to {output_unicode_normalize}", file=sys.stderr)
+            result.document.normalize_unicode(output_unicode_normalize)
+        elif args.debug:
+            print(f"[flexipipe] DEBUG: Output document normalization: none", file=sys.stderr)
         # If we're using a temp file for validation, save to it but don't print yet
         actual_output_path = output_path if not validation_temp_file else output_path
         output_entry.save(
@@ -4535,6 +4776,13 @@ def run_tag(args: argparse.Namespace) -> int:
             model_info=model_str,
         )
     elif output_format == "teitok":
+        # Normalize output document before serialization
+        if output_unicode_normalize != "none":
+            if args.debug:
+                print(f"[flexipipe] DEBUG: Normalizing output document to {output_unicode_normalize}", file=sys.stderr)
+            result.document.normalize_unicode(output_unicode_normalize)
+        elif args.debug:
+            print(f"[flexipipe] DEBUG: Output document normalization: none", file=sys.stderr)
         # Apply create_implicit_mwt if requested (for TEITOK output with <dtok> elements)
         # But defer this until we know if we're in writeback mode and updating existing tokens
         output_doc = result.document
@@ -4740,6 +4988,7 @@ def run_tag(args: argparse.Namespace) -> int:
                         settings=teitok_settings_obj,
                         from_raw_text=processed_from_raw,
                         strict_alignment=True,  # Always use strict alignment to prevent incorrect writes
+                        unicode_normalization=output_unicode_normalize,
                     )
                     if args.verbose or args.debug:
                         target = str(target_writeback_path) if not output_path else output_path
@@ -4773,6 +5022,7 @@ def run_tag(args: argparse.Namespace) -> int:
                 spaceafter_handling=spaceafter_handling,
                 skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking,
                 settings=teitok_settings_obj,
+                unicode_normalization=output_unicode_normalize,
             )
             note_candidate = (
                 note_source_path
@@ -5169,7 +5419,13 @@ def run_train(args: argparse.Namespace) -> int:
                 output_dir = output_dir_arg.resolve()
         elif backend_type == "udpipe1":
             storage_root = get_backend_models_dir("udpipe1").resolve()
-            output_dir = output_dir_arg.resolve() if output_dir_arg else storage_root
+            if output_dir_arg is None:
+                # If no output dir specified, use model name to create subdirectory
+                label = args.name or train_path.stem or "udpipe-model"
+                safe_label = label.replace("/", "_") or f"udpipe-model-{datetime.now():%Y%m%d%H%M%S}"
+                output_dir = storage_root  # Models are saved directly in storage_root with .udpipe extension
+            else:
+                output_dir = output_dir_arg.resolve()
         else:
             output_dir = output_dir_arg.resolve() if output_dir_arg else Path(args.output_dir or ".").expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -5214,6 +5470,12 @@ def run_train(args: argparse.Namespace) -> int:
             raise SystemExit(f"{backend_type} backend does not support training")
         
         try:
+            # Get Unicode normalization for training (from args or config)
+            unicode_normalize = getattr(args, "unicode_normalize", None)
+            if unicode_normalize is None:
+                from .model_storage import get_unicode_normalization
+                unicode_normalize = get_unicode_normalization()
+            
             model_path = backend.train(
                 train_data=train_path,
                 output_dir=output_dir,
@@ -5221,6 +5483,7 @@ def run_train(args: argparse.Namespace) -> int:
                 model_name=args.name,
                 language=args.language,
                 verbose=args.verbose or args.debug,
+                unicode_normalization=unicode_normalize,
             )
             print(f"[flexipipe] trained {backend_type} model at {model_path}")
             _cleanup_nlpform_paths()
@@ -5464,6 +5727,12 @@ def _run_convert_tagged(args: argparse.Namespace) -> int:
     """Convert between input/output formats without running any NLP tasks."""
     from .teitok import load_teitok, save_teitok, dump_teitok
     from .conllu import conllu_to_document, document_to_conllu
+    from .model_storage import get_unicode_normalization
+    
+    # Get Unicode normalization form for output
+    output_unicode_normalize = getattr(args, "output_unicode_normalize", None)
+    if output_unicode_normalize is None:
+        output_unicode_normalize = get_unicode_normalization()
     
     if not args.output_format:
         print("Error: --output-format is required for tagged conversion", file=sys.stderr)
@@ -5514,8 +5783,8 @@ def _run_convert_tagged(args: argparse.Namespace) -> int:
         if read_from_stdin:
             conllu_text = stdin_content if stdin_content else sys.stdin.read()
         else:
-            with open(input_path, "r", encoding="utf-8") as f:
-                conllu_text = f.read()
+            from .file_utils import read_text_file
+            conllu_text = read_text_file(Path(input_path))
         doc = conllu_to_document(conllu_text)
         if not read_from_stdin:
             doc.meta.setdefault("source_path", input_path)
@@ -5556,11 +5825,11 @@ def _run_convert_tagged(args: argparse.Namespace) -> int:
     if output_format == "teitok":
         pretty_print = getattr(args, "pretty_print", False)
         if args.output:
-            save_teitok(doc, args.output, pretty_print=pretty_print)
+            save_teitok(doc, args.output, pretty_print=pretty_print, unicode_normalization=output_unicode_normalize)
             if args.verbose or args.debug:
                 print(f"[flexipipe] converted to TEI: {args.output}")
         else:
-            print(dump_teitok(doc, pretty_print=pretty_print), end="")
+            print(dump_teitok(doc, pretty_print=pretty_print, unicode_normalization=output_unicode_normalize), end="")
     elif output_format in ("conllu", "conllu-ne"):
         entity_format = "ne" if output_format == "conllu-ne" else "iob"
         conllu_text = document_to_conllu(doc, entity_format=entity_format)
@@ -5747,7 +6016,13 @@ def run_map_tags(args: argparse.Namespace) -> int:
     if output_format == "auto":
         output_format = input_format
 
-    _write_document(document, args.output, output_format)
+    # Get Unicode normalization form for output
+    from .model_storage import get_unicode_normalization
+    output_unicode_normalize = getattr(args, "output_unicode_normalize", None)
+    if output_unicode_normalize is None:
+        output_unicode_normalize = get_unicode_normalization()
+
+    _write_document(document, args.output, output_format, unicode_normalization=output_unicode_normalize)
 
     if args.verbose or args.debug:
         target = args.output or "stdout"
@@ -5786,6 +6061,7 @@ def _write_document(
     spaceafter_handling: str = "preserve",
     skip_spaceafter_for_breaking_elements: bool = True,
     teitok_settings: Optional[TeitokSettings] = None,
+    unicode_normalization: Optional[str] = None,
 ) -> None:
     if fmt == "teitok":
         if output:
@@ -5796,6 +6072,7 @@ def _write_document(
                 spaceafter_handling=spaceafter_handling,
                 skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking_elements,
                 settings=teitok_settings,
+                unicode_normalization=unicode_normalization,
             )
         else:
             sys.stdout.write(
@@ -5805,6 +6082,7 @@ def _write_document(
                     spaceafter_handling=spaceafter_handling,
                     skip_spaceafter_for_breaking_elements=skip_spaceafter_for_breaking_elements,
                     settings=teitok_settings,
+                    unicode_normalization=unicode_normalization,
                 )
             )
         return
@@ -5874,8 +6152,36 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             raise
         return 0
-    elif argv[0] not in TASK_CHOICES and argv[0].startswith("-"):
-        argv = ["process", *argv]
+    elif argv[0] not in TASK_CHOICES and not argv[0].startswith("-"):
+        # If the first argument is not a task name and not an option, treat it as inline text for `process`
+        # This restores the “process by default” behavior for commands like:
+        #   flexipipe "Some text here"
+        argv = ["process", "--data", *argv]
+    elif argv[0].startswith("-"):
+        # If options are provided without an explicit task, assume "process".
+        # Additionally, if only flag options are present (e.g., --debug/--verbose)
+        # followed by free text, treat the free text as --data for convenience.
+        # Example: flexipipe --debug "Some text"
+        original = list(argv)
+        # Default to just prefixing "process"
+        argv = ["process", *original]
+        # If --data already present, do nothing else
+        if "--data" not in original and "-d" not in original:
+            flag_only_opts = {"--debug", "--verbose", "--refresh-cache"}
+            text_start_idx = None
+            # Skip over flag-only options; stop when we hit the first non-flag token
+            for idx, tok in enumerate(original):
+                if tok.startswith("-"):
+                    if tok not in flag_only_opts:
+                        # Option that takes a value or unknown: don't rewrite
+                        text_start_idx = None
+                        break
+                    continue
+                text_start_idx = idx
+                break
+            if text_start_idx is not None:
+                # Insert --data before the text segment
+                argv = ["process", *original[:text_start_idx], "--data", *original[text_start_idx:]]
 
     parser = build_parser()
     try:
@@ -5891,6 +6197,10 @@ def main(argv: list[str] | None = None) -> int:
         except BrokenPipeError:
             pass
         raise
+
+    # Global debug banner
+    if getattr(args, "debug", False):
+        print("[flexipipe] Running in debugging mode.", file=sys.stderr)
     setattr(args, "_backend_explicit", backend_explicit)
 
     # Auto-set --output-format json when running from TEITOK (if not explicitly set)

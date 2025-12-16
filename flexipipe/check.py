@@ -518,6 +518,7 @@ def evaluate_model(
     debug: bool = False,
     mode: str = "auto",
     create_implicit_mwt: bool = False,
+    unicode_normalize: str = "none",
 ) -> Path:
     start_time = time.time()
     output_dir = output_dir.expanduser().resolve()
@@ -555,6 +556,9 @@ def evaluate_model(
         print(f"[flexipipe] Loading gold standard from {gold_path}...")
     load_start = time.time()
     gold_doc = _load_gold(gold_path, detected_format)
+    # Normalize gold document
+    if unicode_normalize != "none":
+        gold_doc.normalize_unicode(unicode_normalize)
     load_time = time.time() - load_start
     gold_token_count = sum(len(sent.tokens) for sent in gold_doc.sentences)
     gold_sent_count = len(gold_doc.sentences)
@@ -622,6 +626,9 @@ def evaluate_model(
         neural_result = neural_backend.tag(stripped_doc, use_raw_text=use_raw_text)
         tag_time = time.time() - tag_start
         pred_doc = neural_result.document
+        # Normalize pred document
+        if unicode_normalize != "none":
+            pred_doc.normalize_unicode(unicode_normalize)
         pred_token_count = sum(len(sent.tokens) for sent in pred_doc.sentences)
         pred_sent_count = len(pred_doc.sentences)
         if verbose:
@@ -675,6 +682,9 @@ def evaluate_model(
         tagged_result = fallback.tag(stripped_doc)
         tag_time = time.time() - tag_start
         pred_doc = tagged_result.document
+        # Normalize pred document
+        if unicode_normalize != "none":
+            pred_doc.normalize_unicode(unicode_normalize)
         pred_token_count = sum(len(sent.tokens) for sent in pred_doc.sentences)
         pred_sent_count = len(pred_doc.sentences)
         model_str = f"flexitag: {model_path.name}"
