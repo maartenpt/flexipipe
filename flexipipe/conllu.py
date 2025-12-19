@@ -1206,7 +1206,10 @@ def _format_token_line(
         head_value = "_" if not has_dependencies else "0"
     else:
         head_value = str(head_int)
-    deprel = getattr(token, "deprel", "") or "_"
+    # Ensure deprel is never empty - UDPipe requires _ or a valid relation
+    deprel = getattr(token, "deprel", None)
+    if not deprel or deprel == "":
+        deprel = "_"
     deps = getattr(token, "deps", "") or "_"
     # If force_no_space is True (subtokens), suppress SpaceAfter completely (no entry in MISC)
     misc = _format_misc(

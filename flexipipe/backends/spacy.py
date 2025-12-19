@@ -24,15 +24,33 @@ def _resolve_spacy_model_name(
     if not language:
         return None
     lang_norm = language.lower()
+    
+    # Normalize language code to handle ISO-639-3 codes (e.g., "cat" -> "ca")
+    from ..language_mapping import normalize_language_code, get_language_metadata
+    lang_iso1, lang_iso2, lang_iso3 = normalize_language_code(lang_norm)
+    # Collect all possible ISO codes for this language
+    lang_iso_codes = {lang_iso1, lang_iso2, lang_iso3, lang_norm} - {None}
+    
     try:
         entries, _, _ = get_spacy_model_entries(use_cache=True, refresh_cache=False, verbose=False)
     except Exception:
         entries = {}
     for key, info in entries.items():
-        iso = (info.get(LANGUAGE_FIELD_ISO) or "").lower()
-        name = (info.get(LANGUAGE_FIELD_NAME) or "").lower()
-        if lang_norm in {iso, name}:
+        entry_iso = (info.get(LANGUAGE_FIELD_ISO) or "").lower()
+        entry_name = (info.get(LANGUAGE_FIELD_NAME) or "").lower()
+        # Check if any of the normalized ISO codes match
+        if entry_iso in lang_iso_codes or lang_norm in {entry_iso, entry_name}:
             return key
+        # Also check if entry's ISO code normalizes to the same language
+        if entry_iso:
+            entry_iso1, entry_iso2, entry_iso3 = normalize_language_code(entry_iso)
+            entry_iso_codes = {entry_iso1, entry_iso2, entry_iso3} - {None}
+            if lang_iso_codes & entry_iso_codes:
+                return key
+    # Try default models with all normalized codes
+    for iso_code in lang_iso_codes:
+        if iso_code in SPACY_DEFAULT_MODELS:
+            return SPACY_DEFAULT_MODELS[iso_code]
     return SPACY_DEFAULT_MODELS.get(lang_norm)
 
 
@@ -137,11 +155,12 @@ def _create_spacy_backend(
     verbose: bool = False,
     **kwargs: Any,
 ) -> SpacyBackend:
-    _ = training  # unused
     model_name = _resolve_spacy_model_name(model_name, language)
     if download_model and model_name and not model_path:
         _ensure_spacy_model_available(model_name)
 
+    # Pass training flag to backend constructors
+    kwargs["training"] = training
     if model_path:
         return SpacyBackend.from_model_path(model_path, verbose=verbose, **kwargs)
     if model_name:

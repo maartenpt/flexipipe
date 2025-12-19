@@ -220,10 +220,14 @@ def resolve_language_query(value: str) -> Dict[str, Set[str]]:
 
     if lang_obj:
         fields = getattr(lang_obj, "_fields", {})
-        for attr in ("alpha_2", "alpha_3"):
-            code = fields.get(attr)
-            if code:
-                iso_candidates.add(code.lower())
+        # Only add ISO codes if the input is itself a valid ISO code (2-3 letters)
+        # This prevents pycountry's fuzzy matching from adding incorrect ISO codes
+        is_input_iso = value and len(value.strip()) in {2, 3} and value.strip().isalpha()
+        if is_input_iso:
+            for attr in ("alpha_2", "alpha_3"):
+                code = fields.get(attr)
+                if code:
+                    iso_candidates.add(code.lower())
         for attr in ("name", "common_name", "inverted_name"):
             name_val = fields.get(attr)
             if name_val:
@@ -259,6 +263,29 @@ def language_matches_entry(
 
     if iso_value and iso_value in query["iso"]:
         return True
+    
+    # Check if entry's ISO code and query ISO codes normalize to the same language
+    # This handles cases like swh (Swahili individual) vs swa (Swahili macrolanguage)
+    # But we need to be careful: only match if the normalization actually finds the same language,
+    # not if there's a substring match (e.g., "sw" shouldn't match Swedish via "swedish")
+    if iso_value and query["iso"]:
+        from .language_mapping import normalize_language_code, _LANGUAGE_BY_CODE
+        # Only do normalization check if both codes are actually in the language mapping
+        # This prevents false matches from substring matching
+        entry_in_mapping = iso_value.lower() in _LANGUAGE_BY_CODE
+        entry_iso1, entry_iso2, entry_iso3 = normalize_language_code(iso_value) if entry_in_mapping else (None, None, None)
+        entry_normalized = {entry_iso1, entry_iso2, entry_iso3} - {None}
+        
+        for query_iso in query["iso"]:
+            query_in_mapping = query_iso.lower() in _LANGUAGE_BY_CODE
+            if not query_in_mapping:
+                continue  # Skip if query ISO isn't in mapping (might be a substring match artifact)
+            query_iso1, query_iso2, query_iso3 = normalize_language_code(query_iso)
+            query_normalized = {query_iso1, query_iso2, query_iso3} - {None}
+            # If they share any normalized ISO code, they're the same language
+            if entry_normalized & query_normalized:
+                return True
+    
     if normalized_name and normalized_name in query["normalized"]:
         return True
     if normalized_display and normalized_display in query["normalized"]:

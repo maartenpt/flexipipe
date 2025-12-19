@@ -208,6 +208,7 @@ class BackendInfo:
         is_hidden: bool = False,
         factory: Optional[Callable[..., Backend]] = None,
         url: Optional[str] = None,
+        install_instructions: Optional[str] = None,
     ):
         self.name = name
         self.backend_class = backend_class
@@ -222,6 +223,7 @@ class BackendInfo:
         self.factory = factory
         self.url = url
         self.model_registry_url: Optional[str] = None
+        self.install_instructions: Optional[str] = install_instructions
 
 
 # Registry of all backends
@@ -247,6 +249,7 @@ def register_backend_spec(spec: BackendSpec) -> None:
         is_hidden=spec.is_hidden,
         factory=spec.factory,
         url=spec.url,
+        install_instructions=spec.install_instructions,
     )
     info.model_registry_url = spec.model_registry_url
     register_backend(info)
@@ -451,10 +454,48 @@ def create_backend(
             return info.factory(**factory_kwargs)
         except ImportError as e:
             # Handle missing module gracefully
-            module_name = str(e).split("'")[1] if "'" in str(e) else "unknown"
+            error_str = str(e)
+            # Check if this is a SpaCy language support error (E048)
+            # For training, let the backend handle it (it will use 'xx' fallback)
+            if training and ("E048" in error_str or ("Can't import language" in error_str and "spacy.lang" in error_str)):
+                # Re-raise to let the backend handle it (SpaCy backend will use 'xx' for training)
+                raise
+            if "E048" in error_str or ("Can't import language" in error_str and "spacy.lang" in error_str):
+                # Extract language code from error if possible
+                language = factory_kwargs.get("language", "unknown")
+                raise RuntimeError(
+                    f"Backend '{backend_type}' does not support language '{language}'. "
+                    f"SpaCy only supports certain languages out of the box. "
+                    f"For training, unsupported languages will automatically use 'xx' (multilingual)."
+                ) from e
+            # Try to extract module name from common error patterns
+            module_name = "unknown"
+            # Pattern 1: "No module named 'X'"
+            if "No module named" in error_str and "'" in error_str:
+                parts = error_str.split("No module named")
+                if len(parts) > 1:
+                    quoted = parts[1].strip()
+                    if quoted.startswith("'") and "'" in quoted[1:]:
+                        module_name = quoted[1:].split("'")[0]
+                        # Skip if it's a spacy.lang.* module (language support issue, not missing spacy)
+                        if module_name.startswith("spacy.lang."):
+                            language = module_name.replace("spacy.lang.", "")
+                            # For training, let the backend handle it
+                            if training:
+                                raise
+                            raise RuntimeError(
+                                f"Backend '{backend_type}' does not support language '{language}'. "
+                                f"SpaCy only supports certain languages out of the box. "
+                                f"For training, unsupported languages will automatically use 'xx' (multilingual)."
+                            ) from e
+            # If we couldn't extract a module name, use a generic message
+            if module_name == "unknown":
+                raise RuntimeError(
+                    f"Backend '{backend_type}' import error: {error_str}"
+                ) from e
             raise RuntimeError(
                 f"Backend '{backend_type}' requires the '{module_name}' module, but it is not installed. "
-                f"Please install it with: pip install {module_name}"
+                f"Please install it with: pip install \"flexipipe[{backend_type}]\""
             ) from e
     
     if not info.backend_class:

@@ -17,6 +17,18 @@ from .model_storage import get_cache_dir, read_model_cache_entry, write_model_ca
 
 # Catalog cache key
 CATALOG_CACHE_KEY = "unified_model_catalog_v2"
+
+
+def invalidate_unified_catalog_cache() -> None:
+    """Invalidate the unified model catalog cache to force a rebuild on next access."""
+    from .model_storage import get_cache_dir
+    cache_dir = get_cache_dir()
+    cache_file = cache_dir / f"{CATALOG_CACHE_KEY}.json"
+    try:
+        if cache_file.exists():
+            cache_file.unlink()
+    except (OSError, PermissionError):
+        pass  # Best effort - if we can't delete, that's okay
 CATALOG_CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 hours
 
 
@@ -46,35 +58,16 @@ def build_unified_catalog(
     """
     # Check cache first
     if use_cache and not refresh_cache:
-        cached = read_model_cache_entry(CATALOG_CACHE_KEY, max_age_seconds=CATALOG_CACHE_TTL_SECONDS)
+        # Use cache with 1 hour TTL - this allows new models to appear within an hour
+        # without requiring explicit --refresh-cache, while still being fast for repeated queries
+        cached = read_model_cache_entry(CATALOG_CACHE_KEY, max_age_seconds=3600)  # 1 hour
         if cached:
             if verbose:
                 print(f"[flexipipe] Using cached unified model catalog ({len(cached)} models)")
-            # Warn if caches are stale (but still use them)
-            if verbose:
-                try:
-                    from .cache_manager import warn_if_caches_stale
-                    warn_if_caches_stale(max_age_seconds=CATALOG_CACHE_TTL_SECONDS, verbose=verbose)
-                except ImportError:
-                    pass
             return cached
-        else:
-            # Cache is missing or stale - warn instead of auto-rebuilding
-            if verbose:
-                try:
-                    from .cache_manager import check_cache_staleness
-                    is_stale, age, _ = check_cache_staleness(CATALOG_CACHE_KEY, max_age_seconds=CATALOG_CACHE_TTL_SECONDS)
-                    if is_stale:
-                        if age is not None:
-                            age_hours = age / 3600
-                            print(f"[flexipipe] Warning: unified catalog cache is stale ({age_hours:.1f} hours old)")
-                        else:
-                            print(f"[flexipipe] Warning: unified catalog cache is missing")
-                        print("[flexipipe] Run 'python -m flexipipe config --refresh-all-caches' to refresh all caches.")
-                except ImportError:
-                    pass
-                # Return empty dict instead of rebuilding
-                return {}
+        # If cache is missing or expired, fall through to rebuild
+        if verbose:
+            print("[flexipipe] Cache expired or not found, building unified model catalog...")
     
     if verbose:
         print("[flexipipe] Building unified model catalog...")
@@ -113,15 +106,25 @@ def build_unified_catalog(
                     cache_key = backend
             
             # Read from cache with no TTL (use even expired cache)
-            entries = read_model_cache_entry(cache_key, max_age_seconds=None)
+            # But if refresh_cache is True, skip cache and load fresh
+            entries = None
+            if not refresh_cache:
+                entries = read_model_cache_entry(cache_key, max_age_seconds=None)
             if not entries:
-                # No cache - try loading normally (this will include remote models if available)
+                # No cache or refresh requested - try loading normally (this will include remote models if available)
                 entries = get_model_entries(
                     backend,
-                    use_cache=True,
-                    refresh_cache=False,
+                    use_cache=not refresh_cache,
+                    refresh_cache=refresh_cache,
                     verbose=False,
                 )
+            
+            # Handle tuple return from some backends (e.g., SpaCy returns (entries, dir, standard_location_models))
+            if isinstance(entries, tuple):
+                entries = entries[0]
+            
+            if not isinstance(entries, dict):
+                continue
             
             for model_name, entry in entries.items():
                 if not isinstance(entry, dict):
@@ -136,13 +139,35 @@ def build_unified_catalog(
                 catalog_entry["model"] = model_name
                 
                 # Normalize language codes using language mapping
+                # But preserve the original for dialect detection
+                original_lang_iso = entry.get("language_iso")
+                original_lang_iso_from_entry = entry.get("original_language_iso")
+                # Use original_language_iso if available (preserves codes like "swa" that shouldn't be normalized)
+                if original_lang_iso_from_entry:
+                    original_lang_iso = original_lang_iso_from_entry
                 try:
-                    from .language_mapping import normalize_language_code
-                    lang_iso = entry.get("language_iso")
+                    from .language_mapping import normalize_language_code, _LANGUAGE_BY_CODE
+                    lang_iso = original_lang_iso
                     if lang_iso:
-                        iso_1, iso_2, iso_3 = normalize_language_code(lang_iso)
-                        if iso_1:
-                            catalog_entry["language_iso"] = iso_1
+                        # Only normalize if the code is actually in the mapping
+                        # This prevents substring matches (e.g., "sw" matching "swedish")
+                        lang_lower = lang_iso.lower()
+                        if lang_lower in _LANGUAGE_BY_CODE:
+                            iso_1, iso_2, iso_3 = normalize_language_code(lang_iso)
+                            # For 3-letter codes (ISO-639-3), prefer keeping the original if it's valid
+                            # This ensures "swa" (Swahili macrolanguage) doesn't get normalized to "sw" (Swahili individual)
+                            # Only normalize if the original is a 2-letter code or if normalization produces a different 3-letter code
+                            if len(lang_iso) == 3 and lang_iso.isalpha() and iso_3 and iso_3.lower() == lang_lower:
+                                # Keep the original 3-letter code
+                                catalog_entry["language_iso"] = lang_iso
+                            elif iso_1:
+                                catalog_entry["language_iso"] = iso_1
+                                # Preserve original for dialect detection and matching
+                                if original_lang_iso and original_lang_iso != iso_1:
+                                    catalog_entry["original_language_iso"] = original_lang_iso
+                        else:
+                            # Code not in mapping - keep as-is (might be a dialect code or non-standard)
+                            catalog_entry["language_iso"] = lang_iso
                 except Exception:
                     pass  # Keep original if normalization fails
                 
@@ -168,6 +193,12 @@ def build_unified_catalog(
                 catalog_entry["speed_rating"] = None
                 catalog_entry["accuracy_rating"] = None
                 
+                # Calculate and cache model size (only for local models, skip REST backends)
+                if not is_rest_backend:
+                    model_size_bytes = _calculate_model_size_bytes(backend, model_name)
+                    if model_size_bytes is not None:
+                        catalog_entry["model_size_bytes"] = model_size_bytes
+                
                 catalog[catalog_key] = catalog_entry
                 
         except Exception as exc:
@@ -185,6 +216,58 @@ def build_unified_catalog(
         print(f"[flexipipe] Built unified catalog with {len(catalog)} models")
     
     return catalog
+
+
+def _calculate_model_size_bytes(backend: str, model_name: str) -> Optional[int]:
+    """
+    Calculate the size of a model in bytes.
+    
+    Args:
+        backend: Backend name
+        model_name: Model name
+        
+    Returns:
+        Size in bytes, or None if model not found or size cannot be calculated
+    """
+    try:
+        from .model_storage import get_backend_models_dir
+        from .backend_registry import get_backend_info
+        
+        backend_info = get_backend_info(backend)
+        if backend_info and backend_info.is_rest:
+            # REST backends don't have local files
+            return None
+        
+        backend_dir = get_backend_models_dir(backend, create=False)
+        if not backend_dir or not backend_dir.exists():
+            return None
+        
+        # Try to find the model in the backend directory
+        model_path = backend_dir / model_name
+        if not model_path.exists():
+            return None
+        
+        if model_path.is_file():
+            try:
+                return model_path.stat().st_size
+            except (OSError, PermissionError):
+                return None
+        elif model_path.is_dir():
+            # Sum all files in the directory
+            try:
+                total = 0
+                for file_path in model_path.rglob("*"):
+                    if file_path.is_file():
+                        try:
+                            total += file_path.stat().st_size
+                        except (OSError, PermissionError):
+                            pass
+                return total if total > 0 else None
+            except (OSError, PermissionError):
+                return None
+    except Exception:
+        return None
+    return None
 
 
 def _assign_model_ratings(entry: Dict[str, Any]) -> None:
@@ -271,6 +354,7 @@ def get_models_for_language(
     preferred_only: bool = False,
     available_only: bool = False,
     use_cache: bool = True,
+    refresh_cache: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Get models for a specific language from the unified catalog.
@@ -280,11 +364,12 @@ def get_models_for_language(
         preferred_only: If True, only return preferred models
         available_only: If True, only return models available without download
         use_cache: If True, use cached catalog
+        refresh_cache: If True, force refresh of catalog
         
     Returns:
         List of model entry dicts matching the criteria
     """
-    catalog = build_unified_catalog(use_cache=use_cache, refresh_cache=False, verbose=False)
+    catalog = build_unified_catalog(use_cache=use_cache, refresh_cache=refresh_cache, verbose=False)
     
     from .language_utils import resolve_language_query, language_matches_entry
     
@@ -292,7 +377,7 @@ def get_models_for_language(
     matches: List[Dict[str, Any]] = []
     
     for entry in catalog.values():
-        if not language_matches_entry(entry, query, allow_fuzzy=True):
+        if not language_matches_entry(entry, query, allow_fuzzy=False):
             continue
         
         if preferred_only and not entry.get("preferred", False):

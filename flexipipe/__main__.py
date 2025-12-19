@@ -553,6 +553,7 @@ def _collect_language_matches(
     *,
     allow_fuzzy: bool = False,
 ) -> list[tuple[str, str, dict]]:
+    """Collect language matches - fuzzy matching is never used for actual selection."""
     matches: list[tuple[str, str, dict]] = []
     for backend, entries in entries_by_backend.items():
         # Skip if entries is not a dict (e.g., error dict)
@@ -569,9 +570,76 @@ def _collect_language_matches(
             from .benchmark import is_model_disabled
             if is_model_disabled(backend, model_name):
                 continue
-            if language_matches_entry(entry, query, allow_fuzzy=allow_fuzzy):
+            # Never use fuzzy matching for actual model selection
+            if language_matches_entry(entry, query, allow_fuzzy=False):
                 matches.append((backend, model_name, entry))
     return matches
+
+
+def _suggest_similar_languages(
+    language: str,
+    entries_by_backend: dict[str, dict],
+    query: dict,
+    max_suggestions: int = 3,
+) -> list[str]:
+    """
+    Suggest similar languages using fuzzy matching (for display only, never for actual selection).
+    
+    Returns a list of suggestion strings like "Xaxay (xxy)".
+    """
+    from difflib import SequenceMatcher
+    from .language_utils import normalize_language_value, LANGUAGE_FIELD_ISO, LANGUAGE_FIELD_NAME
+    
+    # Never suggest for ISO codes
+    if language and len(language.strip()) in {2, 3} and language.strip().isalpha():
+        return []
+    
+    suggestions: list[tuple[float, str, str]] = []  # (score, language_name, iso_code)
+    query_normalized = normalize_language_value(language)
+    
+    # Collect unique language names and ISO codes from all entries
+    seen_languages: dict[str, tuple[str, str]] = {}  # normalized_name -> (name, iso)
+    
+    for backend, entries in entries_by_backend.items():
+        if not isinstance(entries, dict) or (len(entries) == 1 and "error" in entries):
+            continue
+        for model_name, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+            lang_name = entry.get(LANGUAGE_FIELD_NAME) or entry.get("language_display") or ""
+            lang_iso = entry.get(LANGUAGE_FIELD_ISO) or ""
+            
+            if not lang_name:
+                continue
+            
+            # Normalize and deduplicate
+            normalized = normalize_language_value(lang_name)
+            if normalized and normalized not in seen_languages:
+                seen_languages[normalized] = (lang_name, lang_iso)
+    
+    # Calculate fuzzy similarity scores (only for language names, never ISO codes)
+    for normalized_name, (name, iso) in seen_languages.items():
+        if not normalized_name or not query_normalized:
+            continue
+        # Skip if this is an exact match (shouldn't happen if we got here, but be safe)
+        if normalized_name == query_normalized:
+            continue
+        
+        ratio = SequenceMatcher(None, normalized_name, query_normalized).ratio()
+        if ratio >= 0.65:  # Same threshold as fuzzy matching
+            suggestions.append((ratio, name, iso))
+    
+    # Sort by score (highest first) and format
+    suggestions.sort(reverse=True, key=lambda x: x[0])
+    
+    result: list[str] = []
+    for score, name, iso in suggestions[:max_suggestions]:
+        if iso:
+            result.append(f"{name} ({iso})")
+        else:
+            result.append(name)
+    
+    return result
 
 
 def _display_language_filtered_models(language: Optional[str], entries_by_backend: dict[str, dict], output_format: str = "table", sort_by: str = "backend") -> int:
@@ -600,20 +668,39 @@ def _display_language_filtered_models(language: Optional[str], entries_by_backen
     else:
         query = resolve_language_query(language)
         matches = _collect_language_matches(entries_by_backend, query, allow_fuzzy=False)
-        if not matches:
-            matches = _collect_language_matches(entries_by_backend, query, allow_fuzzy=True)
-            if matches:
-                used_fuzzy = True
         # Filter out disabled models
         matches = [(backend, model, entry) for backend, model, entry in matches if not is_model_disabled(backend, model)]
 
         if not matches:
+            # No exact matches found - suggest similar languages using fuzzy matching (for display only)
+            # Build full catalog for suggestions (since entries_by_backend might be filtered/empty)
+            try:
+                from .model_catalog import build_unified_catalog
+                full_catalog = build_unified_catalog(use_cache=True, refresh_cache=False, verbose=False)
+                full_entries_by_backend: dict[str, dict] = {}
+                for entry in full_catalog.values():
+                    backend = entry.get("backend")
+                    model = entry.get("model")
+                    if backend and model:
+                        if backend not in full_entries_by_backend:
+                            full_entries_by_backend[backend] = {}
+                        full_entries_by_backend[backend][model] = entry
+                suggestions = _suggest_similar_languages(language, full_entries_by_backend, query)
+            except Exception as e:
+                # If catalog fails, try with provided entries_by_backend
+                suggestions = _suggest_similar_languages(language, entries_by_backend, query)
+            
             if output_format == "json":
                 import json
                 import sys
-                print(json.dumps({"language": language, "models": []}, indent=2, ensure_ascii=False), flush=True)
+                result = {"language": language, "models": []}
+                if suggestions:
+                    result["suggestions"] = suggestions
+                print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
             else:
                 print(f"[flexipipe] No models found for language '{language}'.")
+                if suggestions:
+                    print(f"[flexipipe] Did you mean: {', '.join(suggestions)}?")
             return 0
 
     # Sort matches based on sort_by option (natural, case-insensitive sorting)
@@ -729,11 +816,34 @@ def _display_language_filtered_models(language: Optional[str], entries_by_backen
             details_parts.append("★ Preferred")
         
         status = entry.get("status")
+        source = entry.get("source", "")
+        
+        # Format status with appropriate source label
         if status:
             details = status.capitalize()
-            version = entry.get("version") or entry.get("date") or entry.get("updated")
-            if version:
-                details += f" ({version})"
+            # For SpaCy and other backends, show source-specific labels instead of version
+            if backend == "spacy" and source:
+                if source == "local":
+                    details += " (locally trained model)"
+                elif source == "flexipipe":
+                    details += " (flexipipe model)"
+                elif source == "community":
+                    details += " (community model)"
+                elif source == "official":
+                    version = entry.get("version") or entry.get("date") or entry.get("updated")
+                    if version:
+                        details += f" (v{version})"
+                    else:
+                        details += " (official model)"
+                else:
+                    version = entry.get("version") or entry.get("date") or entry.get("updated")
+                    if version:
+                        details += f" ({version})"
+            else:
+                # For other backends, show version if available
+                version = entry.get("version") or entry.get("date") or entry.get("updated")
+                if version:
+                    details += f" ({version})"
             details_parts.append(details)
         features = entry.get("features")
         if features and features not in details_parts:
@@ -760,7 +870,7 @@ def _display_language_filtered_models(language: Optional[str], entries_by_backen
             total_size = 0
             models_counted = 0
             try:
-                # Only calculate size for the filtered models
+                # Use cached model sizes from catalog if available, otherwise calculate
                 for backend, model_name, entry in matches:
                     # Skip REST backends - they don't have local files
                     backend_info = get_backend_info(backend)
@@ -768,7 +878,14 @@ def _display_language_filtered_models(language: Optional[str], entries_by_backen
                     if is_rest_backend:
                         continue
                     
-                    # Try to find the model directory/file
+                    # Try to get cached size from entry first
+                    model_size_bytes = entry.get("model_size_bytes")
+                    if model_size_bytes is not None:
+                        total_size += model_size_bytes
+                        models_counted += 1
+                        continue
+                    
+                    # Fallback: calculate size if not cached
                     backend_dir = get_backend_models_dir(backend, create=False)
                     if not backend_dir or not backend_dir.exists():
                         continue
@@ -779,18 +896,21 @@ def _display_language_filtered_models(language: Optional[str], entries_by_backen
                         models_counted += 1
                         if model_path.is_file():
                             try:
-                                total_size += model_path.stat().st_size
+                                size = model_path.stat().st_size
+                                total_size += size
                             except (OSError, PermissionError):
                                 pass
                         elif model_path.is_dir():
                             # Sum all files in the directory
                             try:
+                                size = 0
                                 for file_path in model_path.rglob("*"):
                                     if file_path.is_file():
                                         try:
-                                            total_size += file_path.stat().st_size
+                                            size += file_path.stat().st_size
                                         except (OSError, PermissionError):
                                             pass
+                                total_size += size
                             except (OSError, PermissionError):
                                 pass
             except (OSError, PermissionError):
@@ -957,9 +1077,9 @@ def _auto_select_model_for_language(
     backend_unavailable_status = None
 
     def pick_best(entries_map: dict[str, dict], allow_fuzzy: bool) -> Optional[tuple[str, dict]]:
-        # If language is an ISO code, don't allow fuzzy matching
-        if is_iso_code and allow_fuzzy:
-            return None
+        # Never use fuzzy matching for actual model selection
+        # (allow_fuzzy parameter is kept for API compatibility but ignored)
+        allow_fuzzy = False
         
         # If language is an ISO code, only match on ISO codes (not language names)
         # This prevents matching through normalized names which can cause incorrect matches
@@ -1006,11 +1126,22 @@ def _auto_select_model_for_language(
                     # Get the normalized ISO-1 code (or ISO-3 if no ISO-1)
                     normalized_entry_iso = (entry_metadata.get("iso_639_1") or entry_metadata.get("iso_639_3") or corrected_iso).lower()
                     
-                    # Only match if the normalized ISO code matches
+                    # Check if normalized ISO codes match (exact match)
                     if normalized_entry_iso == lang_lower:
                         matches.append((backend, model_name, entry))
+                    # Also check if both codes normalize to the same language (handles swh vs swa)
+                    elif corrected_iso and lang_lower:
+                        from .language_mapping import normalize_language_code
+                        entry_iso1, entry_iso2, entry_iso3 = normalize_language_code(corrected_iso)
+                        entry_normalized = {entry_iso1, entry_iso2, entry_iso3} - {None}
+                        lang_iso1, lang_iso2, lang_iso3 = normalize_language_code(lang_lower)
+                        lang_normalized = {lang_iso1, lang_iso2, lang_iso3} - {None}
+                        # If they share any normalized ISO code, they're the same language
+                        if entry_normalized & lang_normalized:
+                            matches.append((backend, model_name, entry))
         else:
-            matches = _collect_language_matches(entries_map, query, allow_fuzzy=allow_fuzzy)
+            # Never use fuzzy matching for actual model selection
+            matches = _collect_language_matches(entries_map, query, allow_fuzzy=False)
         if not matches:
             return None
         
@@ -1179,16 +1310,14 @@ def _auto_select_model_for_language(
 
     # First try requested backend (if any)
     primary_entries = ensure_entries(search_order, refresh=getattr(args, "refresh_cache", False))
+    # Never use fuzzy matching for actual model selection
     selection = pick_best(primary_entries, allow_fuzzy=False)
-    if not selection and use_fuzzy:
-        selection = pick_best(primary_entries, allow_fuzzy=True)
 
     # If nothing found, try remaining backends
     if not selection and remaining:
         secondary_entries = ensure_entries(remaining, refresh=getattr(args, "refresh_cache", False))
+        # Never use fuzzy matching for actual model selection
         selection = pick_best(secondary_entries, allow_fuzzy=False)
-        if not selection and use_fuzzy:
-            selection = pick_best(secondary_entries, allow_fuzzy=True)
 
     if not selection:
         if backend_locked and requested_backend:
@@ -1275,11 +1404,20 @@ def _auto_select_model_for_language(
                             print(f"[flexipipe] No available models found for language '{language}' (exact ISO code match required).", file=sys.stderr)
                             return backend_type
         
+        # Check if ISO codes match (exact or normalized)
         if entry_iso != lang_lower:
-            if getattr(args, "verbose", False) or getattr(args, "debug", False):
-                print(f"[flexipipe] Rejecting selected model '{chosen_model}' - language_iso mismatch: entry has '{entry_iso}', requested '{lang_lower}'", file=sys.stderr)
-            print(f"[flexipipe] No available models found for language '{language}' (exact ISO code match required).", file=sys.stderr)
-            return backend_type
+            # Check if both codes normalize to the same language (handles swh vs swa)
+            from .language_mapping import normalize_language_code
+            entry_iso1, entry_iso2, entry_iso3 = normalize_language_code(entry_iso) if entry_iso else (None, None, None)
+            entry_normalized = {entry_iso1, entry_iso2, entry_iso3} - {None}
+            lang_iso1, lang_iso2, lang_iso3 = normalize_language_code(lang_lower) if lang_lower else (None, None, None)
+            lang_normalized = {lang_iso1, lang_iso2, lang_iso3} - {None}
+            # If they share any normalized ISO code, they're the same language
+            if not (entry_normalized & lang_normalized):
+                if getattr(args, "verbose", False) or getattr(args, "debug", False):
+                    print(f"[flexipipe] Rejecting selected model '{chosen_model}' - language_iso mismatch: entry has '{entry_iso}', requested '{lang_lower}'", file=sys.stderr)
+                print(f"[flexipipe] No available models found for language '{language}' (exact ISO code match required).", file=sys.stderr)
+                return backend_type
 
     # Prefer ISO code over language name (language names may include incorrect treebank names like "English (EWT)")
     entry_language = (
@@ -1584,6 +1722,7 @@ TASK_CHOICES = (
     "convert",
     "config",
     "info",
+    "install",
     "benchmark",
     "validate",
 )
@@ -2606,6 +2745,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format for --show (text or json)",
     )
     
+    # install ---------------------------------------------------------------
+    install_parser = subparsers.add_parser("install", help="Install optional backend dependencies", parents=[parent_parser])
+    add_logging_args(install_parser)
+    install_parser.add_argument(
+        "backends",
+        nargs="+",
+        metavar="BACKEND",
+        help="Backend(s) to install dependencies for (e.g., spacy, stanza, transformers, all)",
+    )
+    
     # train ---------------------------------------------------------------
     train_parser = subparsers.add_parser("train", help="Train a model from training data", parents=[parent_parser])
     add_logging_args(train_parser)
@@ -3288,7 +3437,8 @@ def _parse_classla_model_spec(
                 # Format: lang-type (e.g., mk-standard, sr-nonstandard)
                 final_language = lang_part
                 final_type = type_part
-                final_model_name = None
+                # Preserve the original model_name so the backend can use it if needed
+                final_model_name = model_name
                 return (final_language, final_package, final_model_name, final_type)
             elif len(lang_part) <= 3:
                 # Format: lang-something (might be lang-package, treat as lang)
@@ -3703,6 +3853,57 @@ def run_tag(args: argparse.Namespace) -> int:
             print("[flexipipe] Error: --example cannot be combined with --data.", file=sys.stderr)
             return 1
         language = getattr(args, "language", None)
+        
+        # If language is not set, try to extract it from the model name
+        if not language:
+            model_name = getattr(args, "model", None)
+            backend_type = getattr(args, "backend", None)
+            
+            if model_name and backend_type:
+                backend_lower = backend_type.lower()
+                
+                # For ClassLA, model names are like "bg-standard" or "sr-nonstandard"
+                # Extract both language and type from the model name
+                if backend_lower == "classla":
+                    if "-" in model_name:
+                        parts = model_name.split("-", 1)
+                        if len(parts) == 2:
+                            lang_part, type_part = parts
+                            if len(lang_part) <= 3:  # Valid language code
+                                if type_part in ("standard", "nonstandard"):
+                                    language = lang_part
+                                    args.language = language
+                                    # Set classla_type if not already set
+                                    if not hasattr(args, "classla_type") or not getattr(args, "classla_type", None):
+                                        args.classla_type = type_part
+                                    if args.verbose or args.debug:
+                                        print(f"[flexipipe] Extracted language '{language}' and type '{type_part}' from ClassLA model '{model_name}'", file=sys.stderr)
+                                elif len(lang_part) <= 3:
+                                    # Format: lang-something (might be lang-package, treat as lang only)
+                                    language = lang_part
+                                    args.language = language
+                                    if args.verbose or args.debug:
+                                        print(f"[flexipipe] Extracted language '{language}' from ClassLA model '{model_name}'", file=sys.stderr)
+                
+                # For other backends, try to look up language from model catalog
+                elif model_name:
+                    try:
+                        from .model_catalog import build_unified_catalog
+                        catalog = build_unified_catalog(use_cache=True, refresh_cache=False, verbose=False)
+                        # Look for model in catalog
+                        for entry in catalog.values():
+                            if (entry.get("backend", "").lower() == backend_lower and 
+                                entry.get("model", "").lower() == model_name.lower()):
+                                model_lang = entry.get("language_iso")
+                                if model_lang:
+                                    language = model_lang
+                                    args.language = language
+                                    if args.verbose or args.debug:
+                                        print(f"[flexipipe] Extracted language '{language}' from model '{model_name}' in catalog", file=sys.stderr)
+                                    break
+                    except Exception:
+                        pass  # If catalog lookup fails, continue to error
+        
         if not language:
             print("[flexipipe] Error: --example requires --language to be specified.", file=sys.stderr)
             return 1
@@ -3721,6 +3922,53 @@ def run_tag(args: argparse.Namespace) -> int:
     if inline_data_text and unicode_normalize != "none":
         inline_data_text = normalize_unicode(inline_data_text, unicode_normalize) or ""
     
+    # Try to extract language from model name before falling back to ALI
+    if not getattr(args, "language", None):
+        model_name = getattr(args, "model", None)
+        backend_type_for_extraction = getattr(args, "backend", None) or backend_type
+        
+        if model_name and backend_type_for_extraction:
+            backend_lower = backend_type_for_extraction.lower()
+            
+            # For ClassLA, model names are like "bg-standard" or "sr-nonstandard"
+            # Extract both language and type from the model name
+            if backend_lower == "classla":
+                if "-" in model_name:
+                    parts = model_name.split("-", 1)
+                    if len(parts) == 2:
+                        lang_part, type_part = parts
+                        if len(lang_part) <= 3:  # Valid language code
+                            if type_part in ("standard", "nonstandard"):
+                                args.language = lang_part
+                                # Set classla_type if not already set
+                                if not hasattr(args, "classla_type") or not getattr(args, "classla_type", None):
+                                    args.classla_type = type_part
+                                if args.verbose or args.debug:
+                                    print(f"[flexipipe] Extracted language '{lang_part}' and type '{type_part}' from ClassLA model '{model_name}'", file=sys.stderr)
+                            elif len(lang_part) <= 3:
+                                # Format: lang-something (might be lang-package, treat as lang only)
+                                args.language = lang_part
+                                if args.verbose or args.debug:
+                                    print(f"[flexipipe] Extracted language '{lang_part}' from ClassLA model '{model_name}'", file=sys.stderr)
+            
+            # For other backends, try to look up language from model catalog
+            elif model_name:
+                try:
+                    from .model_catalog import build_unified_catalog
+                    catalog = build_unified_catalog(use_cache=True, refresh_cache=False, verbose=False)
+                    # Look for model in catalog
+                    for entry in catalog.values():
+                        if (entry.get("backend", "").lower() == backend_lower and 
+                            entry.get("model", "").lower() == model_name.lower()):
+                            model_lang = entry.get("language_iso")
+                            if model_lang:
+                                args.language = model_lang
+                                if args.verbose or args.debug:
+                                    print(f"[flexipipe] Extracted language '{model_lang}' from model '{model_name}' in catalog", file=sys.stderr)
+                                break
+                except Exception:
+                    pass  # If catalog lookup fails, continue to ALI
+    
     # Try language detection early if we have inline data and no language specified
     if inline_data_text and not getattr(args, "language", None):
         detection_result = _maybe_detect_language(args, inline_data_text)
@@ -3729,9 +3977,30 @@ def run_tag(args: argparse.Namespace) -> int:
             args.backend = backend_type
             auto_selected = True
     
+    # For stdin input, read early to extract language from CoNLL-U (before model check)
+    # This allows chaining: flexipipe ... | flexipipe ...
+    read_from_stdin_early = (args.input == "-" or (args.input is None and not sys.stdin.isatty())) and not inline_data_text
+    stdin_content_early = None
+    if read_from_stdin_early and not getattr(args, "language", None):
+        # Read stdin content to extract language from CoNLL-U comments
+        stdin_content_early = sys.stdin.read()
+        # Look for # language = ... in the content
+        for line in stdin_content_early.split('\n'):
+            if line.strip().startswith('#') and 'language' in line.lower() and '=' in line:
+                match = re.match(r'#\s*language\s*=\s*(.+)', line, re.IGNORECASE)
+                if match:
+                    lang_from_input = match.group(1).strip()
+                    if lang_from_input:
+                        args.language = lang_from_input
+                        if args.verbose or args.debug:
+                            print(f"[flexipipe] Using language from input CoNLL-U: {lang_from_input}", file=sys.stderr)
+                        break
+    
     # If no model was selected for a locked/explicit backend, try auto-selection once
+    # But skip if backend was explicitly set - let the backend factory handle model selection from language
     model_name = getattr(args, "model", None)
-    if backend_type and not model_name:
+    backend_explicit = getattr(args, "_backend_explicit", False)
+    if backend_type and not model_name and not backend_explicit:
         if not auto_selected:
             backend_type = _auto_select_model_for_language(args, backend_type)
             args.backend = backend_type
@@ -3750,7 +4019,14 @@ def run_tag(args: argparse.Namespace) -> int:
             else:
                 lang_display = getattr(args, "language", None)
                 if not lang_display:
-                    print("[flexipipe] Unable to automatically detect the language and no language was specified. Provide --language to specify the language explicitly.", file=sys.stderr)
+                    # Check if we're reading from stdin (chaining scenario)
+                    is_stdin = args.input == "-" or (args.input is None and not sys.stdin.isatty())
+                    if is_stdin:
+                        print("[flexipipe] Unable to automatically detect the language and no language was specified.", file=sys.stderr)
+                        print("[flexipipe] When chaining commands, ensure the first command outputs language in CoNLL-U comments (# language = ...).", file=sys.stderr)
+                        print("[flexipipe] Alternatively, provide --language to specify the language explicitly.", file=sys.stderr)
+                    else:
+                        print("[flexipipe] Unable to automatically detect the language and no language was specified. Provide --language to specify the language explicitly.", file=sys.stderr)
                 else:
                     print(f"[flexipipe] No available models found for language '{lang_display}'.", file=sys.stderr)
             return 1
@@ -3772,19 +4048,20 @@ def run_tag(args: argparse.Namespace) -> int:
             print("Error: No input specified. Provide --input <file> or pipe data to STDIN.", file=sys.stderr)
             return 1
     
+    # Handle stdin (reuse content if already read for language extraction)
+    read_from_stdin = (args.input == "-") and not inline_data_text
+    stdin_content = stdin_content_early if stdin_content_early is not None else None
+    
     input_format = _normalize_format_name(args.input_format)
     if inline_data_text:
         input_format = "raw"
-    
-    # Handle stdin
-    read_from_stdin = (args.input == "-") and not inline_data_text
-    stdin_content = None
     
     if input_format == "auto" and not inline_data_text:
         if read_from_stdin:
             # For stdin, we need to read the content first to detect format
             # But we can't rewind stdin, so we'll read it all and use it
-            stdin_content = sys.stdin.read()
+            if stdin_content is None:
+                stdin_content = sys.stdin.read()
             # Create a temporary approach: try to detect from content
             sample = stdin_content[:4096] if len(stdin_content) > 4096 else stdin_content
             stripped = sample.lstrip()
@@ -4531,12 +4808,24 @@ def run_tag(args: argparse.Namespace) -> int:
                             model_path=model_path_arg,
                             **backend_kwargs_final,
                         )
-                    except (ImportError, RuntimeError) as exc:
+                    except (ImportError, RuntimeError, ValueError) as exc:
+                        # Check if this is a JSON parsing error (from corrupted cache files)
+                        error_msg = str(exc)
+                        if "Expecting value" in error_msg or "JSONDecodeError" in error_msg:
+                            if args.debug:
+                                import traceback
+                                print("[flexipipe] Full traceback for JSON error:", file=sys.stderr)
+                                traceback.print_exc(file=sys.stderr)
+                            print(
+                                "[flexipipe] Error: Corrupted JSON file detected. "
+                                "Try running with --refresh-cache or delete ~/.flexipipe/cache/ and ~/.flexipipe/models/examples/",
+                                file=sys.stderr
+                            )
+                            return 1
                         # Backend not available (missing module) - try to find an alternative
                         backend_locked = bool(getattr(args, "_backend_explicit", False))
                         if not backend_locked:
                             # Only fallback if backend wasn't explicitly requested
-                            error_msg = str(exc)
                             if "requires the" in error_msg and "module" in error_msg:
                                 # Missing module - try alternative backend
                                 excluded_backends.add(backend_type_lower)
@@ -4561,6 +4850,18 @@ def run_tag(args: argparse.Namespace) -> int:
                         raise
                     except (ValueError, FileNotFoundError, RuntimeError) as e:
                         error_msg = str(e)
+                        # Check if this is a JSON parsing error (from corrupted cache files)
+                        if "Expecting value" in error_msg or "JSONDecodeError" in error_msg:
+                            if args.debug:
+                                import traceback
+                                print("[flexipipe] Full traceback:", file=sys.stderr)
+                                traceback.print_exc(file=sys.stderr)
+                            print(
+                                "[flexipipe] Error: Corrupted JSON file detected. "
+                                "Try running with --refresh-cache or delete ~/.flexipipe/cache/ and ~/.flexipipe/models/examples/",
+                                file=sys.stderr
+                            )
+                            return 1
                         # Check if language detection was attempted and failed
                         if detection_attempted and detection_result is None and not getattr(args, "language", None):
                             # Language detection failed - enhance the error message
@@ -4655,14 +4956,22 @@ def run_tag(args: argparse.Namespace) -> int:
             display_backend = backend_type_lower.upper()
             backend_descriptor = getattr(neural_backend, "model_descriptor", None)
             if backend_type_lower == "spacy":
-                if model_name and Path(model_name).exists():
-                    model_display = Path(model_name).name
-                elif model_name:
-                    model_display = model_name
+                # Get the actual model name from the backend
+                spacy_model_name = getattr(neural_backend, "_model_name", None) or getattr(neural_backend, "_auto_model", None) or model_name
+                if spacy_model_name and Path(spacy_model_name).exists():
+                    model_display = Path(spacy_model_name).name
+                elif spacy_model_name:
+                    model_display = spacy_model_name
                 elif language:
                     model_display = f"{language} (blank)"
                 else:
                     model_display = backend_descriptor or "unknown"
+                model_str = f"{display_backend}: {model_display}"
+                # Also set model information in document meta for CoNLL-U output
+                if spacy_model_name and "_file_level_attrs" not in result.document.meta:
+                    result.document.meta["_file_level_attrs"] = {}
+                if spacy_model_name:
+                    result.document.meta["_file_level_attrs"]["spacy_model"] = spacy_model_name
             elif backend_type_lower == "nametag":
                 # For NameTag, if a specific model/language is set, show it; otherwise just show the version
                 backend_model = getattr(neural_backend, "model", None)
@@ -4760,6 +5069,12 @@ def run_tag(args: argparse.Namespace) -> int:
 
     output_entry = io_registry.get_output(output_format)
     if output_entry:
+        # Ensure language is preserved in result document (for chaining)
+        if getattr(args, "language", None) and "language" not in result.document.meta:
+            result.document.meta["language"] = args.language
+        elif "language" in doc.meta and "language" not in result.document.meta:
+            # Copy language from original document if not already in result
+            result.document.meta["language"] = doc.meta["language"]
         # Normalize output document before serialization
         if output_unicode_normalize != "none":
             if args.debug:
@@ -5308,6 +5623,18 @@ def run_train(args: argparse.Namespace) -> int:
                     print(f"[flexipipe] tag attribute: {chosen_attr} ({note})")
             except Exception:
                 pass
+        # Invalidate unified catalog cache so the new model appears immediately
+        from .model_catalog import invalidate_unified_catalog_cache
+        invalidate_unified_catalog_cache()
+        # Also invalidate flexitag's local cache
+        from .model_storage import get_cache_dir
+        cache_dir = get_cache_dir()
+        flexitag_cache = cache_dir / "flexitag:local.json"
+        try:
+            if flexitag_cache.exists():
+                flexitag_cache.unlink()
+        except (OSError, PermissionError):
+            pass
         _cleanup_nlpform_paths()
         return 0
     
@@ -5483,9 +5810,22 @@ def run_train(args: argparse.Namespace) -> int:
                 model_name=args.name,
                 language=args.language,
                 verbose=args.verbose or args.debug,
+                debug=args.debug,
                 unicode_normalization=unicode_normalize,
             )
             print(f"[flexipipe] trained {backend_type} model at {model_path}")
+            # Invalidate unified catalog cache so the new model appears immediately
+            from .model_catalog import invalidate_unified_catalog_cache
+            invalidate_unified_catalog_cache()
+            # Also invalidate backend-specific cache
+            from .model_storage import get_cache_dir
+            cache_dir = get_cache_dir()
+            backend_cache = cache_dir / f"{backend_type}:local.json"
+            try:
+                if backend_cache.exists():
+                    backend_cache.unlink()
+            except (OSError, PermissionError):
+                pass  # Best effort
             _cleanup_nlpform_paths()
             return 0
         except NotImplementedError as e:
@@ -5671,6 +6011,7 @@ def run_train(args: argparse.Namespace) -> int:
                 output_dir=output_dir,
                 dev_data=dev_path,
                 verbose=args.verbose or args.debug,
+                debug=args.debug,
                 **train_kwargs,
             )
             print(f"[flexipipe] trained {backend_type} model at {model_path}")
@@ -6240,6 +6581,9 @@ def main(argv: list[str] | None = None) -> int:
         from .benchmark import run_cli as run_benchmark_cli
         run_benchmark_cli(args)
         return 0
+    if args.task == "install":
+        from .install import run_install
+        return run_install(args)
 
     parser.error(f"Unknown task '{args.task}'. Supported tasks: {', '.join(TASK_CHOICES)}")
     return 1

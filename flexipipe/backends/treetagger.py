@@ -502,6 +502,7 @@ BACKEND_SPEC = BackendSpec(
     is_rest=False,
     url="https://www.cis.uni-muenchen.de/~schmid/tools/TreeTagger/",
     model_registry_url=DEFAULT_TREETAGGER_REGISTRY_URL,
+    install_instructions="treetagger requires the TreeTagger CLI binary to be installed separately (see https://www.cis.uni-muenchen.de/~schmid/tools/TreeTagger/)",
 )
 
 

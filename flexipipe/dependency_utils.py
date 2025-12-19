@@ -13,14 +13,77 @@ def _module_available(module_name: str) -> bool:
 
 
 def _run_pip_install(extra_name: str) -> bool:
-    cmd = [sys.executable, "-m", "pip", "install", f"flexipipe[{extra_name}]"]
+    """Install optional dependencies for a backend extra.
+    
+    If flexipipe is installed from PyPI, installs flexipipe[extra_name].
+    If flexipipe is installed in editable mode or run from source, installs dependencies directly.
+    """
+    # Hardcoded mapping of extra names to their dependencies (matches setup.py)
+    EXTRA_DEPENDENCIES = {
+        "spacy": ["spacy>=3.7.0"],
+        "stanza": ["stanza>=1.8.0"],
+        "classla": ["classla>=2.1.0"],
+        "flair": ["flair>=0.13.0", "torch>=2.6.0"],
+        "transformers": [
+            "torch>=2.6.0",
+            "transformers>=4.20.0",
+            "datasets>=2.0.0",
+            "scikit-learn>=1.0.0",
+            "accelerate>=0.20.0",
+        ],
+        "nametag": ["requests>=2.31.0"],
+        "udpipe": ["requests>=2.31.0"],
+        "udmorph": ["requests>=2.31.0"],
+    }
+    
+    deps = EXTRA_DEPENDENCIES.get(extra_name)
+    if not deps:
+        print(f"[flexipipe] Error: Unknown extra '{extra_name}'", file=sys.stderr)
+        return False
+    
+    # Check if flexipipe is installed from PyPI (not editable/dev mode)
+    # If it's an editable install or run from source, install dependencies directly
+    use_extra_syntax = False
+    try:
+        import pkg_resources
+        dist = pkg_resources.get_distribution("flexipipe")
+        # Check if it's installed in editable mode
+        # Editable installs typically have the location pointing to the source directory
+        # or have .egg-link files. For simplicity, check if location contains common dev paths
+        location = dist.location
+        if location and (
+            "site-packages" in location or 
+            "dist-packages" in location or
+            location.endswith(".egg")
+        ):
+            # Likely installed from PyPI or as a regular package - try extra syntax
+            use_extra_syntax = True
+    except (pkg_resources.DistributionNotFound, pkg_resources.RequirementParseError, ImportError, AttributeError):
+        # flexipipe is not installed as a package - install dependencies directly
+        pass
+    
+    if use_extra_syntax:
+        # Try installing via flexipipe[extra] syntax (for PyPI installations)
+        cmd = [sys.executable, "-m", "pip", "install", f"flexipipe[{extra_name}]"]
+        print(f"[flexipipe] Installing optional dependency via: {' '.join(cmd)}")
+        try:
+            subprocess.check_call(cmd)
+            importlib.invalidate_caches()
+            return True
+        except subprocess.CalledProcessError:
+            # Extra syntax failed - fall back to direct dependencies
+            # (might be editable install or flexipipe not on PyPI)
+            pass
+    
+    # Install dependencies directly (works for editable installs, source runs, and as fallback)
+    cmd = [sys.executable, "-m", "pip", "install"] + deps
     print(f"[flexipipe] Installing optional dependency via: {' '.join(cmd)}")
     try:
         subprocess.check_call(cmd)
         importlib.invalidate_caches()
         return True
     except subprocess.CalledProcessError as exc:
-        print(f"[flexipipe] Failed to install flexipipe[{extra_name}]: {exc}", file=sys.stderr)
+        print(f"[flexipipe] Failed to install dependencies for '{extra_name}': {exc}", file=sys.stderr)
         return False
 
 

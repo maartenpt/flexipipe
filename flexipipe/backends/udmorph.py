@@ -16,6 +16,7 @@ from ..language_utils import (
     cache_entries_standardized,
 )
 from ..model_storage import read_model_cache_entry, write_model_cache_entry
+from ..model_registry import get_remote_models_for_backend
 from ..neural_backend import BackendManager, NeuralResult
 
 try:
@@ -43,6 +44,9 @@ def _document_to_plain_text(document: Document) -> str:
     return "\n".join(filter(None, sentences)) or document.id or ""
 
 
+BASE_UDMORPH_ROOT = "https://lindat.mff.cuni.cz/services/teitok-live/udmorph/"
+
+
 def list_udmorph_models(url: str = "https://lindat.mff.cuni.cz/services/teitok-live/udmorph/index.php?action=tag&act=list") -> Dict:
     """
     Fetch the list of available UDMorph models from the service.
@@ -68,6 +72,94 @@ def get_udmorph_model_entries(
     cache_ttl_seconds: int = MODEL_CACHE_TTL_SECONDS,
     verbose: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
+    # 1) Prefer curated registry from flexipipe-models (registries/udmorph.json)
+    #    so that we can maintain additional metadata (axes, normalization, etc.)
+    curated_entries: Dict[str, Dict[str, Any]] = {}
+    try:
+        remote_models = get_remote_models_for_backend(
+            "udmorph",
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+            verbose=verbose,
+        )
+        for model_entry in remote_models:
+            model_key = model_entry.get("model") or model_entry.get("key")
+            if not model_key:
+                continue
+            language_code = (
+                model_entry.get(LANGUAGE_FIELD_ISO)
+                or model_entry.get("language_iso")
+                or model_entry.get("iso")
+            )
+            language_name = (
+                model_entry.get(LANGUAGE_FIELD_NAME)
+                or model_entry.get("language_name")
+                or model_entry.get("name")
+            )
+            features = model_entry.get("features") or model_entry.get("feats") or "unknown"
+            name = language_name or model_key
+
+            entry = build_model_entry(
+                "udmorph",
+                model_key,
+                language_code=language_code,
+                language_name=language_name,
+                features=features,
+                name=name,
+            )
+
+            # Endpoint URL (may be stored as endpoint_url, url, or src)
+            endpoint_override = (
+                model_entry.get("endpoint_url")
+                or model_entry.get("url")
+                or model_entry.get("src")
+            )
+            if endpoint_override:
+                if not endpoint_override.startswith(("http://", "https://")):
+                    endpoint_override = urllib.parse.urljoin(
+                        BASE_UDMORPH_ROOT, endpoint_override
+                    )
+                # Parse URL and remove query parameters that should be POST data
+                # (like &model=... and &text={text} which are templates)
+                parsed = urllib.parse.urlparse(endpoint_override)
+                # Keep only action-related query params, remove model/text params
+                query_params = urllib.parse.parse_qs(parsed.query)
+                # Remove model and text from query (these are sent as POST data)
+                query_params.pop("model", None)
+                query_params.pop("text", None)
+                # Rebuild query string with remaining params
+                clean_query = urllib.parse.urlencode(query_params, doseq=True)
+                # Reconstruct URL without model/text params
+                clean_endpoint = urllib.parse.urlunparse((
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    clean_query,
+                    parsed.fragment
+                ))
+                entry["endpoint_url"] = clean_endpoint
+
+            # Preserve additional metadata (e.g., unicode_normalization, post_spec, source, etc.)
+            for extra_key in (
+                "unicode_normalization",
+                "post_spec",
+                "source",
+                "backend_version",
+                "description",
+            ):
+                if extra_key in model_entry:
+                    entry[extra_key] = model_entry[extra_key]
+
+            curated_entries[model_key] = entry
+    except Exception:
+        # If anything goes wrong with the curated registry, fall back to live list
+        curated_entries = {}
+
+    if curated_entries:
+        return curated_entries
+
+    # 2) Fallback to live list from the UDMorph service (previous behaviour)
     if url is None:
         url = "https://lindat.mff.cuni.cz/services/teitok-live/udmorph/index.php?action=tag&act=list"
     elif "?action=tag" in url:
@@ -116,7 +208,33 @@ def get_udmorph_model_entries(
         )
         endpoint_override = model_info.get("src") or model_info.get("url")
         if endpoint_override:
-            entry["endpoint_url"] = endpoint_override
+            # Older registry entries sometimes store only a relative path like:
+            #   "index.php?action=tag&act=tag&model=udpipe:kab&text={text}"
+            # Normalize these to the public UDMorph root so the URL is usable.
+            if not endpoint_override.startswith(("http://", "https://")):
+                endpoint_override = urllib.parse.urljoin(
+                    BASE_UDMORPH_ROOT, endpoint_override
+                )
+            # Parse URL and remove query parameters that should be POST data
+            # (like &model=... and &text={text} which are templates)
+            parsed = urllib.parse.urlparse(endpoint_override)
+            # Keep only action-related query params, remove model/text params
+            query_params = urllib.parse.parse_qs(parsed.query)
+            # Remove model and text from query (these are sent as POST data)
+            query_params.pop("model", None)
+            query_params.pop("text", None)
+            # Rebuild query string with remaining params
+            clean_query = urllib.parse.urlencode(query_params, doseq=True)
+            # Reconstruct URL without model/text params
+            clean_endpoint = urllib.parse.urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                clean_query,
+                parsed.fragment
+            ))
+            entry["endpoint_url"] = clean_endpoint
         entry["tagger"] = model_info.get("tagger")
         entry["post_spec"] = model_info.get("post", "")
         prepared_models[model_key] = entry
@@ -553,5 +671,6 @@ BACKEND_SPEC = BackendSpec(
     supports_training=False,
     is_rest=True,
     url="https://lindat.mff.cuni.cz/services/udmorph",
+    install_instructions="udmorph is a REST service that requires no installation",
 )
 

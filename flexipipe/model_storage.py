@@ -433,7 +433,17 @@ def _load_model_cache() -> dict:
     if cache_file.exists():
         try:
             with open(cache_file, "r", encoding="utf-8") as handle:
-                return json.load(handle)
+                content = handle.read().strip()
+                if not content:
+                    # Empty file - return empty dict
+                    return {}
+                return json.loads(content)
+        except (json.JSONDecodeError, ValueError) as e:
+            # Corrupted JSON file - log and return empty dict
+            import sys
+            if sys.stderr:
+                print(f"[flexipipe] Warning: Corrupted cache file {cache_file}: {e}. Rebuilding cache.", file=sys.stderr)
+            return {}
         except Exception:
             return {}
     return {}
@@ -502,7 +512,17 @@ def read_backend_registry_file(backend: str) -> Optional[dict]:
         return None
     try:
         with registry_path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
+            content = handle.read().strip()
+            if not content:
+                # Empty file - return None
+                return None
+            return json.loads(content)
+    except (json.JSONDecodeError, ValueError) as e:
+        # Corrupted JSON file - log and return None
+        import sys
+        if sys.stderr:
+            print(f"[flexipipe] Warning: Corrupted registry file {registry_path}: {e}. Rebuilding registry.", file=sys.stderr)
+        return None
     except Exception:
         return None
 
@@ -642,13 +662,34 @@ def is_model_installed(backend: str, model_name: str) -> bool:
         # SpaCy models are directories with meta.json
         model_path = backend_dir / model_name
         if model_path.exists() and model_path.is_dir() and (model_path / "meta.json").exists():
-            return True
+            # Verify the model can actually be loaded (not just meta.json exists)
+            try:
+                import spacy  # type: ignore
+                # Try to load the model to verify it's actually usable
+                try:
+                    nlp = spacy.load(model_name)
+                    if nlp is not None:
+                        return True
+                except Exception:
+                    # Model directory exists but model can't be loaded - not really installed
+                    return False
+            except ImportError:
+                # If spacy is not available, just check for meta.json
+                return True
         # Also check standard spaCy location
         try:
             import spacy.util  # type: ignore
             try:
-                spacy.util.get_package_path(model_name)
-                return True
+                package_path = spacy.util.get_package_path(model_name)
+                if package_path and Path(package_path).exists():
+                    # Verify it can actually be loaded
+                    try:
+                        import spacy  # type: ignore
+                        nlp = spacy.load(model_name)
+                        if nlp is not None:
+                            return True
+                    except Exception:
+                        return False
             except (OSError, IOError, ImportError):
                 pass
         except ImportError:
@@ -698,6 +739,9 @@ def is_model_installed(backend: str, model_name: str) -> bool:
     elif backend == "classla":
         # ClassLA models: lang/processor/variant.pt
         # Model name format: lang-type (e.g., bg-standard, mk-standard)
+        # For a model to be considered installed, we need:
+        # - At least one processor directory with .pt files
+        # - If pos processor exists, pretrain must also exist (POS tagger requires pretrain vectors)
         # Files are named standard.pt or nonstandard.pt (not package.pt)
         if "-" in model_name:
             lang_code, variant = model_name.split("-", 1)
@@ -706,11 +750,28 @@ def is_model_installed(backend: str, model_name: str) -> bool:
                 # Check for processor directories (e.g., pos, tokenize, lemma, depparse)
                 # Look for variant.pt files (e.g., standard.pt, nonstandard.pt)
                 variant_file = f"{variant}.pt"
+                has_pos = False
+                has_pretrain = False
+                has_any_processor = False
+                
                 for processor_dir in lang_dir.iterdir():
                     if processor_dir.is_dir():
                         pt_file = processor_dir / variant_file
                         if pt_file.exists():
-                            return True
+                            has_any_processor = True
+                            if processor_dir.name == "pos":
+                                has_pos = True
+                            elif processor_dir.name == "pretrain":
+                                has_pretrain = True
+                
+                # Model is installed if:
+                # 1. Has at least one processor with .pt files
+                # 2. If pos exists, pretrain must also exist (POS tagger requires pretrain vectors)
+                if has_any_processor:
+                    if has_pos and not has_pretrain:
+                        # Incomplete model - has POS but missing pretrain
+                        return False
+                    return True
     elif backend == "udpipe1":
         # UDPipe CLI models: <model>.udpipe in backend dir
         model_file = backend_dir / f"{model_name}.udpipe"

@@ -1,6 +1,6 @@
-# Flexipipe
+# flexiPipe
 
-Flexipipe is a modular NLP pipeline for Universal Dependencies data that glues
+flexiPipe is a modular NLP pipeline for Universal Dependencies data that glues
 rule-based components, the legacy flexitag tagger, and multiple neural
 backends (SpaCy, Stanza, Flair, UDPipe REST, and
 UDMorph REST).  It can ingest raw text, CoNLL-U, and TEITOK XML, preserves
@@ -114,7 +114,7 @@ This will skip the wrapper script installation prompt and install silently with 
 
 ### Optional Extras Behaviour
 
-Flexipipe can install extras automatically the first time you use a backend:
+flexiPipe can install extras automatically the first time you use a backend:
 
 ```bash
 python -m flexipipe config --set-auto-install-extras true
@@ -181,7 +181,7 @@ Important switches:
 | --- | --- |
 | `--backend` | Selects backend (`flexitag`, `spacy`, `stanza`, `flair`, `udpipe`, `udmorph`, `nametag`) |
 | `--model` / `--language` | Backend-specific model hint. SpaCy resolves installed/downloadable names. |
-| `--language English` (SpaCy) | Without `--model`, Flexipipe auto-uses SpaCy’s default core model (e.g., `en_core_web_sm`, if installed). |
+| `--language English` (SpaCy) | Without `--model`, flexiPipe auto-uses SpaCy’s default core model (e.g., `en_core_web_sm`, if installed). |
 | `--download-model` | Auto-fetch SpaCy/Stanza/Flair models when missing. |
 | `--output-format` | `tei`, `conllu`, or `json`. Falls back to configuration default. |
 | `--create-implicit-mwt` | Rebuilds implicit MWT ranges in output (default configurable). |
@@ -267,7 +267,7 @@ python -m flexipipe config --show
 | `nametag` | Raw + tokenized | REST NER service, supports 21 languages, NameTag 3 (default), curl debug output | Provide `--nametag-model` or `--language`, optional `--nametag-version` (1/2/3), `--nametag-param KEY=VALUE`. |
 ### HuggingFace Transformers backend
 
-The new `transformers` backend plugs Flexipipe directly into HuggingFace token-classification
+The new `transformers` backend plugs flexiPipe directly into HuggingFace token-classification
 models (POS tagging or NER). Models are described in the transformers registry with extra
 metadata—tasks, base model, training corpora, and training techniques—so `python -m flexipipe info models --backend transformers`
 shows not just names but what each model actually does.

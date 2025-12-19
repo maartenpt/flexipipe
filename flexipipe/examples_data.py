@@ -28,9 +28,16 @@ def _download_examples_file(destination: Path) -> bool:
         destination.parent.mkdir(parents=True, exist_ok=True)
         with urllib.request.urlopen(REMOTE_URL) as response:
             data = response.read().decode("utf-8")
+        if not data.strip():
+            # Empty response - don't write empty file
+            return False
         destination.write_text(data, encoding="utf-8")
         return True
-    except Exception:
+    except Exception as e:
+        # Log the error for debugging
+        import sys
+        if sys.stderr:
+            print(f"[flexipipe] Warning: Failed to download examples file: {e}", file=sys.stderr)
         return False
 
 
@@ -47,7 +54,18 @@ def load_examples(refresh: bool = False) -> Dict[str, Dict[str, str]]:
                 )
 
     with examples_file.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+        content = f.read().strip()
+        if not content:
+            raise FileNotFoundError(
+                f"Examples file {examples_file} is empty. Try deleting it and running again."
+            )
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Corrupted examples file {examples_file}: {e}. "
+                f"Try deleting it and running again to re-download."
+            ) from e
 
     normalized = {}
     for lang_code, entry in data.items():

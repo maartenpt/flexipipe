@@ -54,6 +54,125 @@ class UDPipeCLIBackend(BackendManager):
     )
 
     @staticmethod
+    @staticmethod
+    def _validate_and_fix_conllu_for_training(conllu_path: Path, verbose: bool = False, debug: bool = False) -> Path:
+        """
+        Validate and filter CoNLL-U file for UDPipe training.
+        
+        Removes sentences with missing deprel values (unless the corpus has no dependencies at all).
+        This prevents noise in the model from invalid dependency structures.
+        
+        Returns the path to the (possibly filtered) CoNLL-U file.
+        If filtering was needed, returns a temporary file path; otherwise returns the original.
+        """
+        from ..file_utils import read_text_file
+        
+        lines = read_text_file(conllu_path).split('\n')
+        
+        # First pass: check if corpus has any dependencies at all
+        corpus_has_dependencies = False
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            parts = line.split('\t')
+            if len(parts) < 8:
+                continue
+            token_id = parts[0]
+            if "-" in token_id or "." in token_id:
+                continue  # Skip MWTs and empty nodes
+            deprel = parts[7] if len(parts) > 7 else ""
+            head = parts[6] if len(parts) > 6 else ""
+            if deprel and deprel.strip() and deprel.strip() != "_":
+                corpus_has_dependencies = True
+                break
+            if head and head.strip() and head.strip() != "_" and head.strip() != "0":
+                corpus_has_dependencies = True
+                break
+        
+        # If corpus has no dependencies, keep all sentences
+        if not corpus_has_dependencies:
+            if debug:
+                print(f"[flexipipe] Corpus has no dependency annotations; keeping all sentences.")
+            return conllu_path
+        
+        # Second pass: filter out sentences with missing deprel values
+        filtered_lines = []
+        current_sentence_lines = []
+        discarded_sentences = 0
+        sentence_has_invalid_deprel = False
+        sentence_id = None
+        
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                # End of sentence - check if we should keep it
+                if current_sentence_lines:
+                    if sentence_has_invalid_deprel:
+                        discarded_sentences += 1
+                        if debug and discarded_sentences <= 10:
+                            sent_info = f" (sent_id: {sentence_id})" if sentence_id else ""
+                            print(f"[flexipipe] Discarding sentence{sent_info} with missing deprel values")
+                    else:
+                        filtered_lines.extend(current_sentence_lines)
+                        filtered_lines.append("")  # Preserve blank line
+                current_sentence_lines = []
+                sentence_has_invalid_deprel = False
+                sentence_id = None
+                continue
+            
+            if stripped.startswith('#'):
+                # Comment line - extract sent_id if present
+                if stripped.startswith('# sent_id = '):
+                    sentence_id = stripped.replace('# sent_id = ', '').strip()
+                current_sentence_lines.append(line)
+                continue
+            
+            parts = line.split('\t')
+            if len(parts) < 8:
+                current_sentence_lines.append(line)
+                continue
+            
+            token_id = parts[0]
+            if "-" in token_id or "." in token_id:
+                # MWT or empty node - keep as is (MWTs should not have deprel)
+                current_sentence_lines.append(line)
+                continue
+            
+            # Only check deprel for regular tokens (not MWTs or empty nodes)
+            deprel = parts[7] if len(parts) > 7 else ""
+            # Check if deprel is missing or empty
+            if not deprel or deprel.strip() == "" or deprel.strip() == "_":
+                sentence_has_invalid_deprel = True
+            
+            current_sentence_lines.append(line)
+        
+        # Handle last sentence if file doesn't end with blank line
+        if current_sentence_lines:
+            if sentence_has_invalid_deprel:
+                discarded_sentences += 1
+                if debug and discarded_sentences <= 10:
+                    sent_info = f" (sent_id: {sentence_id})" if sentence_id else ""
+                    print(f"[flexipipe] Discarding sentence{sent_info} with missing deprel values")
+            else:
+                filtered_lines.extend(current_sentence_lines)
+        
+        if discarded_sentences > 0:
+            if verbose or debug:
+                print(f"[flexipipe] Discarded {discarded_sentences} sentence(s) with missing deprel values")
+                if debug and discarded_sentences > 10:
+                    print(f"[flexipipe] ... (showing first 10 above)")
+            
+            # Write filtered content to temporary file
+            import tempfile
+            fixed_file = tempfile.NamedTemporaryFile(mode="w", suffix=".conllu", delete=False, encoding="utf-8")
+            fixed_file.write('\n'.join(filtered_lines))
+            fixed_file.close()
+            return Path(fixed_file.name)
+        else:
+            return conllu_path
+    
+    @staticmethod
     def _detect_annotation_coverage(conllu_path: Path) -> Dict[str, bool]:
         """
         Inspect a CoNLL-U file and detect which annotation columns contain data.
@@ -183,8 +302,9 @@ class UDPipeCLIBackend(BackendManager):
         self._backend_name = "UDPipe CLI"
         self._model_name = self._model.stem
         
-        # Look up model's unicode_normalization from registry
+        # Look up model's metadata from registry (unicode_normalization, supported components)
         self._model_unicode_normalization = None
+        self._model_components = None  # List of supported components: ["tokenizer", "tagger", "parser"]
         try:
             model_entries = get_udpipe1_model_entries(use_cache=True, verbose=False)
             model_entry = model_entries.get(self._model_name)
@@ -192,8 +312,24 @@ class UDPipeCLIBackend(BackendManager):
                 self._model_unicode_normalization = model_entry.get("unicode_normalization")
                 if self._verbose and self._model_unicode_normalization:
                     print(f"[flexipipe] Model '{self._model_name}' expects {self._model_unicode_normalization} normalization")
+                
+                # Parse features string to determine supported components
+                features = model_entry.get("features", "")
+                if features:
+                    features_lower = features.lower()
+                    components = []
+                    if "tokenizer" in features_lower or "tokenize" in features_lower:
+                        components.append("tokenizer")
+                    if "tagger" in features_lower or "tag" in features_lower:
+                        components.append("tagger")
+                    if "parser" in features_lower or "parse" in features_lower:
+                        components.append("parser")
+                    if components:
+                        self._model_components = components
+                        if self._verbose:
+                            print(f"[flexipipe] Model '{self._model_name}' supports: {', '.join(components)}")
         except Exception:
-            # If registry lookup fails, continue without model-specific normalization
+            # If registry lookup fails, continue without model-specific metadata
             pass
     
     def tag(
@@ -252,11 +388,20 @@ class UDPipeCLIBackend(BackendManager):
                 cmd.append("--tokenize")
             # For pre-tokenized input, just omit --tokenize (don't use --no-tokenize)
             
-            # Add components based on what's requested
+            # Add components based on what's requested and what the model supports
             if components is None:
-                # Default: tag and parse
-                cmd.extend(["--tag", "--parse"])
+                # Default: use what the model supports (from registry), or try tag and parse
+                if self._model_components:
+                    # Use only components that the model actually supports
+                    if "tagger" in self._model_components:
+                        cmd.append("--tag")
+                    if "parser" in self._model_components:
+                        cmd.append("--parse")
+                else:
+                    # Fallback: try tag and parse (will retry without parser if it fails)
+                    cmd.extend(["--tag", "--parse"])
             else:
+                # User explicitly requested components - use them (model will error if not available)
                 if "tagger" in components or "tag" in components:
                     cmd.append("--tag")
                 if "parser" in components or "parse" in components:
@@ -337,6 +482,7 @@ class UDPipeCLIBackend(BackendManager):
         language: Optional[str] = None,
         model_name: Optional[str] = None,
         verbose: bool = False,
+        debug: bool = False,
         tokenizer_options: Optional[str] = None,
         tagger_options: Optional[str] = None,
         parser_options: Optional[str] = None,
@@ -493,8 +639,18 @@ class UDPipeCLIBackend(BackendManager):
                         print(f"[flexipipe] Normalized dev data from {Path(dev_data)} to {unicode_normalization}")
         
         try:
+            # Validate and fix training data before training
+            validated_train_path = UDPipeCLIBackend._validate_and_fix_conllu_for_training(train_path, verbose=verbose, debug=debug)
+            train_path_was_fixed = validated_train_path != train_path
+            
+            # If we created a fixed file, we need to clean it up later
+            if train_path_was_fixed and train_data_normalized:
+                # We already created a temp file for normalization, so we can replace it
+                # But we need to track that we created another temp file
+                pass
+            
             # Build UDPipe train command
-            coverage = self._detect_annotation_coverage(train_path)
+            coverage = UDPipeCLIBackend._detect_annotation_coverage(validated_train_path)
             has_tagger_annotations = any(
                 coverage[key] for key in ("lemma", "upos", "xpos", "feats")
             )
@@ -554,13 +710,21 @@ class UDPipeCLIBackend(BackendManager):
                 for opt in parser_opts:
                     cmd.append(f"--parser={opt}")
 
+            # Validate and fix dev data if provided
+            validated_dev_path = None
+            dev_path_was_fixed = False
             if dev_path:
-                cmd.append(f"--heldout={dev_path}")
+                if isinstance(dev_path, Path) and dev_path.is_file():
+                    validated_dev_path = UDPipeCLIBackend._validate_and_fix_conllu_for_training(dev_path, verbose=verbose, debug=debug)
+                    dev_path_was_fixed = validated_dev_path != dev_path
+                else:
+                    validated_dev_path = dev_path
+                cmd.append(f"--heldout={validated_dev_path}")
 
             cmd.extend(
                 [
                     str(model_path),
-                    str(train_path),
+                    str(validated_train_path),
                 ]
             )
             
@@ -629,11 +793,23 @@ class UDPipeCLIBackend(BackendManager):
                 if verbose:
                     print(f"[flexipipe] Warning: Failed to register model in registry: {e}")
             
+            # Invalidate unified catalog cache so the new model appears immediately
+            try:
+                from ..model_catalog import invalidate_unified_catalog_cache
+                invalidate_unified_catalog_cache()
+            except Exception:
+                pass  # Best effort - don't fail training if cache invalidation fails
+            
             return model_path
         finally:
             # Clean up temporary files if we created them
             if train_data_normalized and train_path.exists():
                 train_path.unlink(missing_ok=True)
+            # Clean up validated/fixed files if they're different from the original
+            if 'validated_train_path' in locals() and validated_train_path != train_path and validated_train_path.exists():
+                validated_train_path.unlink(missing_ok=True)
+            if 'validated_dev_path' in locals() and validated_dev_path and dev_path_was_fixed and validated_dev_path.exists():
+                validated_dev_path.unlink(missing_ok=True)
             if dev_data_normalized and dev_path and dev_path.exists():
                 dev_path.unlink(missing_ok=True)
     
@@ -985,4 +1161,5 @@ BACKEND_SPEC = BackendSpec(
     supports_training=True,
     is_rest=False,
     url="https://github.com/ufal/udpipe",
+    install_instructions="udpipe1 requires the UDPipe CLI binary to be installed separately (see https://github.com/ufal/udpipe)",
 )

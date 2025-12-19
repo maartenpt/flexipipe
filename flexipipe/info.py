@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from .backend_registry import get_backend_info, list_models_display, get_model_entries
 from .task_registry import TASK_ALIASES, TASK_DEFAULTS, TASK_DESCRIPTIONS, TASK_MANDATORY
@@ -201,7 +201,8 @@ def list_models(args: argparse.Namespace) -> int:
                 language_filter,
                 preferred_only=False,
                 available_only=False,
-                use_cache=True,  # Always use cache for speed
+                use_cache=not force_refresh,  # Use cache unless refresh is requested
+                refresh_cache=force_refresh,  # Pass refresh flag through
             )
             
             if debug:
@@ -209,11 +210,35 @@ def list_models(args: argparse.Namespace) -> int:
                 print(f"[DEBUG] Unified catalog lookup: {catalog_time:.3f}s ({len(models)} models found)", file=sys.stderr)
             
             if not models:
+                # No exact matches found - suggest similar languages using fuzzy matching (for display only)
+                from .language_utils import resolve_language_query
+                from .__main__ import _suggest_similar_languages
+                query = resolve_language_query(language_filter)
+                try:
+                    from .model_catalog import build_unified_catalog
+                    full_catalog = build_unified_catalog(use_cache=True, refresh_cache=False, verbose=False)
+                    full_entries_by_backend: dict[str, dict] = {}
+                    for entry in full_catalog.values():
+                        backend = entry.get("backend")
+                        model = entry.get("model")
+                        if backend and model:
+                            if backend not in full_entries_by_backend:
+                                full_entries_by_backend[backend] = {}
+                            full_entries_by_backend[backend][model] = entry
+                    suggestions = _suggest_similar_languages(language_filter, full_entries_by_backend, query)
+                except Exception:
+                    suggestions = []
+                
                 output_format = getattr(args, "output_format", "table")
                 if output_format == "json":
-                    print(json.dumps({"language": language_filter, "models": []}, indent=2, ensure_ascii=False), flush=True)
+                    result = {"language": language_filter, "models": []}
+                    if suggestions:
+                        result["suggestions"] = suggestions
+                    print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
                 else:
                     print(f"[flexipipe] No models found for language '{language_filter}'.")
+                    if suggestions:
+                        print(f"[flexipipe] Did you mean: {', '.join(suggestions)}?")
                 if debug:
                     total_time = time.time() - start_time
                     print(f"[DEBUG] Total execution time: {total_time:.3f}s", file=sys.stderr)
@@ -370,96 +395,44 @@ def list_models(args: argparse.Namespace) -> int:
 
     if not backend_type:
         # No backend specified - list all models from all backends
+        # Use unified catalog for fast access (like info languages does)
         if debug:
-            print("[DEBUG] No backend specified - listing models from all backends...", file=sys.stderr)
-            backend_priority_list = _get_language_backend_priority()
-            print(f"[DEBUG] Checking backends: {', '.join([b for b in backend_priority_list if b])}", file=sys.stderr)
+            print("[DEBUG] No backend specified - using unified catalog...", file=sys.stderr)
         
-        output_format = getattr(args, "output_format", "table")
-        from .__main__ import _load_backend_entries
-        backend_priority_list = _get_language_backend_priority()
+        from .model_catalog import build_unified_catalog
         
-        entries_by_backend: dict[str, dict] = {}
-        backend_timings: dict[str, float] = {}
+        catalog = build_unified_catalog(
+            use_cache=not force_refresh,
+            refresh_cache=force_refresh,
+            verbose=debug,
+        )
         
-        for backend in backend_priority_list:
-            if backend is None:
-                continue
-            if debug:
-                backend_start = time.time()
-                print(f"[DEBUG] Checking backend: {backend}...", file=sys.stderr)
-            try:
-                # Optimize: Try to read from cache first (even if expired) to avoid slow operations
-                # This makes listing all models much faster - it should only read JSON files
-                # Skip HTTP requests for REST backends and directory scans for local backends
-                if not force_refresh:
-                    from .model_storage import read_model_cache_entry
-                    backend_info = get_backend_info(backend)
-                    is_rest_backend = backend_info and backend_info.is_rest if backend_info else False
-                    
-                    # Determine cache key based on backend type
-                    if is_rest_backend:
-                        # REST backends use cache keys like "udpipe:{url}" or "udmorph:{url}"
-                        url = getattr(args, "endpoint_url", None)
-                        if backend == "udpipe":
-                            cache_key = f"udpipe:{url or 'https://lindat.mff.cuni.cz/services/udpipe/api/models'}"
-                        elif backend == "udmorph":
-                            cache_key = f"udmorph:{url or 'https://lindat.mff.cuni.cz/services/teitok-live/udmorph/index.php?action=tag&act=list'}"
-                        elif backend == "nametag":
-                            cache_key = f"nametag:{url or 'https://lindat.mff.cuni.cz/services/nametag/api/models'}"
-                        else:
-                            cache_key = f"{backend}:{url or 'default'}"
-                    else:
-                        # Local backends use simple cache keys
-                        if backend == "flexitag":
-                            cache_key = "flexitag:local"
-                        else:
-                            cache_key = backend
-                    
-                    # Check cache with no TTL - use even expired cache to avoid slow operations
-                    cached = read_model_cache_entry(cache_key, max_age_seconds=None)
-                    if cached:
-                        # Use cached data directly - don't call backend function which might be slow
-                        entries_by_backend[backend] = cached
-                        if debug:
-                            backend_time = time.time() - backend_start
-                            backend_timings[backend] = backend_time
-                            print(f"[DEBUG]   {backend}: {backend_time:.3f}s (cached, {len(cached)} models)", file=sys.stderr)
-                        continue
-                    # If no cache, fall through to normal loading (but only if not force_refresh)
-                
-                # Only load normally if cache is missing or force_refresh is True
-                entries = _load_backend_entries(
-                    backend,
-                    args,
-                    use_cache=use_cache,
-                    refresh_cache=force_refresh,
-                    verbose=bool(getattr(args, "verbose", False)),
-                )
-                if entries:  # Only add if we got entries
-                    entries_by_backend[backend] = entries
-                    if debug:
-                        backend_time = time.time() - backend_start
-                        backend_timings[backend] = backend_time
-                        print(f"[DEBUG]   {backend}: {backend_time:.3f}s ({len(entries)} models)", file=sys.stderr)
-            except Exception as exc:  # pragma: no cover - defensive
-                # Skip backends that fail to load
-                if debug:
-                    backend_time = time.time() - backend_start
-                    print(f"[DEBUG]   {backend}: {backend_time:.3f}s (FAILED: {exc})", file=sys.stderr)
-                # Only show in debug/verbose mode
-                if output_format != "json" and (getattr(args, "debug", False) or getattr(args, "verbose", False)):
-                    print(f"[flexipipe] Failed to load models for backend '{backend}': {exc}")
-                continue
-        
-        if not entries_by_backend:
+        if not catalog:
             if output_format == "json":
-                print(json.dumps({"error": "No backends available for listing models."}, indent=2), flush=True)
+                print(json.dumps({"error": "No models available."}, indent=2), flush=True)
             else:
-                print("[flexipipe] No backends available for listing models.")
+                print("[flexipipe] No models available.")
             return 1
         
+        # Convert catalog to entries_by_backend format for compatibility with _display_language_filtered_models
+        if debug:
+            convert_start = time.time()
+        entries_by_backend: dict[str, dict] = {}
+        for catalog_key, entry in catalog.items():
+            backend = entry.get("backend")
+            model_name = entry.get("model")
+            if not backend or not model_name:
+                continue
+            if backend not in entries_by_backend:
+                entries_by_backend[backend] = {}
+            entries_by_backend[backend][model_name] = entry
+        
+        if debug:
+            convert_time = time.time() - convert_start
+            print(f"[DEBUG] Converted catalog to entries_by_backend: {convert_time:.3f}s ({len(catalog)} models)", file=sys.stderr)
+        
         # Display all models from all backends
+        output_format = getattr(args, "output_format", "table")
         sort_by = getattr(args, "sort", "backend")
         if debug:
             display_start = time.time()
@@ -468,9 +441,6 @@ def list_models(args: argparse.Namespace) -> int:
             display_time = time.time() - display_start
             total_time = time.time() - start_time
             print(f"[DEBUG] Display formatting: {display_time:.3f}s", file=sys.stderr)
-            if backend_timings:
-                total_backend_time = sum(backend_timings.values())
-                print(f"[DEBUG] Backend loading total: {total_backend_time:.3f}s", file=sys.stderr)
             print(f"[DEBUG] Total execution time: {total_time:.3f}s", file=sys.stderr)
         return result
     
@@ -501,6 +471,10 @@ def list_models(args: argparse.Namespace) -> int:
                 refresh_cache=force_refresh,
                 verbose=bool(getattr(args, "verbose", False)),
             )
+            
+            # Handle tuple return from some backends (e.g., SpaCy returns (entries, dir, standard_location_models))
+            if isinstance(entries, tuple):
+                entries = entries[0]
             
             # Check if entries is actually an error dict (from exception handling in language filtering)
             # This happens when _load_backend_entries catches an exception and returns {"error": "..."}
@@ -539,6 +513,9 @@ def list_models(args: argparse.Namespace) -> int:
                         "languages": entry.get("languages"),
                         "package": entry.get("package"),
                     }
+                    # Add source if present (for SpaCy and other backends that track model source)
+                    if "source" in entry:
+                        model_info["source"] = entry["source"]
                     # Add installed status if available
                     if installed is not None:
                         model_info["installed"] = installed
@@ -617,25 +594,70 @@ def list_languages(args: argparse.Namespace) -> int:
         catalog_time = time.time() - catalog_start
         print(f"[DEBUG] Catalog loaded: {catalog_time:.3f}s ({len(catalog)} models)", file=sys.stderr)
     
+    # Load language JSON to get dialect names and aliases (needed for dialect detection)
+    from .language_mapping import _load_language_mappings_from_json
+    json_mappings = _load_language_mappings_from_json(use_cache=not force_refresh, verbose=debug)
+    dialect_names: Dict[str, Dict[str, str]] = {}  # {base_iso: {dialect_code: dialect_name}}
+    dialect_aliases: Dict[str, Dict[str, str]] = {}  # {base_iso: {alias: dialect_code}}
+    if json_mappings:
+        for lang_entry in json_mappings:
+            if not isinstance(lang_entry, dict):
+                continue
+            entry_iso_3 = lang_entry.get("iso_639_3")
+            if entry_iso_3:
+                base_iso_lower = entry_iso_3.lower()
+                dialects = lang_entry.get("dialects", {})
+                if isinstance(dialects, dict):
+                    dialect_names[base_iso_lower] = {}
+                    dialect_aliases[base_iso_lower] = {}
+                    for dial_code, dial_info in dialects.items():
+                        if isinstance(dial_info, dict):
+                            dialect_names[base_iso_lower][dial_code] = dial_info.get("name", dial_code)
+                            # Map aliases to dialect codes (e.g., "oci-ar" -> "ara", "oci-ara" -> "ara")
+                            for alias in dial_info.get("aliases", []):
+                                dialect_aliases[base_iso_lower][alias.lower()] = dial_code
+    
     # Collect language information - group by normalized ISO-1 code to avoid duplicates
     languages_data: Dict[str, Dict[str, Any]] = {}
     
+    # Helper to extract dialect code from language_iso (e.g., "oci-ar" -> "ar", "oci-ara" -> "ara")
+    def _extract_dialect_code(lang_iso: str, base_iso: str) -> Optional[str]:
+        """Extract dialect code from a language ISO code like 'oci-ar' or 'oci-ara'."""
+        if not lang_iso or not base_iso:
+            return None
+        if lang_iso.lower().startswith(base_iso.lower() + "-"):
+            dialect_part = lang_iso[len(base_iso) + 1:].lower()
+            return dialect_part if dialect_part else None
+        return None
+    
     for catalog_key, entry in catalog.items():
         lang_iso = entry.get("language_iso")
+        # Use original_language_iso if available (preserves dialect codes like "oci-ar")
+        original_lang_iso = entry.get("original_language_iso") or lang_iso
         lang_name = entry.get("language_name")
         
         if not lang_iso:
             continue
         
         # Get comprehensive language metadata to normalize the ISO code
+        # Always use the normalized lang_iso from catalog (which is already normalized to ISO-1)
         lang_metadata = get_language_metadata(lang_iso)
-        if not lang_metadata.get("iso_639_1"):
-            # Try with language name if ISO lookup failed
+        if not lang_metadata.get("iso_639_1") and not lang_metadata.get("iso_639_3"):
+            # If metadata lookup failed, try with language name
             if lang_name:
                 lang_metadata = get_language_metadata(lang_name)
+            # If still no metadata, try with original_language_iso (might be a dialect code)
+            if (not lang_metadata.get("iso_639_1") and not lang_metadata.get("iso_639_3") 
+                and original_lang_iso and original_lang_iso != lang_iso):
+                # Try to get base language from original code (e.g., "oci-ara" -> "oci")
+                base_from_original = get_language_metadata(original_lang_iso.split("-")[0] if "-" in original_lang_iso else original_lang_iso)
+                if base_from_original.get("iso_639_1") or base_from_original.get("iso_639_3"):
+                    lang_metadata = base_from_original
         
         # Use normalized ISO-1 code as the key (or ISO-3 if no ISO-1)
+        # Prefer ISO-1 for consistency, but fall back to ISO-3
         normalized_key = lang_metadata.get("iso_639_1") or lang_metadata.get("iso_639_3") or lang_iso
+        base_iso = lang_metadata.get("iso_639_3") or normalized_key
         
         if normalized_key not in languages_data:
             languages_data[normalized_key] = {
@@ -646,6 +668,8 @@ def list_languages(args: argparse.Namespace) -> int:
                 "model_count": 0,
                 "backend_count": 0,
                 "backends": set(),
+                "dialects_seen": set(),  # Track which dialect codes we've seen
+                "has_generic_models": False,  # Track if there are generic (non-dialect) models
             }
         
         languages_data[normalized_key]["model_count"] += 1
@@ -653,6 +677,68 @@ def list_languages(args: argparse.Namespace) -> int:
         if backend:
             languages_data[normalized_key]["backends"].add(backend)
             languages_data[normalized_key]["backend_count"] = len(languages_data[normalized_key]["backends"])
+        
+        # Track dialect if this is a dialect-specific model
+        # Use original_lang_iso to detect dialects (e.g., "oci-ar", "oci-ara")
+        # Also check model name for dialect indicators (e.g., "pap-aru-1" -> "aru")
+        dialect_code = None
+        base_iso_lower = base_iso.lower()
+        
+        # First try alias mapping
+        if base_iso_lower in dialect_aliases and original_lang_iso.lower() in dialect_aliases[base_iso_lower]:
+            dialect_code = dialect_aliases[base_iso_lower][original_lang_iso.lower()]
+        else:
+            # Fallback: extract dialect code directly (e.g., "oci-ara" -> "ara")
+            dialect_code = _extract_dialect_code(original_lang_iso, base_iso)
+            # If we extracted a dialect code, check if it matches a known dialect
+            # (e.g., "ar" might need to map to "ara")
+            if dialect_code and base_iso_lower in dialect_names:
+                # Check if the extracted code matches a dialect name or if we need to find it
+                if dialect_code not in dialect_names[base_iso_lower]:
+                    # Try to find a dialect that has this as a substring or vice versa
+                    for known_dial_code in dialect_names[base_iso_lower]:
+                        if dialect_code in known_dial_code or known_dial_code in dialect_code:
+                            dialect_code = known_dial_code
+                            break
+        
+        # If no dialect found but model name suggests one (e.g., "pap-aru-1"), 
+        # extract it from the model name
+        # Only do this if original_lang_iso doesn't already contain dialect info
+        # (to avoid false positives for models like "oci-restaure" where "restaure" is not a dialect)
+        if not dialect_code and original_lang_iso.lower() == base_iso.lower():
+            model_name = entry.get("model", "")
+            if model_name and "-" in model_name:
+                # Check if model name follows pattern: "lang-dialect-..." or "lang-dialect"
+                parts = model_name.split("-")
+                if len(parts) >= 2:
+                    # Check if first part matches base language
+                    first_part = parts[0].lower()
+                    if first_part == base_iso_lower or first_part == normalized_key.lower():
+                        possible_dialect = parts[1].lower()
+                        # If dialects are defined for this language, check if it matches
+                        if base_iso_lower in dialect_names and possible_dialect in dialect_names[base_iso_lower]:
+                            dialect_code = possible_dialect
+                        # Even if not in dialect_names, if the pattern suggests a dialect, use it
+                        # (e.g., "pap-aru-1" where "aru" is likely a dialect/variant code)
+                        # But only if the original_lang_iso is the base (not already a dialect code)
+                        elif len(possible_dialect) <= 4 and len(possible_dialect) >= 2 and original_lang_iso.lower() == base_iso.lower():
+                            # Heuristic: short codes after language code are likely dialects
+                            dialect_code = possible_dialect
+        
+        # Track if this is a generic (non-dialect) model
+        # A model is generic ONLY if:
+        # 1. No dialect code was detected at all, AND
+        # 2. The original_lang_iso equals the base_iso (e.g., "oci" not "oci-ara")
+        # If a dialect_code was detected (even from model name), it's NOT generic
+        is_generic_model = (dialect_code is None and 
+                           (original_lang_iso.lower() == base_iso.lower() or 
+                            original_lang_iso.lower() == normalized_key.lower() or
+                            (original_lang_iso.lower() == lang_iso.lower() and lang_iso.lower() in [normalized_key.lower(), base_iso.lower()])))
+        if is_generic_model:
+            languages_data[normalized_key]["has_generic_models"] = True
+        
+        if dialect_code:
+            languages_data[normalized_key]["dialects_seen"].add(dialect_code)
     
     # Sort by ISO code
     sorted_languages = sorted(languages_data.items(), key=lambda x: x[0])
@@ -694,9 +780,38 @@ def list_languages(args: argparse.Namespace) -> int:
         backend_count = lang_data["backend_count"]
         backends_str = ", ".join(sorted(lang_data["backends"]))
         
+        # Add dialect information if dialects were seen
+        # Distinguish between languages with both generic and dialect models vs. only dialect models
+        dialects_seen = lang_data.get("dialects_seen", set())
+        has_generic = lang_data.get("has_generic_models", False)
+        if dialects_seen:
+            base_iso_lower = iso_3.lower()
+            dialect_info = []
+            for dial_code in sorted(dialects_seen):
+                dial_name = dialect_names.get(base_iso_lower, {}).get(dial_code, dial_code)
+                dialect_info.append(dial_name)
+            if dialect_info:
+                if has_generic:
+                    # Has both generic and dialect models: "Occitan (dialects: Aranese)"
+                    name += f" (dialects: {', '.join(dialect_info)})"
+                else:
+                    # Only dialect models: "Papiamento (Aru only)" or just list the dialects
+                    if len(dialect_info) == 1:
+                        name += f" ({dialect_info[0]} only)"
+                    else:
+                        name += f" ({', '.join(dialect_info)} only)"
+        
         print(f"{iso_1:<8} {iso_2:<8} {iso_3:<8} {name:<25} {model_count:<8} {backend_count:<10} {backends_str}")
     
-    print(f"\nTotal: {len(sorted_languages)} language(s) with {sum(d['model_count'] for _, d in sorted_languages)} model(s)")
+    # Count total languages including dialects
+    total_languages = len(sorted_languages)
+    total_dialects = sum(len(d.get("dialects_seen", set())) for _, d in sorted_languages)
+    total_models = sum(d['model_count'] for _, d in sorted_languages)
+    
+    if total_dialects > 0:
+        print(f"\nTotal: {total_languages} language(s) with {total_dialects} dialect(s) and {total_models} model(s)")
+    else:
+        print(f"\nTotal: {total_languages} language(s) with {total_models} model(s)")
     
     if debug:
         total_time = time.time() - start_time

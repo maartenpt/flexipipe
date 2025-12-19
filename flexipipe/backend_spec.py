@@ -33,5 +33,12 @@ class BackendSpec:
     
     Third-party backends can specify their own registry URL.
     """
+    install_instructions: Optional[str] = None
+    """Installation instructions for this backend.
+    
+    If None, defaults to "Install via: flexipipe install {name}".
+    For backends that don't require installation (e.g., REST services),
+    provide a message like "{name} is a REST service that requires no installation".
+    """
 
 

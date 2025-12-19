@@ -1406,6 +1406,26 @@ def handle_run(args: argparse.Namespace, runner: BenchmarkRunner) -> None:
             languages = runner.discover_languages()
         if not languages:
             raise SystemExit("No languages specified and none discovered. Provide --languages (or --language) or --treebank-root.")
+    # Handle --model (singular) when --backend is also provided
+    # Convert it to --models BACKEND=MODEL format
+    if hasattr(args, 'model') and args.model and not args.models:
+        backend_list = args.backends
+        if not backend_list and hasattr(args, 'backend') and args.backend:
+            backend_list = [args.backend]
+        if backend_list and len(backend_list) == 1:
+            # Single backend + single model = convert to --models format
+            args.models = [f"{backend_list[0]}={args.model}"]
+        elif backend_list and len(backend_list) > 1:
+            raise SystemExit(
+                f"Cannot use --model with multiple backends ({', '.join(backend_list)}). "
+                "Use --models BACKEND=MODEL format instead."
+            )
+        elif not backend_list:
+            raise SystemExit(
+                "Cannot use --model without specifying --backend. "
+                "Use --models BACKEND=MODEL format or specify --backend."
+            )
+    
     model_map = parse_model_map(args.models)
     tasks = parse_tasks_arg(args.tasks)
     explicit_treebanks: Optional[list[Path]] = None

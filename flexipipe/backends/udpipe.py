@@ -638,5 +638,6 @@ BACKEND_SPEC = BackendSpec(
     is_rest=True,
     url="https://lindat.mff.cuni.cz/services/udpipe",
     model_registry_url=DEFAULT_UDPIPE_REGISTRY_URL,
+    install_instructions="udpipe is a REST service that requires no installation",
 )
 

@@ -101,6 +101,47 @@ _LANGUAGE_BY_CODE: Dict[str, Dict[str, str]] = {}
 _LANGUAGE_BY_NAME: Dict[str, Dict[str, str]] = {}
 _LANGUAGE_MAPPINGS_LOADED = False
 
+# Optional axis + parsing metadata loaded from languages.json
+_LANGUAGE_AXES: Dict[str, Any] = {}
+_LANGUAGE_PARSING_HEURISTICS: Dict[str, Any] = {}
+
+
+def _set_language_axes_metadata(axes: Dict[str, Any], parsing_heuristics: Dict[str, Any]) -> None:
+    """
+    Store axis semantics and parsing heuristics loaded from languages.json.
+
+    This keeps the responsibility for loading languages.json in this module,
+    while allowing other parts of the codebase to query the axis configuration
+    without needing to know about the remote source or caching.
+    """
+    global _LANGUAGE_AXES, _LANGUAGE_PARSING_HEURISTICS
+    if isinstance(axes, dict):
+        _LANGUAGE_AXES = axes
+    else:
+        _LANGUAGE_AXES = {}
+    if isinstance(parsing_heuristics, dict):
+        _LANGUAGE_PARSING_HEURISTICS = parsing_heuristics
+    else:
+        _LANGUAGE_PARSING_HEURISTICS = {}
+
+
+def get_language_axes() -> Dict[str, Any]:
+    """
+    Return the axis semantics loaded from languages.json, or an empty dict.
+
+    The structure follows the `axes` key in the flexipipe-models languages.json.
+    """
+    return _LANGUAGE_AXES
+
+
+def get_language_parsing_heuristics() -> Dict[str, Any]:
+    """
+    Return the parsing heuristics loaded from languages.json, or an empty dict.
+
+    The structure follows the `parsing_heuristics` key in languages.json.
+    """
+    return _LANGUAGE_PARSING_HEURISTICS
+
 
 def _load_language_mappings_from_json(
     url: Optional[str] = None,
@@ -109,22 +150,36 @@ def _load_language_mappings_from_json(
     verbose: bool = False,
 ) -> Optional[List[Dict[str, Any]]]:
     """
-    Load language mappings from a JSON file.
+    Load language mappings (and optionally axis metadata) from a JSON file.
     
-    The JSON file should have the following structure:
-    {
-        "languages": [
-            {
-                "iso_639_1": "en",
-                "iso_639_2": "eng",
-                "iso_639_3": "eng",
-                "primary_name": "English",
-                "variants": ["english"],
-                "aliases": ["en", "eng"]  // optional, additional aliases
+    The JSON file is expected to be the flexipipe-models `languages.json`, with
+    at least the following structure:
+    
+        {
+            "languages": [
+                {
+                    "iso_639_1": "en",
+                    "iso_639_2": "eng",
+                    "iso_639_3": "eng",
+                    "primary_name": "English",
+                    "variants": ["english"],
+                    "aliases": ["en", "eng"]
+                },
+                ...
+            ],
+            "axes": {
+                ...
             },
-            ...
-        ]
-    }
+            "parsing_heuristics": {
+                ...
+            }
+        }
+    
+    Historically this function returned only a flat list of language mapping
+    dictionaries. For backwards compatibility we still return such a list, but
+    when the JSON has a top-level dict we will also extract and cache the
+    optional `axes` and `parsing_heuristics` sections for other parts of the
+    code to consume.
     
     Args:
         url: URL to the JSON file. If None, uses the default from flexipipe-models.
@@ -144,10 +199,29 @@ def _load_language_mappings_from_json(
         cache_dir = get_cache_dir()
         if cache_dir:
             cached = read_model_cache_entry(cache_key, max_age_seconds=86400)  # 24 hours
-            if cached and isinstance(cached, list):
+            # Old cache format: list of language dicts
+            if isinstance(cached, list):
                 if verbose:
-                    print(f"[flexipipe] Loaded {len(cached)} language mappings from cache", file=__import__("sys").stderr)
+                    print(
+                        f"[flexipipe] Loaded {len(cached)} language mappings from cache",
+                        file=__import__("sys").stderr,
+                    )
                 return cached
+            # New cache format: dict with "languages" and optional "axes"/"parsing_heuristics"
+            if isinstance(cached, dict) and "languages" in cached:
+                languages = cached.get("languages") or []
+                if verbose:
+                    print(
+                        f"[flexipipe] Loaded {len(languages)} language mappings from cache (with metadata)",
+                        file=__import__("sys").stderr,
+                    )
+                # Cache axes and parsing heuristics for global access
+                _set_language_axes_metadata(
+                    cached.get("axes") or {},
+                    cached.get("parsing_heuristics") or {},
+                )
+                if isinstance(languages, list):
+                    return languages
     
     # Try to fetch from remote URL
     if mapping_url.startswith("http://") or mapping_url.startswith("https://"):
@@ -162,9 +236,15 @@ def _load_language_mappings_from_json(
             data = response.json()
             
             if isinstance(data, dict) and "languages" in data:
-                languages = data["languages"]
+                languages = data.get("languages") or []
+                # Extract and store axes + parsing heuristics (may be empty)
+                axes = data.get("axes") or {}
+                parsing = data.get("parsing_heuristics") or {}
+                _set_language_axes_metadata(axes, parsing)
+                cache_payload: Any = {"languages": languages, "axes": axes, "parsing_heuristics": parsing}
             elif isinstance(data, list):
                 languages = data
+                cache_payload = languages
             else:
                 if verbose:
                     print(f"[flexipipe] Warning: Invalid language mapping JSON format", file=sys.stderr)
@@ -173,12 +253,15 @@ def _load_language_mappings_from_json(
             # Cache the result
             if use_cache and cache_dir:
                 try:
-                    write_model_cache_entry(cache_key, languages)
+                    write_model_cache_entry(cache_key, cache_payload)
                 except (OSError, PermissionError):
                     pass
             
             if verbose:
-                print(f"[flexipipe] Loaded {len(languages)} language mappings from {mapping_url}", file=sys.stderr)
+                print(
+                    f"[flexipipe] Loaded {len(languages)} language mappings from {mapping_url}",
+                    file=sys.stderr,
+                )
             return languages
         except Exception as exc:
             if verbose:
@@ -262,6 +345,15 @@ def _build_language_mappings(
             variants = lang_entry.get("variants", [])
             aliases = lang_entry.get("aliases", [])
             
+            # Also collect dialect-specific aliases (e.g., oci-ara from dialects.ara.aliases)
+            dialects = lang_entry.get("dialects", {})
+            if isinstance(dialects, dict):
+                for dialect_code, dialect_info in dialects.items():
+                    if isinstance(dialect_info, dict):
+                        dialect_aliases = dialect_info.get("aliases", [])
+                        if dialect_aliases:
+                            aliases.extend(dialect_aliases)
+            
             # Combine variants and aliases
             all_variants = list(variants) + list(aliases)
             
@@ -285,6 +377,29 @@ def _build_language_mappings(
             if not found_existing:
                 # Add new entry
                 mappings_to_process.append((iso_1, iso_2, iso_3, primary_name, all_variants))
+    
+    # Build a mapping from language codes to their aliases (including dialect aliases)
+    # This allows us to index aliases to point to the correct base language
+    # We'll match by any ISO code (1, 2, or 3) to handle variations
+    code_to_aliases: Dict[str, List[str]] = {}
+    if json_mappings:
+        for lang_entry in json_mappings:
+            if not isinstance(lang_entry, dict):
+                continue
+            entry_iso_1 = lang_entry.get("iso_639_1")
+            entry_iso_2 = lang_entry.get("iso_639_2")
+            entry_iso_3 = lang_entry.get("iso_639_3")
+            entry_aliases = list(lang_entry.get("aliases", []))
+            # Also collect dialect-specific aliases (e.g., oci-ara from dialects.ara.aliases)
+            entry_dialects = lang_entry.get("dialects", {})
+            if isinstance(entry_dialects, dict):
+                for dialect_info in entry_dialects.values():
+                    if isinstance(dialect_info, dict):
+                        entry_aliases.extend(dialect_info.get("aliases", []))
+            # Index by all ISO codes that exist (1, 2, or 3)
+            for iso_code in [entry_iso_1, entry_iso_2, entry_iso_3]:
+                if iso_code:
+                    code_to_aliases[iso_code.lower()] = entry_aliases
     
     # Build lookup dictionaries
     for iso_1, iso_2, iso_3, primary_name, variants in mappings_to_process:
@@ -315,6 +430,15 @@ def _build_language_mappings(
                 _LANGUAGE_BY_NAME[variant.lower()] = lang_data
                 _LANGUAGE_BY_NAME[variant.title()] = lang_data
                 _LANGUAGE_BY_NAME[variant.upper()] = lang_data
+        
+        # Index by aliases (including dialect-specific aliases like oci-ara)
+        # Match this language's codes to find its aliases (try any ISO code)
+        for iso_code in [iso_1, iso_2, iso_3]:
+            if iso_code and iso_code.lower() in code_to_aliases:
+                for alias in code_to_aliases[iso_code.lower()]:
+                    if alias:
+                        _LANGUAGE_BY_CODE[alias.lower()] = lang_data
+                break  # Found aliases, no need to check other codes
     
     _LANGUAGE_MAPPINGS_LOADED = True
 

@@ -13,7 +13,7 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 try:
     import requests
@@ -809,6 +809,7 @@ class SpacyBackend(BackendManager):
         disable: Optional[List[str]] = None,
         gpu: bool = False,
         verbose: bool = False,
+        training: bool = False,
     ):
         """
         Initialize SpaCy backend.
@@ -1002,7 +1003,33 @@ class SpacyBackend(BackendManager):
                 raise _handle_spacy_value_error(exc, str(model_path)) from exc
         elif load_language:
             # Create blank language model
-            self._nlp = spacy.blank(load_language)
+            # For training, allow unsupported languages (will use 'xx' fallback)
+            if training:
+                # For training, try the requested language first, but fall back to 'xx' if not supported
+                try:
+                    self._nlp = spacy.blank(load_language)
+                except (ImportError, OSError) as e:
+                    error_str = str(e)
+                    if "E048" in error_str or "Can't import language" in error_str:
+                        # For training, use 'xx' (multilingual) as fallback
+                        if self._verbose:
+                            print(f"[flexipipe] Warning: Language '{load_language}' is not supported by SpaCy. Using 'xx' (multilingual) for training.", file=sys.stderr)
+                        self._nlp = spacy.blank("xx")
+                        self._language = "xx"  # Update stored language
+                    else:
+                        raise
+            else:
+                # For inference, require a supported language
+                try:
+                    self._nlp = spacy.blank(load_language)
+                except (ImportError, OSError) as e:
+                    error_str = str(e)
+                    if "E048" in error_str or "Can't import language" in error_str:
+                        raise ImportError(
+                            f"SpaCy does not support language '{load_language}' for inference. "
+                            f"SpaCy only supports certain languages out of the box."
+                        ) from e
+                    raise
             # Add basic components
             if components:
                 for component_name in components:
@@ -1293,6 +1320,13 @@ class SpacyBackend(BackendManager):
         elapsed = time.time() - start_time
         token_count = sum(len(sent.tokens) for sent in result_doc.sentences)
         
+        # Set model information in document meta for CoNLL-U output
+        model_name_used = self._model_name or self._auto_model
+        if model_name_used:
+            if "_file_level_attrs" not in result_doc.meta:
+                result_doc.meta["_file_level_attrs"] = {}
+            result_doc.meta["_file_level_attrs"]["spacy_model"] = model_name_used
+        
         stats = {
             "elapsed_seconds": elapsed,
             "tokens_per_second": token_count / elapsed if elapsed > 0 else 0,
@@ -1317,8 +1351,17 @@ class SpacyBackend(BackendManager):
         language = kwargs.get("language") or self._language or (self._nlp.lang if self._nlp else None)
         if not language:
             raise ValueError("SpaCy training requires a language code. Provide --language.")
-
+        
         verbose = bool(kwargs.get("verbose", False))
+        
+        # For training, if the language is not supported by SpaCy, use 'xx' (multilingual) as fallback
+        # This allows training models for languages not in SpaCy's built-in language list
+        # Note: The language check happens in __init__ when creating the blank model, so this is just for consistency
+        if self._nlp and self._nlp.lang == "xx" and language != "xx":
+            if verbose:
+                import sys
+                print(f"[flexipipe] Warning: Language '{language}' is not supported by SpaCy. Using 'xx' (multilingual) for training.", file=sys.stderr)
+            language = "xx"
         model_name = kwargs.get("model_name") or output_dir.name
 
         if isinstance(train_data, (str, Path)):
@@ -1356,6 +1399,20 @@ class SpacyBackend(BackendManager):
                 target_name="train.spacy",
                 silent=not verbose,
             )
+            # Verify the file exists and is readable immediately after conversion
+            # Add a small delay in case of filesystem lag
+            import time
+            time.sleep(0.2)
+            if not train_docbin.exists():
+                # List files in tmp_dir to see what actually exists
+                existing = list(tmp_dir.glob("*"))
+                raise RuntimeError(
+                    f"Training data file was not created: {train_docbin}. "
+                    f"Files in tmp_dir: {existing}"
+                )
+            if train_docbin.stat().st_size == 0:
+                raise RuntimeError(f"Training data file is empty: {train_docbin}")
+            
             if dev_files:
                 dev_docbin = self._convert_conllu_to_docbin(
                     dev_files,
@@ -1364,30 +1421,94 @@ class SpacyBackend(BackendManager):
                     target_name="dev.spacy",
                     silent=not verbose,
                 )
+                if not dev_docbin.exists():
+                    raise RuntimeError(f"Dev data file was not created: {dev_docbin}")
+                if dev_docbin.stat().st_size == 0:
+                    raise RuntimeError(f"Dev data file is empty: {dev_docbin}")
             else:
                 dev_docbin = tmp_dir / "dev.spacy"
                 shutil.copy(train_docbin, dev_docbin)
 
+            # Detect what annotations are available in the training data
+            from .validator import detect_annotation_coverage
+            
+            # Check the first training file to determine annotation coverage
+            coverage = detect_annotation_coverage(train_files[0]) if train_files else {}
+            
+            # Build pipeline based on available annotations
+            # - tagger: needs UPOS or XPOS
+            # - morphologizer: needs FEATS
+            # - parser: needs HEAD and DEPREL
+            pipeline = ["tok2vec"]  # Always include tok2vec (token vectorizer)
+            
+            if coverage.get("upos") or coverage.get("xpos"):
+                pipeline.append("tagger")
+            if coverage.get("feats"):
+                pipeline.append("morphologizer")
+            if coverage.get("head") and coverage.get("deprel"):
+                pipeline.append("parser")
+            
+            # Warn if user-specified components can't be trained
+            if self._components:
+                missing = []
+                if "morphologizer" in self._components and not coverage.get("feats"):
+                    missing.append("morphologizer (requires FEATS)")
+                if "parser" in self._components and (not coverage.get("head") or not coverage.get("deprel")):
+                    missing.append("parser (requires HEAD and DEPREL)")
+                if missing and verbose:
+                    import sys
+                    print(f"[flexipipe] Warning: Cannot train {', '.join(missing)} - required annotations not found in training data.", file=sys.stderr)
+            
+            if verbose:
+                import sys
+                available = [k for k, v in coverage.items() if v]
+                print(f"[flexipipe] Detected annotations in training data: {', '.join(available) if available else 'none'}", file=sys.stderr)
+                print(f"[flexipipe] Training pipeline: {' -> '.join(pipeline)}", file=sys.stderr)
+            
             base_config = None
             base_config_path = self._get_base_config_path()
             if base_config_path and base_config_path.exists():
                 base_config = load_config(base_config_path)
             if base_config is None:
-                pipeline = self._components or ["tok2vec", "morphologizer", "tagger", "parser"]
+                # Use the language from self._nlp if available (may be 'xx' for unsupported languages)
+                config_lang = self._nlp.lang if self._nlp else language
                 base_config = init_config(
-                    lang=language,
+                    lang=config_lang,
                     pipeline=pipeline,
                     optimize="efficiency",
                     silent=not verbose,
                 )
 
+            # Use absolute paths but don't resolve symlinks (to avoid path mismatches on macOS)
+            # The files were created at these paths, so we should use them as-is
+            train_docbin_abs = train_docbin.absolute()
+            dev_docbin_abs = dev_docbin.absolute()
+            
+            if not train_docbin.exists():
+                raise RuntimeError(f"Training data file does not exist: {train_docbin} (absolute: {train_docbin_abs})")
+            if not dev_docbin.exists():
+                raise RuntimeError(f"Dev data file does not exist: {dev_docbin} (absolute: {dev_docbin_abs})")
+            
+            # Use the original path (not resolved) to match where the file actually exists
             base_config["paths"]["train"] = str(train_docbin)
             base_config["paths"]["dev"] = str(dev_docbin)
 
             config_path = tmp_dir / "config.cfg"
             base_config.to_disk(config_path)
+            
+            # Verify config was saved correctly
+            if not config_path.exists():
+                raise RuntimeError(f"Failed to save config file: {config_path}")
 
             training_out = tmp_dir / "training"
+            training_out.mkdir(exist_ok=True)
+            
+            # Verify files still exist before training
+            if not train_docbin.exists():
+                raise RuntimeError(f"Training data file disappeared before training: {train_docbin}")
+            if not dev_docbin.exists():
+                raise RuntimeError(f"Dev data file disappeared before training: {dev_docbin}")
+            
             spacy_cli_train(str(config_path), str(training_out))
 
             best_model_src = training_out / "model-best"
@@ -1488,28 +1609,93 @@ class SpacyBackend(BackendManager):
 
         docbin_paths = []
         for source in sources:
-            convert(
-                source,
-                tmp_dir,
-                file_type="spacy",
-                converter="conllu",
-                n_sents=1000,
-                seg_sents=True,
-                morphology=True,
-                lang=language,
-                silent=silent,
-            )
-            produced = tmp_dir / f"{source.stem}.spacy"
-            if not produced.exists():
-                raise RuntimeError(f"Failed to convert {source} to DocBin.")
+            # Convert CoNLL-U to SpaCy DocBin format
+            # Note: convert writes to the output directory, using the source filename
+            # Check files before conversion for debugging
+            files_before = set(tmp_dir.glob("*"))
+            try:
+                convert(
+                    str(source),  # Ensure it's a string path
+                    str(tmp_dir),  # Ensure it's a string path
+                    file_type="spacy",
+                    converter="conllu",
+                    n_sents=1000,
+                    seg_sents=True,
+                    morphology=True,
+                    lang=language,
+                    silent=silent,
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to convert {source} to SpaCy DocBin format: {e}"
+                ) from e
+            
+            # Check what files were created
+            files_after = set(tmp_dir.glob("*"))
+            new_files = files_after - files_before
+            if not silent:
+                import sys
+                print(f"[flexipipe] DEBUG: Files before convert: {[str(f) for f in files_before]}", file=sys.stderr)
+                print(f"[flexipipe] DEBUG: Files after convert: {[str(f) for f in files_after]}", file=sys.stderr)
+                print(f"[flexipipe] DEBUG: New files: {[str(f) for f in new_files]}", file=sys.stderr)
+            # SpaCy's convert creates a file with the source stem + .spacy extension
+            # But it might create it with a slightly different name - check what actually exists
+            produced = None
+            
+            # SpaCy's convert creates a file with the source stem + .spacy extension
+            # Wait a moment for file to be created (convert might take time to flush)
+            import time
+            time.sleep(0.5)  # Give convert time to finish
+            
+            # The output file should be named after the source file stem
+            expected = tmp_dir / f"{source.stem}.spacy"
+            
+            # Check if file exists, with retries
+            max_retries = 10
+            for retry in range(max_retries):
+                if expected.exists():
+                    produced = expected
+                    break
+                time.sleep(0.1)
+            else:
+                # File still doesn't exist - list what's actually in the directory
+                all_files = sorted(tmp_dir.glob("*"))
+                all_spacy = sorted(tmp_dir.glob("*.spacy"))
+                raise RuntimeError(
+                    f"Failed to convert {source} to DocBin after {max_retries} retries. "
+                    f"Expected: {expected}, "
+                    f"All files in {tmp_dir}: {[str(f) for f in all_files]}, "
+                    f".spacy files: {[str(f) for f in all_spacy]}"
+                )
+            
+            # Verify file is not empty
+            if produced.stat().st_size == 0:
+                raise RuntimeError(f"Converted file is empty: {produced}")
+            
             docbin_paths.append(produced)
 
         target_path = tmp_dir / target_name
-        if target_path.exists():
-            target_path.unlink()
-
+        
         if len(docbin_paths) == 1:
-            docbin_paths[0].replace(target_path)
+            source_file = docbin_paths[0]
+            # If target is the same as source, no move needed
+            if source_file == target_path:
+                # File is already at target location
+                if not target_path.exists():
+                    raise RuntimeError(f"Target file does not exist (same as source): {target_path}")
+            else:
+                # Use shutil.move instead of replace to handle cross-filesystem moves
+                import shutil
+                if not source_file.exists():
+                    raise RuntimeError(f"Source file does not exist before move: {source_file}")
+                # Remove target if it exists
+                if target_path.exists():
+                    target_path.unlink()
+                # Move source to target
+                shutil.move(str(source_file), str(target_path))
+                # Verify move succeeded
+                if not target_path.exists():
+                    raise RuntimeError(f"Target file does not exist after move: {target_path} (source was: {source_file})")
         else:
             import srsly
             from spacy.tokens import DocBin
@@ -1567,6 +1753,7 @@ def get_spacy_model_entries(
     refresh_cache: bool = False,
     cache_ttl_seconds: int = MODEL_CACHE_TTL_SECONDS,
     verbose: bool = False,
+    **kwargs: Any,  # Accept additional kwargs to be compatible with other backends
 ) -> Tuple[Dict[str, Dict[str, str]], Path, List[str]]:
     import importlib.metadata
 
@@ -1720,12 +1907,66 @@ def get_spacy_model_entries(
         entry = dict(info)
         entry["status"] = status
         entry["version"] = version
+        # Preserve source from registry (official, flexipipe, community)
+        if "source" not in entry:
+            entry["source"] = info.get("source", "flexipipe")
         result[model_name] = entry
 
     for model_name, version in installed_models.items():
         if model_name in result:
             continue
-        lang = model_name.split("_")[0]
+        # Try to read language and source info from meta.json
+        lang = None
+        model_source = None
+        model_dir = spacy_dir / model_name
+        meta_path = model_dir / "meta.json"
+        if meta_path.exists():
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                    # Check flexipipe metadata for language and training info
+                    flexipipe_meta = meta.get("flexipipe", {})
+                    # If flexipipe.trained_at exists, this is a locally trained model
+                    if flexipipe_meta.get("trained_at"):
+                        model_source = "local"
+                    # Use lang from meta.json, but prefer flexipipe metadata if available
+                    meta_lang = meta.get("lang")
+                    # If lang is "xx" (multilingual) but we have flexipipe metadata, 
+                    # the actual language might be in the model name or training source
+                    if meta_lang and meta_lang != "xx":
+                        lang = meta_lang
+            except Exception:
+                pass
+        
+        # If not found in meta.json, extract from model name (handle both _ and -)
+        if not lang:
+            # Try splitting on underscore first (standard SpaCy format: en_core_web_sm)
+            if "_" in model_name:
+                lang = model_name.split("_")[0]
+            # Try splitting on hyphen (custom models: swa-masakhane)
+            elif "-" in model_name:
+                lang = model_name.split("-")[0]
+            else:
+                # No separator, use whole name as language code
+                lang = model_name
+        
+        # Determine source if not already set
+        if not model_source:
+            # Check if model is in registry (from flexipipe-models)
+            if model_name in registry_models:
+                registry_entry = registry_models[model_name]
+                model_source = registry_entry.get("source", "flexipipe")
+            # Check if model is in standard location (installed via pip)
+            elif model_name in standard_location_models:
+                model_source = "official"
+            else:
+                # Default to "official" for models installed but not in registry
+                # (likely from SpaCy's official releases)
+                model_source = "official"
+        
+        # For custom trained models, preserve the original language code from model name
+        # to ensure proper matching (e.g., "swa" should not be normalized to "sw")
+        # But still use standardize_language_metadata for proper ISO code handling
         entry = build_model_entry(
             "spacy",
             model_name,
@@ -1733,8 +1974,19 @@ def get_spacy_model_entries(
             language_name=SPACY_LANGUAGE_NAMES.get(lang),
             description=f"{lang.upper()} model",
         )
+        # If the extracted language code is different from what standardize_language_metadata produced,
+        # preserve the original as well (for matching purposes)
+        # This handles cases like "swa" (ISO-639-3) vs "sw" (ISO-639-1)
+        if lang and lang.lower() != entry.get("language_iso", "").lower():
+            # Preserve original language code for better matching
+            entry["original_language_iso"] = lang.lower()
+            # Also set language_iso to the original if it's a valid 3-letter code
+            # This ensures "swa" matches when querying with "swa"
+            if len(lang) == 3 and lang.isalpha():
+                entry["language_iso"] = lang.lower()
         entry["status"] = "installed"
         entry["version"] = version
+        entry["source"] = model_source  # Mark source: "official", "flexipipe", "community", or "local"
         result[model_name] = entry
 
     if verbose and standard_location_models:

@@ -905,5 +905,6 @@ BACKEND_SPEC = BackendSpec(
     supports_training=False,
     is_rest=True,
     url="https://lindat.mff.cuni.cz/services/nametag",
+    install_instructions="nametag is a REST service that requires no installation",
 )
 

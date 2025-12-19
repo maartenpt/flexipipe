@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 from ..backend_spec import BackendSpec
 from ..doc import Document, Entity, Sentence, Token
@@ -15,6 +17,7 @@ from ..language_utils import (
     build_model_entry,
     cache_entries_standardized,
 )
+from ..model_registry import fetch_remote_registry, get_registry_url
 from ..model_storage import (
     get_backend_models_dir,
     read_model_cache_entry,
@@ -25,11 +28,25 @@ from ..neural_backend import BackendManager, NeuralResult
 MODEL_CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 hours
 
 
+def _get_fallback_classla_models() -> Dict[tuple[str, str], Dict[str, Any]]:
+    """Get fallback hardcoded ClassLA models (used when registry is unavailable)."""
+    return {
+        ("hr", "standard"): {"package": "set", "name": "Croatian", "default_features": ["tokenization", "upos", "lemma", "xpos", "feats", "depparse", "ner"]},
+        ("hr", "nonstandard"): {"package": "set", "name": "Croatian (nonstandard)", "default_features": ["tokenization", "upos", "lemma", "xpos", "feats", "depparse", "ner"]},
+        ("sr", "standard"): {"package": "set", "name": "Serbian", "default_features": ["tokenization", "upos", "lemma", "xpos", "feats", "depparse", "ner"]},
+        ("sr", "nonstandard"): {"package": "set", "name": "Serbian (nonstandard)", "default_features": ["tokenization", "upos", "lemma", "xpos", "feats", "depparse", "ner"]},
+        ("bg", "standard"): {"package": "btb", "name": "Bulgarian", "default_features": ["tokenization", "upos", "lemma", "xpos", "feats", "depparse", "ner"]},
+        ("mk", "standard"): {"package": "mk", "name": "Macedonian", "default_features": ["tokenization", "upos", "lemma", "xpos", "feats"]},  # No depparse
+        ("sl", "standard"): {"package": "ssj", "name": "Slovenian", "default_features": ["tokenization", "upos", "lemma", "xpos", "feats", "depparse"]},  # Has depparse
+    }
+
+
 def get_classla_model_entries(
     *,
     use_cache: bool = True,
     refresh_cache: bool = False,
     cache_ttl_seconds: int = MODEL_CACHE_TTL_SECONDS,
+    verbose: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Dict[str, str]]:
     del kwargs
@@ -50,8 +67,45 @@ def get_classla_model_entries(
             if cache_entries_standardized(cached):
                 return cached
 
+    # Try to fetch from remote registry first
+    known_models: Dict[tuple[str, str], Dict[str, Any]] = {}
+    try:
+        registry = fetch_remote_registry(
+            backend="classla",
+            use_cache=use_cache,
+            refresh_cache=refresh_cache,
+            verbose=verbose,
+        )
+        if registry:
+            # Extract models from registry structure
+            sources = registry.get("sources", {})
+            for source_type in ["official", "flexipipe", "community"]:
+                if source_type in sources:
+                    for model_entry in sources[source_type]:
+                        model_name = model_entry.get("model")
+                        if model_name and "-" in model_name:
+                            # Parse model name like "hr-standard" or "mk-standard"
+                            parts = model_name.split("-", 1)
+                            if len(parts) == 2:
+                                lang_code, variant = parts
+                                if variant in ("standard", "nonstandard"):
+                                    known_models[(lang_code, variant)] = {
+                                        "package": model_entry.get("package", ""),
+                                        "name": model_entry.get("language_name") or model_entry.get("name", lang_code.upper()),
+                                        "default_features": model_entry.get("features", "").split(", ") if model_entry.get("features") else [],
+                                    }
+    except Exception as exc:
+        if verbose:
+            print(f"[flexipipe] ClassLA registry unavailable ({exc}), using fallback models.")
+    
+    # Fall back to hardcoded models if registry is empty or unavailable
+    if not known_models:
+        known_models = _get_fallback_classla_models()
+
     result: Dict[str, Dict[str, str]] = {}
     installed_models: Dict[str, Dict[str, str]] = {}
+    # Track available processors for each model
+    model_processors: Dict[str, Set[str]] = {}
     classla_resources = get_backend_models_dir("classla", create=False)
     if classla_resources.exists():
         for lang_dir in classla_resources.iterdir():
@@ -61,25 +115,39 @@ def get_classla_model_entries(
             for processor_dir in lang_dir.iterdir():
                 if not processor_dir.is_dir():
                     continue
-                for model_file in processor_dir.glob("*.pt"):
-                    package = model_file.stem
+                processor_name = processor_dir.name
+                # Check for .pt files (including .pt.zip files)
+                has_model_file = False
+                model_file = None
+                # First check for regular .pt files
+                for f in processor_dir.glob("*.pt"):
+                    if not f.name.endswith(".zip"):
+                        model_file = f
+                        has_model_file = True
+                        break
+                # If no regular .pt file, check for .pt.zip
+                if not model_file:
+                    for f in processor_dir.glob("*.pt.zip"):
+                        model_file = f
+                        has_model_file = True
+                        break
+                
+                if has_model_file and model_file:
+                    package = model_file.stem.replace(".zip", "")
                     variant = "nonstandard" if "nonstandard" in processor_dir.parts else "standard"
                     model_key = f"{lang_code}-{variant}"
                     installed_models.setdefault(
                         model_key,
                         {"lang": lang_code, "package": package, "variant": variant},
                     )
+                    # Track which processors are available for this model
+                    if model_key not in model_processors:
+                        model_processors[model_key] = set()
+                    model_processors[model_key].add(processor_name)
 
-    known_models = {
-        ("hr", "standard"): {"package": "set", "name": "Croatian"},
-        ("hr", "nonstandard"): {"package": "set", "name": "Croatian (nonstandard)"},
-        ("sr", "standard"): {"package": "set", "name": "Serbian"},
-        ("sr", "nonstandard"): {"package": "set", "name": "Serbian (nonstandard)"},
-        ("bg", "standard"): {"package": "btb", "name": "Bulgarian"},
-        ("mk", "standard"): {"package": "mk", "name": "Macedonian"},
-        ("sl", "standard"): {"package": "ssj", "name": "Slovenian"},
-    }
-
+    # Check which models are actually installed
+    from ..model_storage import is_model_installed
+    
     for (lang_code, variant), model_info in known_models.items():
         package = model_info["package"]
         model_key = f"{lang_code}-{variant}"
@@ -100,6 +168,48 @@ def get_classla_model_entries(
         entry["language_iso"] = entry.get("language_iso") or lang_code.lower()
         entry["package"] = model_entry.get("package", package)
         entry["variant"] = model_entry.get("variant", variant)
+        
+        # Set status based on whether model is actually installed
+        try:
+            if is_model_installed("classla", model_key):
+                entry["status"] = "installed"
+            else:
+                entry["status"] = "available"
+        except Exception:
+            # If check fails, default to available
+            entry["status"] = "available"
+        
+        # Set features based on available processors (if installed) or default features (if not installed)
+        available_processors = model_processors.get(model_key, set())
+        features_list = []
+        
+        if available_processors:
+            # Model is installed - detect features from actual processors
+            # Map processor names to feature names
+            processor_to_feature = {
+                "tokenize": "tokenization",
+                "pos": "upos",
+                "lemma": "lemma",
+                "depparse": "depparse",
+                "ner": "ner",
+            }
+            for proc, feat in processor_to_feature.items():
+                if proc in available_processors:
+                    features_list.append(feat)
+            # Also include xpos and feats if pos is available (POS tagger provides these)
+            if "pos" in available_processors:
+                if "xpos" not in features_list:
+                    features_list.append("xpos")
+                if "feats" not in features_list:
+                    features_list.append("feats")
+        else:
+            # Model is not installed - use default features from known_models
+            default_features = model_info.get("default_features", [])
+            features_list = default_features.copy()
+        
+        if features_list:
+            entry["features"] = ", ".join(features_list)
+        
         result[model_key] = entry
 
     if refresh_cache:
@@ -245,7 +355,46 @@ class ClassLABackend(BackendManager):
         self._language = language or (model_name.split("-")[0] if model_name and "-" in model_name else model_name) or "hr"
         default_package = {"hr": "set", "sr": "set", "bg": "btb", "mk": "mk", "sl": "ssj"}
         self._package = package or default_package.get(self._language)
-        self._processors = processors or "tokenize,pos,lemma"
+        
+        # Determine default processors based on model capabilities
+        default_processors = ["tokenize", "pos", "lemma"]
+        # Check model registry to see what features are available
+        if processors is None and model_name:
+            try:
+                from .classla import get_classla_model_entries  # circular-safe import (self-file)
+                entries = get_classla_model_entries(use_cache=True, refresh_cache=False)
+                entry = entries.get(model_name)
+                if entry:
+                    features_str = entry.get("features", "")
+                    if features_str:
+                        features = [f.strip() for f in features_str.split(",")]
+                        # Map features to processors
+                        feature_to_processor = {
+                            "tokenization": "tokenize",
+                            "upos": "pos",
+                            "xpos": "pos",  # xpos comes from pos processor
+                            "feats": "pos",  # feats comes from pos processor
+                            "lemma": "lemma",
+                            "depparse": "depparse",
+                            "ner": "ner",
+                        }
+                        available_processors = []
+                        # Always include tokenize (it's always available for ClassLA models)
+                        available_processors.append("tokenize")
+                        for feat in features:
+                            proc = feature_to_processor.get(feat)
+                            if proc and proc not in available_processors:
+                                available_processors.append(proc)
+                        if available_processors:
+                            default_processors = available_processors
+            except Exception:
+                # If registry lookup fails, use default
+                pass
+        
+        if processors:
+            self._processors = processors
+        else:
+            self._processors = ",".join(default_processors)
         self._use_gpu = use_gpu
         self._download = download_model
         self._verbose = verbose
@@ -284,6 +433,50 @@ class ClassLABackend(BackendManager):
         try:
             return self.classla.Pipeline(**config)
         except (ValueError, TypeError) as e:
+            # Check if this is a JSON parsing error from ClassLA's resource loading
+            error_str = str(e)
+            if "Expecting value" in error_str or "JSONDecodeError" in error_str:
+                # Check if resources.json is empty or corrupted and try to fix it
+                resources_file = classla_dir / "resources.json"
+                if resources_file.exists():
+                    try:
+                        import json
+                        with open(resources_file, "r", encoding="utf-8") as f:
+                            content = f.read().strip()
+                            if not content:
+                                # Empty file - delete it and try to rebuild
+                                if self._verbose:
+                                    print(f"[flexipipe] Detected empty resources.json, attempting to rebuild...", file=sys.stderr)
+                                resources_file.unlink()
+                            else:
+                                # Try to parse - if it fails, it's corrupted
+                                json.loads(content)
+                                # If we get here, JSON is valid but ClassLA still failed
+                                # This might be a different issue
+                                raise RuntimeError(
+                                    f"ClassLA failed to load resources despite valid JSON file. "
+                                    f"This may indicate a ClassLA version mismatch or corrupted model files. "
+                                    f"Try re-downloading: classla.download('{self._language}', type='{self._type}')"
+                                ) from e
+                    except (json.JSONDecodeError, ValueError):
+                        # Corrupted JSON - delete it and try to rebuild
+                        if self._verbose:
+                            print(f"[flexipipe] Detected corrupted resources.json, attempting to rebuild...", file=sys.stderr)
+                        resources_file.unlink()
+                
+                # Always try to rebuild when we detect corrupted/empty resources.json
+                # This is a recovery mechanism, not a download request
+                if self._verbose:
+                    print(f"[flexipipe] Rebuilding ClassLA resources for {self._language} (type: {self._type})...", file=sys.stderr)
+                try:
+                    self.classla.download(self._language, type=self._type, verbose=self._verbose)
+                    # Retry pipeline creation after download
+                    return self.classla.Pipeline(**config)
+                except Exception as download_error:
+                    raise RuntimeError(
+                        f"Failed to rebuild ClassLA resources: {download_error}. "
+                        f"Try manually: classla.download('{self._language}', type='{self._type}')"
+                    ) from download_error
             error_str = str(e)
             if "not enough values to unpack" in error_str or "expected 2" in error_str:
                 config_minimal = {
@@ -297,46 +490,126 @@ class ClassLABackend(BackendManager):
                     pipeline.tokenize_pretokenized = True
                 return pipeline
             raise
-        except (FileNotFoundError, OSError) as e:
-            error_str = str(e).lower()
-            if "depparse" in error_str or "parser" in error_str or "no such file" in error_str:
+        except Exception as e:
+            # Catch any Exception (including ResourcesFileNotFound) to check if it's a resources error
+            error_str = str(e)
+            is_resources_error = (
+                "Resources file not found" in error_str or
+                "resources" in error_str.lower() or
+                isinstance(e, self._resources_error)
+            )
+            
+            # Check if this is a missing pretrain/vector file error
+            is_missing_pretrain = (
+                "vector file is not provided" in error_str.lower() or
+                ("pretrain" in error_str.lower() and ("not found" in error_str.lower() or "missing" in error_str.lower()))
+            )
+            
+            if is_missing_pretrain:
+                # If download is explicitly requested, try to download the complete model
+                if self._download:
+                    if self._verbose:
+                        print(f"[flexipipe] Missing pretrain/vector file detected. Downloading complete ClassLA model for {self._language} (type: {self._type})...", flush=True)
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                    try:
+                        # Download with all required processors, including pretrain
+                        processors_list = [p.strip() for p in self._processors.split(",") if p.strip()]
+                        # Always include pretrain if pos is requested (POS tagger requires pretrain vectors)
+                        if "pos" in processors_list and "pretrain" not in processors_list:
+                            processors_list.append("pretrain")
+                        processors_dict = {proc: True for proc in processors_list}
+                        self.classla.download(
+                            self._language, 
+                            type=self._type, 
+                            processors=processors_dict,
+                            verbose=self._verbose
+                        )
+                        if self._verbose:
+                            sys.stdout.flush()
+                            sys.stderr.flush()
+                            print(f"[flexipipe] ClassLA model download completed", flush=True)
+                        # Retry pipeline creation after download
+                        return self.classla.Pipeline(**config)
+                    except Exception as download_error:
+                        raise RuntimeError(
+                            f"Failed to download ClassLA model: {download_error}. "
+                            f"Try manually: classla.download('{self._language}', type='{self._type}')"
+                        ) from download_error
+                # If download is not requested, raise error with instructions
+                raise RuntimeError(
+                    f"ClassLA model for language '{self._language}' (type: {self._type}) is incomplete. "
+                    f"The pretrain/vector file is missing, which is required for the POS tagger. "
+                    f"Use --download-model to download the complete model, or run: "
+                    f"classla.download('{self._language}', type='{self._type}')"
+                ) from e
+            
+            if is_resources_error:
+                # Check if resources.json is missing or empty - if so, try to rebuild automatically
+                resources_file = classla_dir / "resources.json"
+                should_auto_rebuild = False
+                
+                if not resources_file.exists():
+                    should_auto_rebuild = True
+                    if self._verbose:
+                        print(f"[flexipipe] Resources file not found, attempting to rebuild...", file=sys.stderr)
+                elif resources_file.exists():
+                    # Check if file is empty
+                    try:
+                        if resources_file.stat().st_size == 0:
+                            should_auto_rebuild = True
+                            if self._verbose:
+                                print(f"[flexipipe] Resources file is empty, attempting to rebuild...", file=sys.stderr)
+                            resources_file.unlink()
+                    except OSError:
+                        pass
+                
+                # Auto-rebuild only for corrupted/empty resources.json (recovery mechanism)
+                # For missing models, require explicit --download-model flag
+                if should_auto_rebuild:
+                    if self._verbose:
+                        print(f"[flexipipe] Rebuilding ClassLA resources for {self._language} (type: {self._type})...", file=sys.stderr)
+                    try:
+                        # Only download the processors we actually need, not all available processors
+                        # This prevents downloading unnecessary models (like Ukrainian lemmatizer)
+                        # Processors should be a dict mapping processor names to True/False or package names
+                        processors_list = [p.strip() for p in self._processors.split(",") if p.strip()]
+                        # Always include pretrain if pos is requested (POS tagger requires pretrain vectors)
+                        if "pos" in processors_list and "pretrain" not in processors_list:
+                            processors_list.append("pretrain")
+                        processors_dict = {proc: True for proc in processors_list}
+                        self.classla.download(
+                            self._language, 
+                            type=self._type, 
+                            processors=processors_dict,
+                            verbose=self._verbose
+                        )
+                        # Retry pipeline creation after download
+                        return self.classla.Pipeline(**config)
+                    except Exception as download_error:
+                        raise RuntimeError(
+                            f"Failed to rebuild ClassLA resources: {download_error}. "
+                            f"Try manually: classla.download('{self._language}', type='{self._type}')"
+                        ) from download_error
+                # If resources.json is fine but model files are missing, require explicit download
+                raise RuntimeError(
+                    f"ClassLA model not found for language '{self._language}' "
+                    f"(package: {self._package}, type: {self._type}). "
+                    f"Use --download-model to install, or run: classla.download('{self._language}', type='{self._type}')"
+                ) from e
+            
+            # Check if it's a file/OS error for depparse fallback
+            error_str_lower = error_str.lower()
+            if "depparse" in error_str_lower or "parser" in error_str_lower or "no such file" in error_str_lower:
                 processors_list = [p.strip() for p in self._processors.split(",") if p.strip()]
                 if "depparse" in processors_list:
                     processors_list.remove("depparse")
                     config_fallback = dict(config)
                     config_fallback["processors"] = ",".join(processors_list)
                     return self.classla.Pipeline(**config_fallback)
-            if self._download:
-                import sys
-                print(f"[flexipipe] Downloading ClassLA model for {self._language} (type: {self._type})...", flush=True)
-                sys.stdout.flush()
-                sys.stderr.flush()
-                # Pass verbose=True to classla.download to ensure progress is shown
-                # In non-interactive environments, this helps with output flushing
-                self.classla.download(self._language, type=self._type, verbose=True)
-                sys.stdout.flush()
-                sys.stderr.flush()
-                print(f"[flexipipe] ClassLA model download completed", flush=True)
-                return self.classla.Pipeline(**config)
+            
+            # Not handled - re-raise
             raise
-        except self._resources_error as e:
-            if self._download:
-                import sys
-                print(f"[flexipipe] Downloading ClassLA model for {self._language} (type: {self._type})...", flush=True)
-                sys.stdout.flush()
-                sys.stderr.flush()
-                # Pass verbose=True to classla.download to ensure progress is shown
-                # In non-interactive environments, this helps with output flushing
-                self.classla.download(self._language, type=self._type, verbose=True)
-                sys.stdout.flush()
-                sys.stderr.flush()
-                print(f"[flexipipe] ClassLA model download completed", flush=True)
-                return self.classla.Pipeline(**config)
-            raise RuntimeError(
-                f"ClassLA model not found for language '{self._language}' "
-                f"(package: {self._package}, type: {self._type}). "
-                f"Install it with: classla.download('{self._language}', type='{self._type}')"
-            ) from e
 
     def _get_pipeline(self, pretokenized: bool):
         if pretokenized not in self._pipelines:

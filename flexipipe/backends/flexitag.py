@@ -479,5 +479,6 @@ BACKEND_SPEC = BackendSpec(
     supports_training=True,
     is_rest=False,
     url="https://github.com/flexipipe/flexipipe",  # Built-in backend
+    install_instructions="flexitag is a built-in backend that requires no installation",
 )
 
